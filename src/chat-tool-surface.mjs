@@ -215,8 +215,14 @@ function withRequiredAppTools(tools, required) {
 export function chatProviderToolSurface(
   tools,
   providerId,
-  { input, toolChoice } = {},
+  { input, toolChoice, lazyLocal = false } = {},
 ) {
+  if (lazyLocal) {
+    return flattenNamespaceTools(tools, {
+      includeNamespace: (name) => name === "collaboration",
+      maxDescriptionChars: 1_024,
+    });
+  }
   const merged = mergeCodexAppTools(tools);
   if (providerId !== "groq") return flattenNamespaceTools(merged.tools);
 

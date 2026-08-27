@@ -3035,6 +3035,7 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
     }
   }
   let tools = payload.tools;
+  const lazyLocalToolSurface = route.requestProfile === "qwen38-mlx";
   // LiteLLM's Responses -> Chat Completions bridge drops namespace tools, which
   // is how the client ships the collaboration runtime, the app toolset
   // (threads, automations, navigation), and every MCP server (node_repl,
@@ -3054,6 +3055,7 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
     const flattened = chatProviderToolSurface(tools, provider?.id, {
       input,
       toolChoice: payload.tool_choice,
+      lazyLocal: lazyLocalToolSurface,
     });
     namespacesFlattened = flattened.flattened;
     flattenedNamespaces = flattened.namespaces;

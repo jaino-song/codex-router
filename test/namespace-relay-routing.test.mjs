@@ -1603,6 +1603,66 @@ test("bounded routes preserve one alias for pre-flattened MCP definitions and hi
   }
 });
 
+test("local MLX Qwen starts with a bounded lazy tool surface", async () => {
+  function bulkyLocalPayload(stream, model) {
+    const payload = routedRequestPayload(stream, model);
+    const longDescription = `Tool contract. ${"Detailed instructions. ".repeat(4_000)}`;
+    payload.input = [payload.input[0]];
+    payload.tools.push({
+      type: "function",
+      name: "large_core_tool",
+      description: longDescription,
+      parameters: { type: "object", properties: {} },
+    });
+    payload.tools.find((tool) => tool?.name === "collaboration").tools[0].description =
+      longDescription;
+    return payload;
+  }
+
+  const result = await scenario(false, {
+    model: "custom/qwen3.8-27b-uncensored",
+    requestPayload: bulkyLocalPayload,
+    jsonBody: () => ({ id: "resp_local_qwen", output: [] }),
+  });
+  const outgoing = result.gatewayBodies[0];
+  const names = outgoing.tools.map((tool) => tool.name);
+
+  assert.ok(names.includes("tool_search"), "lazy discovery remains callable");
+  assert.ok(names.includes("exec_command"), "plain core tools remain available");
+  assert.ok(names.includes("collaboration__spawn_agent"), "collaboration remains available");
+  assert.ok(names.includes("large_core_tool"), "plain tools are retained");
+  assert.equal(names.includes("codex_app__create_thread"), false, "deferred app catalog is not restored eagerly");
+  assert.equal(names.includes("mcp__node_repl__js"), false, "MCP namespace waits for tool_search");
+  assert.ok(
+    outgoing.tools.every((tool) => !tool.description || tool.description.length <= 1_024),
+    "provider-facing descriptions are capped",
+  );
+  assert.ok(
+    Buffer.byteLength(JSON.stringify(outgoing.tools), "utf8") < 16_000,
+    "synthetic eager tool payload stays within the regression budget",
+  );
+});
+
+test("local MLX Qwen materializes searched tools on the following turn", async () => {
+  const result = await scenario(false, {
+    model: "custom/qwen3.8-27b-uncensored",
+    requestPayload: routedToolSearchHistoryPayload,
+    jsonBody: () => ({ id: "resp_local_qwen_search", output: [] }),
+  });
+  const outgoing = result.gatewayBodies[0];
+  const names = outgoing.tools.map((tool) => tool.name);
+
+  assert.ok(names.includes("tool_search"));
+  assert.ok(names.includes("mcp__calendar__delete_event"), "searched MCP tool is materialized");
+  assert.equal(names.includes("mcp__node_repl__js"), false, "unsearched MCP tools stay deferred");
+  assert.ok(
+    outgoing.input.some(
+      (item) => item?.type === "function_call_output" && item.call_id === "search-history-1",
+    ),
+    "native search history is translated for the chat provider",
+  );
+});
+
 test("non-streaming routed responses restore namespace calls before client dispatch", async () => {
   const result = await scenario(false);
   assert.equal(result.gatewayBodies.length, 1);

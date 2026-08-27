@@ -539,6 +539,49 @@ test("flattenNamespaceTools exposes client tool_search as an ordinary provider f
   ]);
 });
 
+test("flattenNamespaceTools can defer bulky namespaces while keeping lazy discovery", () => {
+  const { tools, flattened, namespaces } = flattenNamespaceTools(
+    [clientToolSearchControl(), ...clientRoutedTools()],
+    {
+      includeNamespace: (name) => name === "collaboration",
+      maxDescriptionChars: 256,
+    },
+  );
+
+  assert.equal(flattened, true);
+  assert.deepEqual(
+    tools.map((tool) => tool.name),
+    ["tool_search", "exec_command", "view_image", "collaboration__spawn_agent", "collaboration__wait_agent"],
+  );
+  assert.deepEqual([...namespaces.get("codex_app")].sort(), [
+    "load_workspace_dependencies",
+    "navigate_to_codex_page",
+    "read_thread_terminal",
+  ]);
+  assert.deepEqual([...namespaces.get("mcp__node_repl")].sort(), ["js", "js_reset"]);
+});
+
+test("flattenNamespaceTools caps provider-facing descriptions in lazy mode", () => {
+  const longDescription = `Run a tool. ${"schema details ".repeat(500)}`;
+  const { tools } = flattenNamespaceTools(
+    [
+      { type: "function", name: "exec", description: longDescription },
+      {
+        type: "namespace",
+        name: "collaboration",
+        tools: [{ type: "function", name: "wait_agent", description: longDescription }],
+      },
+    ],
+    { maxDescriptionChars: 256 },
+  );
+
+  for (const tool of tools) {
+    assert.ok(tool.description.length <= 256, `${tool.name} description is bounded`);
+    assert.match(tool.description, /truncated for the local context window/);
+  }
+  assert.ok(Buffer.byteLength(JSON.stringify(tools), "utf8") < 2_000);
+});
+
 test("tool_search bridge uses a collision-safe request-local name", () => {
   const { tools, namespaces } = flattenNamespaceTools([
     {
