@@ -95,3 +95,29 @@ export function directLoopbackFetch(url, init = {}) {
   sharedDirectLoopbackDispatcher ??= new Agent(fetchDispatcherOptions());
   return undiciFetch(url, { ...init, dispatcher: sharedDirectLoopbackDispatcher });
 }
+
+// mlx-vlm does not send response headers until a non-streaming generation is
+// complete. Keep its wider timeout isolated from remote provider traffic.
+export function createLoopbackGenerationDispatcher({ AgentClass = Agent } = {}) {
+  return new AgentClass({
+    allowH2: false,
+    pipelining: 1,
+    headersTimeout: 590_000,
+    bodyTimeout: 0,
+  });
+}
+
+let sharedGenerationDispatcher;
+
+export function loopbackGenerationDispatcher() {
+  sharedGenerationDispatcher ??= createLoopbackGenerationDispatcher();
+  return sharedGenerationDispatcher;
+}
+
+export function loopbackGenerationFetch(
+  url,
+  init = {},
+  dispatcher = loopbackGenerationDispatcher(),
+) {
+  return undiciFetch(url, { ...init, dispatcher });
+}

@@ -50,7 +50,10 @@ import {
 } from "./commandcode-plan.mjs";
 import { relayCommandCodeGenerate } from "./commandcode-relay.mjs";
 import { VERSION } from "./version.mjs";
-import { installStableFetchTransport } from "./fetch-transport.mjs";
+import {
+  installStableFetchTransport,
+  loopbackGenerationFetch,
+} from "./fetch-transport.mjs";
 import { zaiCacheUsageTransform } from "./zai-cache-usage.mjs";
 import {
   buildNamespaceLookupsFromTools,
@@ -76,7 +79,7 @@ import {
 } from "./tool-schema-root.mjs";
 import { requestGenericProvider } from "./generic-providers.mjs";
 import { genericProviderConfigured } from "./generic-provider-readiness.mjs";
-import { providerTransportError } from "./transport-failure.mjs";
+import { localTransportHost, providerTransportError } from "./transport-failure.mjs";
 import {
   endpointCapabilityError,
   supportsOpenAIModelEndpoint,
@@ -84,6 +87,8 @@ import {
 import { applyQwenToolContinuation } from "./qwen-tool-continuation.mjs";
 
 installStableFetchTransport();
+
+const QWEN38_MLX_PROFILE = "qwen38-mlx";
 
 const LISTEN_HOST =
   process.env.MODEL_ROUTER_API_HOST ||
@@ -1219,6 +1224,19 @@ async function relayUpstreamResponse(
   }
 }
 
+function fetchUpstream(normalized, target, init) {
+  if (normalized.model.requestProfile === QWEN38_MLX_PROFILE) {
+    try {
+      if (localTransportHost(new URL(target).hostname)) {
+        return loopbackGenerationFetch(target, init);
+      }
+    } catch {
+      // The ordinary fetch path below owns malformed-URL reporting.
+    }
+  }
+  return fetch(target, init);
+}
+
 async function upstreamSession(provider, credential, payload, options = {}, endpoint = provider) {
   if (provider.authProfile !== "github-copilot") {
     return { apiKey: credential.value, baseUrl: providerBaseUrl(endpoint), headers: {} };
@@ -1522,7 +1540,7 @@ async function handleRequest(request, response) {
           normalized.endpoint,
         );
         let attemptTarget = `${attemptSession.baseUrl}${route}${requestUrl.search}`;
-        const sendAttempt = () => fetch(attemptTarget, {
+        const sendAttempt = () => fetchUpstream(normalized, attemptTarget, {
           method: request.method,
           headers: upstreamHeaders(
             request.headers,
@@ -1653,7 +1671,7 @@ async function handleRequest(request, response) {
       normalized.endpoint,
     );
     target = `${session.baseUrl}${route}${requestUrl.search}`;
-    upstream = await fetch(target, {
+    upstream = await fetchUpstream(normalized, target, {
       method: request.method,
       headers: upstreamHeaders(
         request.headers,
@@ -1700,7 +1718,7 @@ async function handleRequest(request, response) {
       normalized.endpoint,
     );
     target = `${session.baseUrl}${route}${requestUrl.search}`;
-    upstream = await fetch(target, {
+    upstream = await fetchUpstream(normalized, target, {
       method: request.method,
       headers: upstreamHeaders(
         request.headers,

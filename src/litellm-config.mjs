@@ -64,6 +64,12 @@ export function renderLiteLlmConfig() {
       `      api_base: ${yamlString(`os.environ/${apiBaseEnv}`)}`,
       '      api_key: "os.environ/CODEX_ROUTER_INTERNAL_KEY"',
       ...(responsesSurface ? [] : ["      use_chat_completions_api: true"]),
+      // A local mlx-vlm deployment can execute only one generation at a time.
+      // LiteLLM's two default retries turn one slow or rejected Codex turn into
+      // three queued generations, making every later turn appear frozen.
+      // Loopback delivery is reliable and Codex owns the user-visible retry,
+      // so this deployment must remain single-shot just like local Ollama.
+      ...(model.requestProfile === "qwen38-mlx" ? ["      num_retries: 0"] : []),
       "",
     );
   }
