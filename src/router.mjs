@@ -74,6 +74,7 @@ import {
 import {
   MODEL_BY_SLUG,
   RUNTIME_PROVIDERS,
+  protocolForModel,
   providerForModel,
 } from "./model-registry.mjs";
 import { createHealthCache } from "./health-cache.mjs";
@@ -2960,7 +2961,7 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
   let namespacesFlattened = false;
   let flattenedNamespaces = new Map();
   const provider = providerForModel(route);
-  const chatCompletionsProvider = provider?.protocol !== "openai-responses";
+  const chatCompletionsProvider = protocolForModel(route) !== "openai-responses";
   const consoleGoResponsesCompatibility = needsConsoleGoResponsesToolCompatibility(route);
   const compatibleInput = zenFreeCompatibleInput(
     normalizeProviderAppToolOutputs(agedInput),
@@ -3042,7 +3043,7 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
   // peekaboo, github, ...). Chat-completions providers need every namespace
   // flattened into ordinary functions; the response transform maps calls back
   // to the client's native namespace shape.
-  if (chatCompletionsProvider) {
+  if (chatCompletionsProvider || lazyLocalToolSurface) {
     // Relay the app's full native toolset (threads, automations, app
     // navigation) to the provider. The client registers these tools with
     // deferLoading and executes the calls natively, but only sends a reduced
@@ -3127,7 +3128,7 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
     routedInput = customTools.input;
     routedToolChoice = customTools.toolChoice;
   }
-  if (chatCompletionsProvider || consoleGoResponsesCompatibility) {
+  if (chatCompletionsProvider || lazyLocalToolSurface || consoleGoResponsesCompatibility) {
     let searchHistory;
     try {
       searchHistory = flattenToolSearchHistory(

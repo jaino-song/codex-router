@@ -75,6 +75,16 @@ export function endpointForModel(model, providers = RUNTIME_PROVIDERS) {
   return provider?.perModelEndpoint ? model.endpoint : provider;
 }
 
+// A per-model endpoint owns the wire protocol for the same reason it owns the
+// address and credential: a custom container can hold an MLX Responses server
+// beside an unrelated Chat Completions server. Consumers must ask this helper
+// instead of reading the protocol off the container, which intentionally has
+// no destination metadata of its own.
+export function protocolForModel(model, providers = PROVIDERS) {
+  const provider = providers.get(model?.provider);
+  return endpointForModel(model, providers)?.protocol ?? provider?.protocol;
+}
+
 // "Nothing for the operator to supply to *this provider*" — three different
 // reasons, one consequence, and every surface that offers to take a key has to
 // agree on it. Named once because the list grew a third member and the four
@@ -486,6 +496,12 @@ function endpointProblem(model, provider) {
   }
   if (!/^https?:\/\//.test(endpoint.baseUrl || "")) {
     return `model ${model.slug} endpoint requires an HTTP(S) baseUrl`;
+  }
+  if (
+    endpoint.protocol !== undefined &&
+    !["openai", "anthropic", "openai-responses"].includes(endpoint.protocol)
+  ) {
+    return `model ${model.slug} endpoint has an unsupported API protocol`;
   }
   if (endpoint.authMode !== undefined && endpoint.authMode !== "anonymous") {
     return `model ${model.slug} endpoint has an unsupported authMode`;
