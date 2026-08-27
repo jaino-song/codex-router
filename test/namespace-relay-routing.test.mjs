@@ -1643,6 +1643,39 @@ test("local MLX Qwen starts with a bounded lazy tool surface", async () => {
   );
 });
 
+test("local MLX Qwen compacts the live Codex surface without native tool_search", async () => {
+  function livePayloadWithoutNativeSearch(stream, model) {
+    const payload = routedRequestPayload(stream, model);
+    const longDescription = `Exec contract. ${"Nested tool documentation. ".repeat(4_000)}`;
+    payload.input = [payload.input[0]];
+    payload.tools = payload.tools.filter((tool) => tool?.type !== "tool_search");
+    payload.tools.push({
+      type: "function",
+      name: "functions.exec",
+      description: longDescription,
+      parameters: { type: "object", properties: {} },
+    });
+    return payload;
+  }
+
+  const result = await scenario(false, {
+    model: "custom/qwen3.8-27b-uncensored",
+    requestPayload: livePayloadWithoutNativeSearch,
+    jsonBody: () => ({ id: "resp_local_qwen_live", output: [] }),
+  });
+  const outgoing = result.gatewayBodies[0];
+  const names = outgoing.tools.map((tool) => tool.name);
+
+  assert.ok(names.includes("functions.exec"), "exec-based lazy discovery remains available");
+  assert.equal(names.includes("codex_app__create_thread"), false, "full app catalog stays deferred");
+  assert.equal(names.includes("mcp__node_repl__js"), false, "MCP namespace stays deferred");
+  assert.ok(
+    outgoing.tools.every((tool) => !tool.description || tool.description.length <= 1_024),
+    "provider-facing descriptions remain bounded without native tool_search",
+  );
+  assert.ok(Buffer.byteLength(JSON.stringify(outgoing.tools), "utf8") < 16_000);
+});
+
 test("local MLX Qwen materializes searched tools on the following turn", async () => {
   const result = await scenario(false, {
     model: "custom/qwen3.8-27b-uncensored",
