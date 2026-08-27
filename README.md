@@ -790,6 +790,7 @@ because what it holds is whatever somebody put in it.
 | Model | Endpoint | Auth |
 | --- | --- | --- |
 | Qwen3.8-27-free-victor | `https://g9hnto0u7lvbu837.us-east-2.aws.endpoints.huggingface.cloud/v1` | none |
+| Qwen 3.8 27b Uncensored | `http://127.0.0.1:8080/v1` | none (local only) |
 
 That first model is a free community [Hugging Face Inference
 Endpoint](https://huggingface.co/spaces/victor/Qwen3.8-27B-free-endpoint) for

@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "models": [
+    {
+      "slug": "custom/qwen3.8-27b-uncensored",
+      "gatewayModel": "custom-qwen3-8-27b-uncensored",
+      "upstreamModel": "qwen3.8-27b-uncensored",
+      "provider": "custom",
+      "endpoint": {
+        "baseUrl": "http://127.0.0.1:8080/v1",
+        "keyless": true,
+        "note": "Runs on this Mac through the local MLX server. Start that server before selecting the model."
+      },
+      "listed": true,
+      "displayName": "Qwen 3.8 27b Uncensored",
+      "description": "Local Qwen3.8 27B Uncensored using 6-bit MLX weights, BF16 KV cache, MTP speculative decoding, text input, and a 128K context window.",
+      "priority": 145,
+      "defaultEffort": "medium",
+      "reasoningLevels": [
+        {
+          "effort": "low",
+          "description": "Brief reasoning"
+        },
+        {
+          "effort": "medium",
+          "description": "Balanced reasoning"
+        },
+        {
+          "effort": "xhigh",
+          "description": "Extended reasoning"
+        }
+      ],
+      "contextWindow": 131072,
+      "autoCompact": 120000,
+      "inputModalities": [
+        "text"
+      ],
+      "requestProfile": "qwen38-mlx",
+      "supportsApplyPatchTool": false,
+      "multiAgentVersion": "v1",
+      "compHash": "custom-qwen3-8-27b-uncensored-v1"
+    }
+  ]
+}

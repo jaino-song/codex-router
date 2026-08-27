@@ -4961,7 +4961,7 @@ test("API forwarder strips Codex schema annotations only for an explicitly profi
 // provider, so this exercises it through a curated model on a provider whose
 // base URL can be pointed at a local mock -- an anonymous provider is pinned
 // to its official endpoint by construction and has none.
-function curatedQwen38EffortModel() {
+function curatedQwen38EffortModel(requestProfile = "qwen38-community") {
   const dir = mkdtempSync(path.join(os.tmpdir(), "routing-qwen38-community-models-"));
   const file = path.join(dir, "user-models.json");
   writeFileSync(
@@ -4983,7 +4983,7 @@ function curatedQwen38EffortModel() {
           contextWindow: 262144,
           autoCompact: 230000,
           inputModalities: ["text"],
-          requestProfile: "qwen38-community",
+          requestProfile,
           compHash: "openrouter-qwen-3-8-27b-effort-user-v1",
         },
       ],
@@ -4992,6 +4992,84 @@ function curatedQwen38EffortModel() {
   );
   return { dir, file, gatewayModel: "openrouter-qwen-3-8-27b-effort" };
 }
+
+test("API forwarder maps the Codex effort ladder onto MLX Qwen3.8 tiers", async () => {
+  const upstreamRequests = [];
+  const upstream = await mockServer(async (request, response) => {
+    upstreamRequests.push({ headers: request.headers, body: await bodyJson(request) });
+    json(response, 200, { choices: [] });
+  });
+  const curated = curatedQwen38EffortModel("qwen38-mlx");
+  const forwarderPort = await openPort();
+  const forwarder = run("api-forwarder.mjs", {
+    CODEX_ROUTER_API_PORT: String(forwarderPort),
+    MODEL_ROUTER_USER_MODELS: curated.file,
+    OPENROUTER_API_BASE_URL: `http://127.0.0.1:${upstream.port}`,
+    OPENROUTER_API_KEY: "TEST_OPENROUTER_API_KEY",
+    CODEX_ROUTER_QUIET: "1",
+  });
+
+  try {
+    await waitFor(`http://127.0.0.1:${forwarderPort}/health`, forwarder, {
+      Authorization: `Bearer ${INTERNAL_KEY}`,
+    });
+    for (const [sentEffort, expectedEffort] of [
+      ["none", "low"],
+      ["minimal", "low"],
+      ["low", "low"],
+      ["medium", "medium"],
+      ["high", "xhigh"],
+      ["xhigh", "xhigh"],
+      ["max", "xhigh"],
+      ["ultra", "xhigh"],
+    ]) {
+      const response = await fetch(`http://127.0.0.1:${forwarderPort}/v1/chat/completions`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${INTERNAL_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: curated.gatewayModel,
+          reasoning_effort: sentEffort,
+          messages: [{ role: "user", content: "test" }],
+        }),
+      });
+      assert.equal(response.status, 200);
+      assert.equal(upstreamRequests.at(-1).body.reasoning_effort, expectedEffort);
+    }
+
+    const response = await fetch(`http://127.0.0.1:${forwarderPort}/v1/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${INTERNAL_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: curated.gatewayModel,
+        tools: [],
+        tool_choice: "none",
+        messages: [
+          { role: "user", content: "hello" },
+          { role: "system", content: "Be brief." },
+        ],
+      }),
+    });
+    assert.equal(response.status, 200);
+    const normalized = upstreamRequests.at(-1).body;
+    assert.equal("reasoning_effort" in normalized, false);
+    assert.equal("tools" in normalized, false);
+    assert.equal("tool_choice" in normalized, false);
+    assert.deepEqual(normalized.messages, [
+      { role: "system", content: "Be brief." },
+      { role: "user", content: "hello" },
+    ]);
+  } finally {
+    await stopChild(forwarder);
+    await closeServer(upstream.server);
+    rmSync(curated.dir, { recursive: true, force: true });
+  }
+});
 
 // One real tool, so a forced choice has something to choose from. The endpoint
 // rejects `tool_choice` sent on its own, so every request here that names a

@@ -1005,6 +1005,29 @@ function normalizeBody(buffer, contentType, route) {
     if (Array.isArray(payload.messages)) {
       payload.messages = normalizeQwen38SystemMessages(payload.messages);
     }
+  } else if (model.requestProfile === "qwen38-mlx") {
+    // The MLX chat template exposes three literal thinking levels. Preserve an
+    // absent effort so the model applies its own default, and fold the wider
+    // Codex ladder onto the nearest supported tier for explicit selections.
+    if (payload.reasoning_effort !== undefined) {
+      if (["none", "minimal", "low"].includes(payload.reasoning_effort)) {
+        payload.reasoning_effort = "low";
+      } else if (payload.reasoning_effort === "medium") {
+        payload.reasoning_effort = "medium";
+      } else {
+        payload.reasoning_effort = "xhigh";
+      }
+    }
+    // mlx-vlm follows the same Qwen message-template constraints as the
+    // community deployment: empty tool lists and late/multiple system
+    // messages must be normalized before they reach the template.
+    if (Array.isArray(payload.tools) && payload.tools.length === 0) delete payload.tools;
+    if (!Array.isArray(payload.tools) || payload.tools.length === 0) {
+      delete payload.tool_choice;
+    }
+    if (Array.isArray(payload.messages)) {
+      payload.messages = normalizeQwen38SystemMessages(payload.messages);
+    }
   } else if (model.requestProfile === "minimax-m3") {
     // MiniMax uses its own thinking control on the OpenAI-compatible
     // Chat Completions endpoint instead of reasoning_effort.
