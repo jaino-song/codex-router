@@ -187,6 +187,7 @@ test("MLX Qwen Responses streams expose safe progress without raw reasoning", as
     output.find((frame) => frame.data?.type === "response.output_text.delta")?.data.delta || "",
     /checking the current state/i,
   );
+  assert.equal(rendered.match(/checking the current state/gi)?.length, 1);
   assert.equal(
     output.find((frame) => frame.data?.type === "response.output_item.added" && frame.data.item?.type === "function_call")?.data.output_index,
     1,
@@ -194,6 +195,55 @@ test("MLX Qwen Responses streams expose safe progress without raw reasoning", as
   const completed = output.find((frame) => frame.data?.type === "response.completed");
   assert.deepEqual(completed.data.response.output.map((item) => item.type), ["message", "function_call"]);
   assert.equal(output.some((frame) => frame.data?.code === "invalid_responses_stream"), false);
+});
+
+test("MLX Qwen converts the internal final-answer tool into assistant text", async () => {
+  const message = {
+    id: "msg-final-progress",
+    type: "message",
+    status: "in_progress",
+    role: "assistant",
+    content: [],
+  };
+  const finalTool = {
+    id: "fc-final",
+    type: "function_call",
+    call_id: "call-final",
+    name: "__codex_router_submit_final",
+    arguments: '{"answer":"All requested checks passed."}',
+  };
+  const source = [
+    `event: response.created\ndata: ${JSON.stringify({ type: "response.created", response: { id: "resp-final", instructions: "Call __codex_router_submit_final." } })}\n\n`,
+    `event: response.output_item.added\ndata: ${JSON.stringify({ type: "response.output_item.added", output_index: 0, item: message })}\n\n`,
+    `event: response.content_part.added\ndata: ${JSON.stringify({ type: "response.content_part.added", item_id: message.id, output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } })}\n\n`,
+    `event: response.output_text.done\ndata: ${JSON.stringify({ type: "response.output_text.done", item_id: message.id, output_index: 0, content_index: 0, text: "" })}\n\n`,
+    `event: response.content_part.done\ndata: ${JSON.stringify({ type: "response.content_part.done", item_id: message.id, output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } })}\n\n`,
+    `event: response.output_item.done\ndata: ${JSON.stringify({ type: "response.output_item.done", output_index: 0, item: { ...message, status: "completed" } })}\n\n`,
+    `event: response.output_item.added\ndata: ${JSON.stringify({ type: "response.output_item.added", output_index: 2, item: finalTool })}\n\n`,
+    `event: response.function_call_arguments.done\ndata: ${JSON.stringify({ type: "response.function_call_arguments.done", output_index: 2, item_id: "fc-final", call_id: "call-final", name: finalTool.name, arguments: finalTool.arguments })}\n\n`,
+    `event: response.output_item.done\ndata: ${JSON.stringify({ type: "response.output_item.done", output_index: 2, item: finalTool })}\n\n`,
+    `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "resp-final", status: "completed", instructions: "Call __codex_router_submit_final.", output: [{ ...message, status: "completed" }, finalTool] } })}\n\n`,
+    "data: [DONE]\n\n",
+  ];
+
+  const rendered = await transformText(
+    createResponsesStreamTransform({
+      profile: "qwen38-mlx",
+      qwenToolContinuation: true,
+    }),
+    source,
+  );
+  const output = frames(rendered);
+  assert.doesNotMatch(rendered, /__codex_router_submit_final/);
+  assert.match(rendered, /All requested checks passed\./);
+  assert.equal(rendered.match(/checking the current state/gi)?.length, 1);
+  assert.equal(
+    output.some((frame) => frame.data?.item?.type === "function_call"),
+    false,
+  );
+  const completed = output.find((frame) => frame.data?.type === "response.completed");
+  assert.deepEqual(completed.data.response.output.map((item) => item.type), ["message"]);
+  assert.equal(completed.data.response.output_text, "All requested checks passed.");
 });
 
 test("Responses stream emits a terminal error instead of silently ending", async () => {
@@ -287,6 +337,64 @@ test("MLX Qwen JSON responses remove raw reasoning", async () => {
   );
   assert.doesNotMatch(rendered, new RegExp(secretReasoning));
   assert.deepEqual(JSON.parse(rendered).output.map((item) => item.type), ["message"]);
+});
+
+test("MLX Qwen JSON converts the internal final-answer tool into assistant text", async () => {
+  const response = {
+    id: "resp-qwen-final-json",
+    instructions: "Call __codex_router_submit_final.",
+    output: [
+      {
+        type: "function_call",
+        call_id: "call-final",
+        name: "__codex_router_submit_final",
+        arguments: '{"answer":"Finished cleanly."}',
+      },
+    ],
+  };
+  const rendered = await transformText(
+    createResponsesJsonTransform({
+      profile: "qwen38-mlx",
+      qwenToolContinuation: true,
+    }),
+    [JSON.stringify(response)],
+  );
+  assert.deepEqual(JSON.parse(rendered).output, [
+    {
+      type: "message",
+      role: "assistant",
+      status: "completed",
+      content: [{ type: "output_text", text: "Finished cleanly.", annotations: [] }],
+    },
+  ]);
+  assert.doesNotMatch(rendered, /__codex_router_submit_final/);
+});
+
+test("MLX Qwen JSON rejects an invalid internal final answer", async () => {
+  const response = {
+    id: "resp-qwen-invalid-final-json",
+    output: [
+      {
+        type: "function_call",
+        call_id: "call-final",
+        name: "__codex_router_submit_final",
+        arguments: '{"answer":""}',
+      },
+    ],
+  };
+  await assert.rejects(
+    transformText(
+      createResponsesJsonTransform({
+        profile: "qwen38-mlx",
+        qwenToolContinuation: true,
+      }),
+      [JSON.stringify(response)],
+    ),
+    (error) =>
+      error.status === 502 &&
+      error.code === "invalid_responses_response" &&
+      /empty final answer/.test(error.message),
+  );
 });
 
 test("Responses JSON transform rejects malformed and invalid upstream bodies", async () => {

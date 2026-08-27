@@ -51,6 +51,7 @@ import {
   createResponsesStreamTransform,
   normalizeOpenAIRequest,
 } from "./openai-adapters.mjs";
+import { applyQwenToolContinuation } from "./qwen-tool-continuation.mjs";
 
 installStableFetchTransport();
 
@@ -530,6 +531,7 @@ function normalizeBody(buffer, contentType, route) {
     throw error;
   }
   let payload = JSON.parse(buffer.toString("utf8"));
+  let qwenToolContinuation = false;
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     const error = new Error("Request JSON must be an object.");
     error.status = 400;
@@ -825,6 +827,9 @@ function normalizeBody(buffer, contentType, route) {
     if (Array.isArray(payload.messages)) {
       payload.messages = normalizeQwen38SystemMessages(payload.messages);
     }
+    const continuation = applyQwenToolContinuation(payload);
+    payload = continuation.payload;
+    qwenToolContinuation = continuation.active;
   } else if (model.requestProfile === "minimax-m3") {
     // MiniMax uses its own thinking control on the OpenAI-compatible
     // Chat Completions endpoint instead of reasoning_effort.
@@ -903,6 +908,7 @@ function normalizeBody(buffer, contentType, route) {
     provider,
     endpoint,
     payload,
+    qwenToolContinuation,
     responseAdapter: modelProtocol === "openai-responses" ? "responses" : undefined,
   };
 }
@@ -1211,10 +1217,16 @@ async function handleRequest(request, response) {
     upstream.ok && upstreamContentType.toLowerCase().includes("application/json");
   const transform = [
     responsesStream
-      ? createResponsesStreamTransform({ profile: normalized.model.requestProfile })
+      ? createResponsesStreamTransform({
+          profile: normalized.model.requestProfile,
+          qwenToolContinuation: normalized.qwenToolContinuation,
+        })
       : undefined,
     responsesJson
-      ? createResponsesJsonTransform({ profile: normalized.model.requestProfile })
+      ? createResponsesJsonTransform({
+          profile: normalized.model.requestProfile,
+          qwenToolContinuation: normalized.qwenToolContinuation,
+        })
       : undefined,
     zaiCacheUsageTransform(normalized.provider.id, upstreamContentType),
   ].filter(Boolean);

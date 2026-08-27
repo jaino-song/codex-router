@@ -1,5 +1,7 @@
 import { Transform } from "node:stream";
 
+import { QWEN_FINAL_ANSWER_TOOL } from "./qwen-tool-continuation.mjs";
+
 const RESPONSE_PROTOCOL = "openai-responses";
 
 function adapterError(message, code = "invalid_responses_request") {
@@ -197,16 +199,65 @@ function normalizeResponsesRequest(payload) {
   return next;
 }
 
-function normalizeResponseBody(payload, { profile } = {}) {
+function finalAnswerFromArguments(argumentsText) {
+  let parsed;
+  try {
+    parsed = JSON.parse(typeof argumentsText === "string" ? argumentsText : "{}");
+  } catch {
+    throw upstreamResponseError("The Qwen final-answer tool returned invalid JSON arguments.");
+  }
+  const answer = typeof parsed?.answer === "string" ? parsed.answer.trim() : "";
+  if (!answer) {
+    throw upstreamResponseError("The Qwen final-answer tool returned an empty final answer.");
+  }
+  return answer;
+}
+
+function finalAnswerMessage(answer, id) {
+  return {
+    ...(id ? { id } : {}),
+    type: "message",
+    role: "assistant",
+    status: "completed",
+    content: [{ type: "output_text", text: answer, annotations: [] }],
+  };
+}
+
+function hideQwenContinuationInstructions(response) {
+  if (
+    response &&
+    typeof response === "object" &&
+    typeof response.instructions === "string" &&
+    response.instructions.includes(QWEN_FINAL_ANSWER_TOOL)
+  ) {
+    delete response.instructions;
+  }
+}
+
+function normalizeResponseBody(payload, { profile, qwenToolContinuation = false } = {}) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     throw upstreamResponseError("The upstream Responses response must be an object.");
   }
   const next = clone(payload);
+  if (qwenToolContinuation) hideQwenContinuationInstructions(next);
   if (next.output !== undefined && !Array.isArray(next.output)) {
     throw upstreamResponseError("The upstream Responses response has an invalid output array.");
   }
   if (profile === QWEN38_MLX_PROFILE && Array.isArray(next.output)) {
     next.output = next.output.filter((item) => item?.type !== "reasoning");
+    if (qwenToolContinuation) {
+      const finalCall = next.output.find(
+        (item) => item?.type === "function_call" && item.name === QWEN_FINAL_ANSWER_TOOL,
+      );
+      if (finalCall) {
+        const answer = finalAnswerFromArguments(finalCall.arguments);
+        next.output = [
+          ...next.output.filter((item) => item !== finalCall),
+          finalAnswerMessage(answer),
+        ];
+        next.output_text = answer;
+      }
+    }
   }
   return next;
 }
@@ -274,10 +325,6 @@ const QWEN38_MLX_PROFILE = "qwen38-mlx";
 const QWEN38_SAFE_PROGRESS =
   "I’m checking the current state and preparing the next verified coding action.";
 
-function prefixedQwenText(text) {
-  return text ? `${QWEN38_SAFE_PROGRESS}\n\n${text}` : QWEN38_SAFE_PROGRESS;
-}
-
 function qwenMessageItem(item, messageId) {
   const content = Array.isArray(item?.content) ? item.content : [];
   const outputText = content.find((part) => part?.type === "output_text");
@@ -291,11 +338,55 @@ function qwenMessageItem(item, messageId) {
       {
         ...(outputText || {}),
         type: "output_text",
-        text: prefixedQwenText(outputText?.text || ""),
+        text: outputText?.text || "",
         annotations: Array.isArray(outputText?.annotations) ? outputText.annotations : [],
       },
     ],
   };
+}
+
+function qwenFinalAnswerFrames(state, message, outputIndex) {
+  const part = message.content[0];
+  const common = {
+    response_id: state.responseId,
+    item_id: message.id,
+    output_index: outputIndex,
+    content_index: 0,
+  };
+  return [
+    serializeFrame({ event: "response.output_item.added" }, {
+      type: "response.output_item.added",
+      response_id: state.responseId,
+      output_index: outputIndex,
+      item: { ...message, status: "in_progress", content: [] },
+    }),
+    serializeFrame({ event: "response.content_part.added" }, {
+      type: "response.content_part.added",
+      ...common,
+      part: { ...part, text: "" },
+    }),
+    serializeFrame({ event: "response.output_text.delta" }, {
+      type: "response.output_text.delta",
+      ...common,
+      delta: part.text,
+    }),
+    serializeFrame({ event: "response.output_text.done" }, {
+      type: "response.output_text.done",
+      ...common,
+      text: part.text,
+    }),
+    serializeFrame({ event: "response.content_part.done" }, {
+      type: "response.content_part.done",
+      ...common,
+      part,
+    }),
+    serializeFrame({ event: "response.output_item.done" }, {
+      type: "response.output_item.done",
+      response_id: state.responseId,
+      output_index: outputIndex,
+      item: message,
+    }),
+  ].join("");
 }
 
 function repairQwenMlxEvent(frame, data, state) {
@@ -303,11 +394,58 @@ function repairQwenMlxEvent(frame, data, state) {
     return { data, suffix: "" };
   }
   const item = data.item && typeof data.item === "object" ? data.item : undefined;
+  if (state.qwenToolContinuation) hideQwenContinuationInstructions(data.response);
   if (String(data.type || "").startsWith("response.reasoning_") || item?.type === "reasoning") {
     return { suppress: true, data, suffix: "" };
   }
   if (data.type === "response.output_item.added" && item?.type === "message") {
     state.qwenMessageId = item.id || state.qwenMessageId;
+  }
+  if (
+    state.qwenToolContinuation &&
+    data.type === "response.output_item.added" &&
+    item?.type === "function_call" &&
+    item.name === QWEN_FINAL_ANSWER_TOOL
+  ) {
+    // This tool exists only between the router and MLX. Codex must receive the
+    // standard assistant-message event sequence, never the private call.
+    for (const key of [item.id, item.call_id]) {
+      if (key) state.qwenFinalCallIds.add(key);
+    }
+    if (typeof item.arguments === "string") state.qwenFinalArguments = item.arguments;
+    return { suppress: true, data, suffix: "" };
+  }
+  if (
+    state.qwenToolContinuation &&
+    ["response.function_call_arguments.delta", "response.function_call_arguments.done"].includes(data.type) &&
+    state.qwenFinalCallIds.has(data.call_id || data.item_id)
+  ) {
+    if (data.type.endsWith(".done") && typeof data.arguments === "string") {
+      state.qwenFinalArguments = data.arguments;
+    } else if (typeof data.delta === "string") {
+      state.qwenFinalArguments += data.delta;
+    }
+    return { suppress: true, data, suffix: "" };
+  }
+  if (
+    state.qwenToolContinuation &&
+    data.type === "response.output_item.done" &&
+    item?.type === "function_call" &&
+    (item.name === QWEN_FINAL_ANSWER_TOOL || state.qwenFinalCallIds.has(item.call_id || item.id))
+  ) {
+    const answer = finalAnswerFromArguments(item.arguments || state.qwenFinalArguments);
+    const outputIndex = state.outputIndex;
+    const message = finalAnswerMessage(
+      answer,
+      `msg_${String(item.call_id || item.id || state.responseId || "qwen_final").replace(/[^a-zA-Z0-9_-]/g, "_")}`,
+    );
+    state.qwenFinalMessage = message;
+    state.outputIndex += 1;
+    return {
+      suppress: true,
+      data,
+      suffix: qwenFinalAnswerFrames(state, message, outputIndex),
+    };
   }
   let suffix = "";
   if (
@@ -315,6 +453,8 @@ function repairQwenMlxEvent(frame, data, state) {
     data.part?.type === "output_text" &&
     !state.qwenProgressInserted
   ) {
+    // One delta is enough for Codex to show meaningful progress; copying the
+    // same fixed text into every later event made the UI repeat it many times.
     state.qwenProgressInserted = true;
     suffix = serializeFrame({ event: "response.output_text.delta" }, {
       type: "response.output_text.delta",
@@ -326,12 +466,12 @@ function repairQwenMlxEvent(frame, data, state) {
     });
   }
   if (data.type === "response.output_text.done") {
-    data.text = prefixedQwenText(typeof data.text === "string" ? data.text : "");
+    data.text = typeof data.text === "string" ? data.text : "";
   }
   if (data.type === "response.content_part.done" && data.part?.type === "output_text") {
     data.part = {
       ...data.part,
-      text: prefixedQwenText(typeof data.part.text === "string" ? data.part.text : ""),
+      text: typeof data.part.text === "string" ? data.part.text : "",
     };
   }
   if (data.type === "response.output_item.done" && item?.type === "message") {
@@ -355,15 +495,30 @@ function repairQwenMlxEvent(frame, data, state) {
   }
   if (data.type === "response.completed" && data.response && typeof data.response === "object") {
     const output = Array.isArray(data.response.output)
-      ? data.response.output.filter((entry) => entry?.type !== "reasoning")
+      ? data.response.output.filter(
+          (entry) =>
+            entry?.type !== "reasoning" &&
+            !(entry?.type === "function_call" && entry.name === QWEN_FINAL_ANSWER_TOOL),
+        )
       : [];
     const existingMessage = output.find((entry) => entry?.type === "message");
-    const repairedMessage = qwenMessageItem(existingMessage, state.qwenMessageId);
+    const repairedMessage = existingMessage
+      ? qwenMessageItem(existingMessage, state.qwenMessageId)
+      : undefined;
+    const repairedMessageText = repairedMessage?.content[0]?.text || "";
+    const messages = [
+      state.qwenFinalMessage && !repairedMessageText ? undefined : repairedMessage,
+      state.qwenFinalMessage,
+    ].filter(Boolean);
+    if (messages.length === 0) messages.push(qwenMessageItem(undefined, state.qwenMessageId));
     data.response.output = [
-      repairedMessage,
+      ...messages,
       ...output.filter((entry) => entry?.type !== "message"),
     ];
-    data.response.output_text = repairedMessage.content[0].text;
+    data.response.output_text = messages
+      .map((message) => message.content[0]?.text || "")
+      .filter(Boolean)
+      .join("\n\n");
   }
   return { data, suffix };
 }
@@ -410,7 +565,7 @@ function normalizeResponsesEvent(frame, state, profile) {
   let suffix = "";
   if (profile === QWEN38_MLX_PROFILE) {
     const repaired = repairQwenMlxEvent(frame, data, state);
-    if (repaired.suppress) return "";
+    if (repaired.suppress) return repaired.suffix || "";
     data = repaired.data;
     suffix = repaired.suffix;
   }
@@ -478,13 +633,17 @@ function normalizeResponsesEvent(frame, state, profile) {
   return serializeFrame(frame, data) + suffix;
 }
 
-export function createResponsesStreamTransform({ profile } = {}) {
+export function createResponsesStreamTransform({ profile, qwenToolContinuation = false } = {}) {
   let buffer = "";
   const state = {
     ...streamState(),
     qwenMessageId: undefined,
     qwenProgressInserted: false,
     qwenToolIndexes: new Map(),
+    qwenToolContinuation,
+    qwenFinalCallIds: new Set(),
+    qwenFinalArguments: "",
+    qwenFinalMessage: undefined,
   };
   const decoder = new TextDecoder();
   const nextBoundary = (value) => {
@@ -532,7 +691,7 @@ export function createResponsesStreamTransform({ profile } = {}) {
   });
 }
 
-export function createResponsesJsonTransform({ profile } = {}) {
+export function createResponsesJsonTransform({ profile, qwenToolContinuation = false } = {}) {
   let body = "";
   return new Transform({
     transform(chunk, _encoding, callback) {
@@ -548,7 +707,7 @@ export function createResponsesJsonTransform({ profile } = {}) {
         return;
       }
       try {
-        this.push(JSON.stringify(normalizeResponseBody(parsed, { profile })));
+        this.push(JSON.stringify(normalizeResponseBody(parsed, { profile, qwenToolContinuation })));
       } catch (error) {
         callback(error);
         return;
