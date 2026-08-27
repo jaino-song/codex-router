@@ -87,6 +87,7 @@ test("provider registry exposes configured API and OAuth model families", () => 
       "commandcode/qwen3.7-plus",
       "commandcode/qwen3.8-max",
       "commandcode/step-3.7-flash",
+      "custom/qwen3.8-27b-uncensored",
       "custom/qwen3.8-27b",
       "deepseek/deepseek-v4-flash",
       "deepseek/deepseek-v4-flash-vision-exp",
@@ -381,9 +382,9 @@ test("provider registry exposes configured API and OAuth model families", () => 
   const customModels = LISTED_MODELS.filter(({ provider }) => provider === "custom");
   assert.deepEqual(
     customModels.map(({ slug }) => slug),
-    ["custom/qwen3.8-27b"],
+    ["custom/qwen3.8-27b-uncensored", "custom/qwen3.8-27b"],
   );
-  const [qwen38] = customModels;
+  const [qwen38Mlx, qwen38] = customModels;
   assert.equal(
     qwen38.endpoint.baseUrl,
     "https://g9hnto0u7lvbu837.us-east-2.aws.endpoints.huggingface.cloud/v1",
@@ -400,6 +401,16 @@ test("provider registry exposes configured API and OAuth model families", () => 
   assert.equal(qwen38.contextWindow, 262144);
   assert.deepEqual(qwen38.inputModalities, ["text", "image"]);
   assert.equal(qwen38.requestProfile, "qwen38-community");
+  assert.equal(qwen38Mlx.displayName, "Qwen 3.8 27b Uncensored");
+  assert.equal(qwen38Mlx.endpoint.baseUrl, "http://127.0.0.1:8080/v1");
+  assert.equal(qwen38Mlx.endpoint.keyless, true);
+  assert.equal(qwen38Mlx.endpoint.id, "custom/qwen3.8-27b-uncensored");
+  assert.equal(qwen38Mlx.upstreamModel, "qwen3.8-27b-uncensored");
+  assert.equal(qwen38Mlx.contextWindow, 131072);
+  assert.equal(qwen38Mlx.autoCompact, 120000);
+  assert.deepEqual(qwen38Mlx.inputModalities, ["text"]);
+  assert.equal(qwen38Mlx.requestProfile, "qwen38-mlx");
+  assert.equal(qwen38Mlx.supportsApplyPatchTool, false);
   // Every other provider is its own endpoint, so the two answers coincide.
   const deepseekModel = LISTED_MODELS.find(({ provider }) => provider === "deepseek");
   assert.equal(endpointForModel(deepseekModel), PROVIDERS.get("deepseek"));
@@ -1347,7 +1358,7 @@ test("credential-free endpoints are allowlisted addresses, at the provider and a
     // JSON fragment is the thing that must not be able to widen it.
     const customModel = (mutate) => (registry) => {
       registry.models = registry.models.map((model) =>
-        model.provider === "custom" ? mutate(model) : model,
+        model.slug === "custom/qwen3.8-27b" ? mutate(model) : model,
       );
     };
 
