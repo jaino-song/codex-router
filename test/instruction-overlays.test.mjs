@@ -20,6 +20,18 @@ test("Grok 4.6 OAuth distinguishes local files from discovered MCP resources", (
   assert.match(instructions, /Keep using read_mcp_resource for valid resources/i);
 });
 
+test("Qwen concise progress summaries are useful without exposing hidden reasoning", () => {
+  const model = MODEL_BY_SLUG.get("custom/qwen3.8-27b-uncensored");
+  assert.equal(model?.instructionOverlay, "concise-progress-summaries");
+
+  const instructions = applyInstructionOverlay("Base instructions.", model.instructionOverlay);
+  assert.match(instructions, /Before the first tool call.*one short commentary update/is);
+  assert.match(instructions, /material finding, blocker, changed approach, or meaningful milestone/i);
+  assert.match(instructions, /Do not narrate each command or tool result/i);
+  assert.match(instructions, /Avoid generic repeated status messages/i);
+  assert.match(instructions, /without exposing hidden chain-of-thought or private scratch work/i);
+});
+
 test("token maxxing activates exactly at seventy percent of auto-compaction", () => {
   const base = {
     enabled: true,
