@@ -325,6 +325,18 @@ test("routed models advertise reasoning summaries only when the registry opts in
   assert.equal(summarized.default_reasoning_summary, "auto");
 });
 
+test("commentary progress overlays do not claim native reasoning-summary support", () => {
+  const model = routedModel(template, {
+    ...grok,
+    instructionOverlay: "concise-progress-summaries",
+  });
+
+  assert.match(model.base_instructions, /Concise progress summaries/);
+  assert.match(model.model_messages.instructions_template, /Concise progress summaries/);
+  assert.equal(model.supports_reasoning_summaries, false);
+  assert.equal(model.default_reasoning_summary, "none");
+});
+
 test("ClinePass routed models omit the unsupported reasoning-effort selector", () => {
   const clinepass = routedModel(template, { ...grok, requestProfile: "clinepass" });
   assert.equal("default_reasoning_level" in clinepass, false);

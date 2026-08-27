@@ -496,6 +496,10 @@ test("provider registry exposes configured API and OAuth model families", () => 
   assert.equal(qwen38Mlx.autoCompact, 120000);
   assert.deepEqual(qwen38Mlx.inputModalities, ["text"]);
   assert.equal(qwen38Mlx.requestProfile, "qwen38-mlx");
+  assert.equal(qwen38Mlx.instructionOverlay, "concise-progress-summaries");
+  assert.match(qwen38Mlx.description, /4-bit MLX weights/);
+  assert.match(qwen38Mlx.description, /8-bit KV cache/);
+  assert.match(qwen38Mlx.description, /APC prefix reuse/);
   assert.equal(qwen38Mlx.supportsApplyPatchTool, false);
   // Every other provider is its own endpoint, so the two answers coincide.
   const deepseekModel = LISTED_MODELS.find(({ provider }) => provider === "deepseek");

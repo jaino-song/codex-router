@@ -13,7 +13,7 @@
       },
       "listed": true,
       "displayName": "Qwen 3.8 27b Uncensored",
-      "description": "Local Qwen3.8 27B Uncensored using 6-bit MLX weights, BF16 KV cache, MTP speculative decoding, text input, and a 128K context window.",
+      "description": "Local Qwen3.8 27B Uncensored using 4-bit MLX weights, 8-bit KV cache, APC prefix reuse, text input, and a 128K context window.",
       "priority": 145,
       "defaultEffort": "medium",
       "reasoningLevels": [
@@ -36,9 +36,10 @@
         "text"
       ],
       "requestProfile": "qwen38-mlx",
+      "instructionOverlay": "concise-progress-summaries",
       "supportsApplyPatchTool": false,
       "multiAgentVersion": "v1",
-      "compHash": "custom-qwen3-8-27b-uncensored-v1"
+      "compHash": "custom-qwen3-8-27b-uncensored-v2"
     }
   ]
 }

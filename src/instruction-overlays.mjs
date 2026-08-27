@@ -17,6 +17,17 @@ const OVERLAYS = {
 - Treat ordinary local filesystem paths as files, never as MCP resource URIs. Use an available filesystem or shell tool, such as exec_command, to inspect local files.
 - Call read_mcp_resource only with a server name and URI returned by MCP resource or resource-template discovery in the current session. Never invent an MCP server name such as file.
 - If an MCP read reports an unknown server or invalid URI, do not repeat the same invalid call for other local paths. Return to the available filesystem tools. Keep using read_mcp_resource for valid resources returned by MCP discovery.`,
+  "concise-progress-summaries": `## Concise progress summaries
+- Before the first tool call in a turn, send one short commentary update stating the immediate objective and next action.
+- During long-running work, send another short commentary update only for a material finding, blocker, changed approach, or meaningful milestone. Do not narrate each command or tool result.
+- Group routine tool calls under one update. Avoid generic repeated status messages such as \"running command\" or \"command completed.\"
+- Describe decisions and evidence at a high level without exposing hidden chain-of-thought or private scratch work.
+- After a tool result, continue execution unless user input is required. Lead the final response with the outcome and verification.`,
+  "token-maxxing": `## Context pressure mode
+- Be terse in commentary and final prose while keeping code, commands, errors, and required evidence exact.
+- Prefer targeted reads, bounded output, and commands that report failures or summaries. Do not reread context already present.
+- Continue through routine work without narration. Use tools only when they materially advance the task.
+- Treat shaped tool output as a compact view. Repeat its named source call only when omitted detail is necessary.`,
 };
 
 export function instructionOverlayExists(name) {
