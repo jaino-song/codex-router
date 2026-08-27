@@ -444,7 +444,7 @@ export function downgradeOriginalImageDetail(input) {
 }
 
 const TRUNCATED_TOOL_DESCRIPTION_SUFFIX =
-  "\n\n[Description truncated for the local context window. Use tool_search to load additional tools on demand.]";
+  "\n\n[Description truncated for the local context window. Use the available lazy discovery mechanism to load details on demand.]";
 
 function boundedToolDescription(tool, maxDescriptionChars) {
   if (!Number.isInteger(maxDescriptionChars) || maxDescriptionChars <= 0) return tool;

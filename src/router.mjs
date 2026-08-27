@@ -2280,10 +2280,7 @@ async function buildRoutedRequest({ request, payload, route, agedInput, tokenMax
   // flattened into ordinary functions; the response transform maps calls back
   // to the client's native namespace shape.
   if (chatCompletionsProvider) {
-    const lazyLocalToolSurface =
-      route.requestProfile === "qwen38-mlx" &&
-      Array.isArray(tools) &&
-      tools.some((tool) => tool?.type === "tool_search" && tool.execution === "client");
+    const lazyLocalToolSurface = route.requestProfile === "qwen38-mlx";
     // Relay the app's full native toolset (threads, automations, app
     // navigation) to the provider. The client registers these tools with
     // deferLoading and executes the calls natively, but only sends a reduced
@@ -2294,10 +2291,11 @@ async function buildRoutedRequest({ request, payload, route, agedInput, tokenMax
     // The local MLX route has a 128K context ceiling. Restoring the full
     // deferred app catalog and flattening every MCP namespace made an empty
     // Codex task exceed that ceiling before the user's first token. When the
-    // client supplied its native deferred-search control, keep the small core
-    // surface and collaboration runtime eager; app and MCP definitions are
-    // materialized by flattenToolSearchHistory only after the model searches
-    // for them. Other chat providers retain the established full inventory.
+    // keep the small core surface and collaboration runtime eager. Current
+    // Codex builds may expose lazy discovery either as native tool_search or
+    // through the functions.exec/ALL_TOOLS bridge, so the route profile -- not
+    // one optional wire shape -- selects this policy. Other chat providers
+    // retain the established full inventory.
     if (!lazyLocalToolSurface) {
       const merged = mergeCodexAppTools(tools);
       if (merged.merged) tools = merged.tools;
