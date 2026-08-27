@@ -2280,6 +2280,10 @@ async function buildRoutedRequest({ request, payload, route, agedInput, tokenMax
   // flattened into ordinary functions; the response transform maps calls back
   // to the client's native namespace shape.
   if (chatCompletionsProvider) {
+    const lazyLocalToolSurface =
+      route.requestProfile === "qwen38-mlx" &&
+      Array.isArray(tools) &&
+      tools.some((tool) => tool?.type === "tool_search" && tool.execution === "client");
     // Relay the app's full native toolset (threads, automations, app
     // navigation) to the provider. The client registers these tools with
     // deferLoading and executes the calls natively, but only sends a reduced
@@ -2287,9 +2291,26 @@ async function buildRoutedRequest({ request, payload, route, agedInput, tokenMax
     // so routed models see what native models see. The router never executes
     // these calls -- the app owns thread, automation, and navigation state --
     // it only relays definitions and results.
-    const merged = mergeCodexAppTools(tools);
-    if (merged.merged) tools = merged.tools;
-    const flattened = flattenNamespaceTools(tools);
+    // The local MLX route has a 128K context ceiling. Restoring the full
+    // deferred app catalog and flattening every MCP namespace made an empty
+    // Codex task exceed that ceiling before the user's first token. When the
+    // client supplied its native deferred-search control, keep the small core
+    // surface and collaboration runtime eager; app and MCP definitions are
+    // materialized by flattenToolSearchHistory only after the model searches
+    // for them. Other chat providers retain the established full inventory.
+    if (!lazyLocalToolSurface) {
+      const merged = mergeCodexAppTools(tools);
+      if (merged.merged) tools = merged.tools;
+    }
+    const flattened = flattenNamespaceTools(
+      tools,
+      lazyLocalToolSurface
+        ? {
+            includeNamespace: (name) => name === "collaboration",
+            maxDescriptionChars: 1_024,
+          }
+        : undefined,
+    );
     namespacesFlattened = flattened.flattened;
     flattenedNamespaces = flattened.namespaces;
     if (namespacesFlattened) {

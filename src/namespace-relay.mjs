@@ -443,21 +443,44 @@ export function downgradeOriginalImageDetail(input) {
   return changed ? converted : input;
 }
 
-function flattenNamespaceChild(namespace, fn) {
+const TRUNCATED_TOOL_DESCRIPTION_SUFFIX =
+  "\n\n[Description truncated for the local context window. Use tool_search to load additional tools on demand.]";
+
+function boundedToolDescription(tool, maxDescriptionChars) {
+  if (!Number.isInteger(maxDescriptionChars) || maxDescriptionChars <= 0) return tool;
+  if (typeof tool?.description !== "string" || tool.description.length <= maxDescriptionChars) {
+    return tool;
+  }
+  const suffix = TRUNCATED_TOOL_DESCRIPTION_SUFFIX.slice(0, maxDescriptionChars);
+  const prefixLength = Math.max(0, maxDescriptionChars - suffix.length);
+  return {
+    ...tool,
+    description: `${tool.description.slice(0, prefixLength)}${suffix}`,
+  };
+}
+
+function flattenNamespaceChild(namespace, fn, maxDescriptionChars) {
   const clientSchema = fn.parameters ?? fn.inputSchema;
   const parameters =
     clientSchema === undefined ? undefined : providerToolSchema(clientSchema);
-  return {
+  return boundedToolDescription({
     ...fn,
     name: `${namespace}${NAMESPACE_DELIMITER}${fn.name}`,
     ...(parameters === undefined ? {} : { parameters }),
-  };
+  }, maxDescriptionChars);
 }
 
 // Flatten every namespace entry into plain functions named
 // `<namespace>__<tool>`. Returns the set of namespaces that were flattened
 // (name -> tool names) so callers can rename history and restore calls.
-export function flattenNamespaceTools(tools, { bridgeToolSearch = true } = {}) {
+export function flattenNamespaceTools(
+  tools,
+  {
+    bridgeToolSearch = true,
+    includeNamespace = () => true,
+    maxDescriptionChars,
+  } = {},
+) {
   if (!Array.isArray(tools)) return { tools, flattened: false, namespaces: new Map() };
   const flattened = [];
   const namespaces = new Map();
@@ -480,12 +503,12 @@ export function flattenNamespaceTools(tools, { bridgeToolSearch = true } = {}) {
         const parameters =
           tool.parameters === undefined ? undefined : providerToolSchema(tool.parameters);
         const description = providerToolSearchDescription(tool.description, toolSearchName);
-        flattened.push({
+        flattened.push(boundedToolDescription({
           type: "function",
           name: toolSearchName,
           ...(description === undefined ? {} : { description }),
           ...(parameters === undefined ? {} : { parameters }),
-        });
+        }, maxDescriptionChars));
         toolSearchRelay = { providerName: toolSearchName };
       }
       continue;
@@ -494,6 +517,8 @@ export function flattenNamespaceTools(tools, { bridgeToolSearch = true } = {}) {
       const names = new Set();
       for (const fn of tool.tools) {
         if (!fn?.name) continue;
+        names.add(fn.name);
+        if (!includeNamespace(tool.name)) continue;
         // Codex names function schemas `inputSchema`, while LiteLLM's
         // Responses -> Chat Completions adapter reads only `parameters`.
         // Without this alias every flattened namespace child reaches the
@@ -509,8 +534,7 @@ export function flattenNamespaceTools(tools, { bridgeToolSearch = true } = {}) {
         // never touches automations still dies on its first message. Normalize
         // only the provider-facing copy; `inputSchema` stays exactly as the
         // client sent it.
-        flattened.push(flattenNamespaceChild(tool.name, fn));
-        names.add(fn.name);
+        flattened.push(flattenNamespaceChild(tool.name, fn, maxDescriptionChars));
         if (tool.name === "collaboration" && fn.name === "spawn_agent") {
           schemaStringValues(fn.inputSchema?.properties?.model, spawnAgentModels);
         }
@@ -530,8 +554,9 @@ export function flattenNamespaceTools(tools, { bridgeToolSearch = true } = {}) {
     // provider that objects. `providerToolSchema` returns anything it does not
     // recognize unchanged, so a tool with an ordinary root is not copied.
     const repaired = repairToolSchemaRoot(tool);
-    if (repaired !== tool) changed = true;
-    flattened.push(repaired);
+    const bounded = boundedToolDescription(repaired, maxDescriptionChars);
+    if (bounded !== tool) changed = true;
+    flattened.push(bounded);
   }
   if (spawnAgentModels.size > 0) SPAWN_AGENT_MODELS.set(namespaces, spawnAgentModels);
   if (toolSearchRelay) TOOL_SEARCH_RELAYS.set(namespaces, toolSearchRelay);
