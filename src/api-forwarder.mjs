@@ -81,6 +81,7 @@ import {
   endpointCapabilityError,
   supportsOpenAIModelEndpoint,
 } from "./openai-endpoint-policy.mjs";
+import { applyQwenToolContinuation } from "./qwen-tool-continuation.mjs";
 
 installStableFetchTransport();
 
@@ -666,6 +667,7 @@ function normalizeBody(buffer, contentType, route) {
     throw error;
   }
   let payload = JSON.parse(buffer.toString("utf8"));
+  let qwenToolContinuation = false;
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     const error = new Error("Request JSON must be an object.");
     error.status = 400;
@@ -1030,6 +1032,9 @@ function normalizeBody(buffer, contentType, route) {
     if (Array.isArray(payload.messages)) {
       payload.messages = normalizeQwen38SystemMessages(payload.messages);
     }
+    const continuation = applyQwenToolContinuation(payload);
+    payload = continuation.payload;
+    qwenToolContinuation = continuation.active;
   } else if (model.requestProfile === "minimax-m3") {
     // MiniMax uses its own thinking control on the OpenAI-compatible
     // Chat Completions endpoint instead of reasoning_effort.
@@ -1106,6 +1111,7 @@ function normalizeBody(buffer, contentType, route) {
     provider,
     endpoint,
     payload,
+    qwenToolContinuation,
     responseAdapter: modelProtocol === "openai-responses" ? "responses" : undefined,
   };
 }
@@ -1187,12 +1193,14 @@ async function relayUpstreamResponse(
       ? createResponsesStreamTransform({
           flatToNative,
           profile: normalized.model.requestProfile,
+          qwenToolContinuation: normalized.qwenToolContinuation,
         })
       : undefined,
     responsesJson
       ? createResponsesJsonTransform({
           flatToNative,
           profile: normalized.model.requestProfile,
+          qwenToolContinuation: normalized.qwenToolContinuation,
         })
       : undefined,
     zaiCacheUsageTransform(normalized.provider.id, upstreamContentType),

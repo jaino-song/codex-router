@@ -4993,6 +4993,39 @@ function curatedQwen38EffortModel(requestProfile = "qwen38-community") {
   return { dir, file, gatewayModel: "openrouter-qwen-3-8-27b-effort" };
 }
 
+function curatedQwen38ResponsesModel(baseUrl) {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "routing-qwen38-responses-models-"));
+  const file = path.join(dir, "user-models.json");
+  writeFileSync(
+    file,
+    JSON.stringify({
+      version: 1,
+      models: [
+        {
+          slug: "custom/qwen3.8-27b-continuation-test",
+          gatewayModel: "custom-qwen3-8-27b-continuation-test",
+          upstreamModel: "qwen3.8-27b-continuation-test",
+          provider: "custom",
+          endpoint: { baseUrl, keyless: true, protocol: "openai-responses" },
+          listed: true,
+          displayName: "Qwen3.8 27B continuation fixture",
+          description: "Test fixture.",
+          priority: 500,
+          defaultEffort: "medium",
+          reasoningLevels: [{ effort: "medium", description: "Balanced reasoning" }],
+          contextWindow: 131072,
+          autoCompact: 120000,
+          inputModalities: ["text"],
+          requestProfile: "qwen38-mlx",
+          compHash: "custom-qwen3-8-27b-continuation-test-v1",
+        },
+      ],
+    }),
+    "utf8",
+  );
+  return { dir, file, gatewayModel: "custom-qwen3-8-27b-continuation-test" };
+}
+
 test("API forwarder maps the Codex effort ladder onto MLX Qwen3.8 tiers", async () => {
   const upstreamRequests = [];
   const upstream = await mockServer(async (request, response) => {
@@ -5064,6 +5097,80 @@ test("API forwarder maps the Codex effort ladder onto MLX Qwen3.8 tiers", async 
       { role: "system", content: "Be brief." },
       { role: "user", content: "hello" },
     ]);
+  } finally {
+    await stopChild(forwarder);
+    await closeServer(upstream.server);
+    rmSync(curated.dir, { recursive: true, force: true });
+  }
+});
+
+test("API forwarder makes Qwen continue after a tool result and hides its final-answer tool", async () => {
+  const upstreamRequests = [];
+  const upstream = await mockServer(async (request, response) => {
+    upstreamRequests.push({ url: request.url, body: await bodyJson(request) });
+    json(response, 200, {
+      id: "resp-qwen-continuation",
+      object: "response",
+      status: "completed",
+      instructions: "Call __codex_router_submit_final.",
+      output: [
+        {
+          type: "function_call",
+          call_id: "call-final",
+          name: "__codex_router_submit_final",
+          arguments: '{"answer":"The coding task is complete."}',
+        },
+      ],
+    });
+  });
+  const curated = curatedQwen38ResponsesModel(`http://127.0.0.1:${upstream.port}/v1`);
+  const forwarderPort = await openPort();
+  const forwarder = run("api-forwarder.mjs", {
+    CODEX_ROUTER_API_PORT: String(forwarderPort),
+    MODEL_ROUTER_USER_MODELS: curated.file,
+    CODEX_ROUTER_QUIET: "1",
+  });
+
+  try {
+    await waitFor(`http://127.0.0.1:${forwarderPort}/health`, forwarder, {
+      Authorization: `Bearer ${INTERNAL_KEY}`,
+    });
+    const response = await fetch(`http://127.0.0.1:${forwarderPort}/v1/responses`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${INTERNAL_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: `responses/${curated.gatewayModel}`,
+        stream: false,
+        input: [
+          { type: "message", role: "user", content: [{ type: "input_text", text: "fix it" }] },
+          { type: "function_call", call_id: "call-1", name: "exec_command", arguments: "{}" },
+          { type: "function_call_output", call_id: "call-1", output: "ok" },
+        ],
+        tools: [
+          {
+            type: "function",
+            name: "exec_command",
+            parameters: { type: "object", properties: {} },
+          },
+        ],
+        tool_choice: "auto",
+      }),
+    });
+
+    assert.equal(response.status, 200, forwarder.testErrors());
+    const request = upstreamRequests[0];
+    assert.equal(request.url, "/v1/responses");
+    assert.equal(request.body.tool_choice, "required");
+    assert.equal(request.body.parallel_tool_calls, false);
+    assert.equal(request.body.input.at(-1).role, "developer");
+    assert.equal(request.body.tools.at(-1).name, "__codex_router_submit_final");
+    const body = await response.json();
+    assert.equal(body.output_text, "The coding task is complete.");
+    assert.deepEqual(body.output.map((item) => item.type), ["message"]);
+    assert.doesNotMatch(JSON.stringify(body), /__codex_router_submit_final/);
   } finally {
     await stopChild(forwarder);
     await closeServer(upstream.server);
