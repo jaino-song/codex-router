@@ -44,7 +44,11 @@ import {
 } from "./commandcode-plan.mjs";
 import { relayCommandCodeGenerate } from "./commandcode-relay.mjs";
 import { VERSION } from "./version.mjs";
-import { installStableFetchTransport } from "./fetch-transport.mjs";
+import {
+  installStableFetchTransport,
+  loopbackGenerationFetch,
+} from "./fetch-transport.mjs";
+import { localTransportHost } from "./transport-failure.mjs";
 import { zaiCacheUsageTransform } from "./zai-cache-usage.mjs";
 import {
   createResponsesJsonTransform,
@@ -77,6 +81,9 @@ const QUIET =
   process.env.MODEL_ROUTER_QUIET === "1" ||
   (TARGET === "codex" &&
     (process.env.CODEX_ROUTER_QUIET === "1" || process.env.KIMI_PROXY_QUIET === "1"));
+
+const QWEN38_MLX_PROFILE = "qwen38-mlx";
+const QWEN38_MLX_TOOL_OUTPUT_LIMIT = 1024;
 
 if (!INTERNAL_KEY) throw new Error("MODEL_ROUTER_INTERNAL_KEY is required.");
 
@@ -804,7 +811,7 @@ function normalizeBody(buffer, contentType, route) {
     if (Array.isArray(payload.messages)) {
       payload.messages = normalizeQwen38SystemMessages(payload.messages);
     }
-  } else if (model.requestProfile === "qwen38-mlx") {
+  } else if (model.requestProfile === QWEN38_MLX_PROFILE) {
     // The MLX chat template exposes three literal thinking levels. Preserve an
     // absent effort so the model applies its own default, and fold the wider
     // Codex ladder onto the nearest supported tier for explicit selections.
@@ -826,6 +833,20 @@ function normalizeBody(buffer, contentType, route) {
     }
     if (Array.isArray(payload.messages)) {
       payload.messages = normalizeQwen38SystemMessages(payload.messages);
+    }
+    // A tool-bearing Codex turn needs a decision or another tool call, not a
+    // 4K-token monologue. At the measured 8-10 tokens/s, the old 4096-token
+    // allowance routinely crossed the transport's five-minute header wait.
+    // Preserve smaller explicit budgets and leave tool-free compaction turns
+    // untouched, while bounding the interactive coding loop to roughly two
+    // minutes of worst-case generation.
+    if (
+      Array.isArray(payload.tools) &&
+      payload.tools.length > 0 &&
+      (!Number.isInteger(payload.max_output_tokens) ||
+        payload.max_output_tokens > QWEN38_MLX_TOOL_OUTPUT_LIMIT)
+    ) {
+      payload.max_output_tokens = QWEN38_MLX_TOOL_OUTPUT_LIMIT;
     }
     const continuation = applyQwenToolContinuation(payload);
     payload = continuation.payload;
@@ -955,6 +976,19 @@ function upstreamHeaders(requestHeaders, body, apiKey, provider, extraHeaders = 
   // redundant, and the HTTP/1.1 dispatcher rejects the request outright
   // (UND_ERR_INVALID_ARG) when a caller-supplied value accompanies a body.
   return headers;
+}
+
+function fetchUpstream(normalized, target, init) {
+  if (normalized.model.requestProfile === QWEN38_MLX_PROFILE) {
+    try {
+      if (localTransportHost(new URL(target).hostname)) {
+        return loopbackGenerationFetch(target, init);
+      }
+    } catch {
+      // The ordinary fetch path below owns malformed-URL reporting.
+    }
+  }
+  return fetch(target, init);
 }
 
 async function upstreamSession(provider, credential, payload, options = {}, endpoint = provider) {
@@ -1135,7 +1169,7 @@ async function handleRequest(request, response) {
     normalized.endpoint,
   );
   let target = `${session.baseUrl}${route}${requestUrl.search}`;
-  let upstream = await fetch(target, {
+  let upstream = await fetchUpstream(normalized, target, {
     method: request.method,
     headers: upstreamHeaders(
       request.headers,

@@ -84,3 +84,32 @@ export function loopbackProbeDispatcher() {
 export function loopbackProbeFetch(url, init = {}, dispatcher = loopbackProbeDispatcher()) {
   return undiciFetch(url, { ...init, dispatcher });
 }
+
+// Local generation is different from both remote provider traffic and health
+// probes: mlx-vlm does not send response headers until a non-streaming
+// generation is complete, which can legitimately take longer than Undici's
+// five-minute default. Keep that wider wait isolated to the loopback model so
+// a stalled remote provider still retains the normal transport deadline.
+export function createLoopbackGenerationDispatcher({ AgentClass = Agent } = {}) {
+  return new AgentClass({
+    allowH2: false,
+    pipelining: 1,
+    headersTimeout: 590_000,
+    bodyTimeout: 0,
+  });
+}
+
+let sharedGenerationDispatcher;
+
+export function loopbackGenerationDispatcher() {
+  sharedGenerationDispatcher ??= createLoopbackGenerationDispatcher();
+  return sharedGenerationDispatcher;
+}
+
+export function loopbackGenerationFetch(
+  url,
+  init = {},
+  dispatcher = loopbackGenerationDispatcher(),
+) {
+  return undiciFetch(url, { ...init, dispatcher });
+}

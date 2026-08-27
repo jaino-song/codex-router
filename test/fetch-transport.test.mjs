@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { getGlobalDispatcher, setGlobalDispatcher } from "undici";
 
 import {
+  createLoopbackGenerationDispatcher,
   createLoopbackProbeDispatcher,
   fetchDispatcherOptions,
   installStableFetchTransport,
@@ -79,6 +80,20 @@ test("the process-wide pool does not hold idle sockets past the undici default",
     environment: {},
   });
   assert.equal(probe.options.keepAliveTimeout, 10_000);
+});
+
+test("loopback generation can wait for a cold local model without changing remote timeouts", () => {
+  const generation = createLoopbackGenerationDispatcher({
+    AgentClass: class {
+      constructor(options) {
+        this.options = options;
+      }
+    },
+  });
+
+  assert.equal(generation.options.headersTimeout, 590_000);
+  assert.equal(generation.options.bodyTimeout, 0);
+  assert.equal("headersTimeout" in fetchDispatcherOptions(), false);
 });
 
 test("the router uses the environment proxy dispatcher only with explicit opt-in", () => {

@@ -910,6 +910,18 @@ test("only Z.ai Coding Plan model groups disable LiteLLM rate-limit retries", ()
   assert.doesNotMatch(rendered, /zai-api-glm-5-3:\n\s+RateLimitErrorRetries: 0/);
 });
 
+test("local MLX Qwen disables LiteLLM retries for every failure class", () => {
+  const rendered = renderLiteLlmConfig();
+  const model = MODEL_BY_SLUG.get("custom/qwen3.8-27b-uncensored");
+
+  assert.ok(model, "local MLX Qwen is missing from the registry");
+  const deployment = rendered
+    .split(`  - model_name: "${model.gatewayModel}"\n`)[1]
+    ?.split("\n  - model_name: ")[0];
+  assert.ok(deployment, "local MLX Qwen deployment is missing from LiteLLM config");
+  assert.match(deployment, /^\s+num_retries: 0$/m);
+});
+
 test("LiteLLM configuration is generated from every registry route", () => {
   const rendered = renderLiteLlmConfig();
   for (const model of MODELS) {

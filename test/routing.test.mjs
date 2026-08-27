@@ -3654,6 +3654,7 @@ test("API forwarder makes Qwen continue after a tool result and hides its final-
       body: JSON.stringify({
         model: `responses/${curated.gatewayModel}`,
         stream: false,
+        max_output_tokens: 4096,
         input: [
           { type: "message", role: "user", content: [{ type: "input_text", text: "fix it" }] },
           { type: "function_call", call_id: "call-1", name: "exec_command", arguments: "{}" },
@@ -3675,6 +3676,7 @@ test("API forwarder makes Qwen continue after a tool result and hides its final-
     assert.equal(request.url, "/v1/responses");
     assert.equal(request.body.tool_choice, "required");
     assert.equal(request.body.parallel_tool_calls, false);
+    assert.equal(request.body.max_output_tokens, 1024);
     assert.equal(request.body.input.at(-1).role, "developer");
     assert.equal(request.body.tools.at(-1).name, "__codex_router_submit_final");
     const body = await response.json();
