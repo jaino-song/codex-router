@@ -60,7 +60,12 @@ import {
   PORTS,
   loopback,
 } from "./paths.mjs";
-import { MODEL_BY_SLUG, PROVIDERS, providerForModel } from "./model-registry.mjs";
+import {
+  MODEL_BY_SLUG,
+  PROVIDERS,
+  protocolForModel,
+  providerForModel,
+} from "./model-registry.mjs";
 import { createHealthCache } from "./health-cache.mjs";
 import { discoveryDisabled } from "./discovery-mode.mjs";
 import { readNativeAliases } from "./native-alias.mjs";
@@ -2248,7 +2253,8 @@ async function buildRoutedRequest({ request, payload, route, agedInput, tokenMax
   // having quietly replaced the prompt with its own letters.
   const input = Array.isArray(bridged) ? [...bridged] : bridged;
   const provider = providerForModel(route);
-  const chatCompletionsProvider = provider?.protocol !== "openai-responses";
+  const routeProtocol = protocolForModel(route);
+  const chatCompletionsProvider = routeProtocol !== "openai-responses";
   // Thinking chat providers need the assistant's reasoning replayed, but
   // LiteLLM drops Responses `reasoning` input items. Generic providers keep
   // the established visible-content carry used for DeepSeek. GLM's native
@@ -2279,8 +2285,8 @@ async function buildRoutedRequest({ request, payload, route, agedInput, tokenMax
   // peekaboo, github, ...). Chat-completions providers need every namespace
   // flattened into ordinary functions; the response transform maps calls back
   // to the client's native namespace shape.
-  if (chatCompletionsProvider) {
-    const lazyLocalToolSurface = route.requestProfile === "qwen38-mlx";
+  const lazyLocalToolSurface = route.requestProfile === "qwen38-mlx";
+  if (chatCompletionsProvider || lazyLocalToolSurface) {
     // Relay the app's full native toolset (threads, automations, app
     // navigation) to the provider. The client registers these tools with
     // deferLoading and executes the calls natively, but only sends a reduced
@@ -2355,7 +2361,7 @@ async function buildRoutedRequest({ request, payload, route, agedInput, tokenMax
     routedInput = customTools.input;
     routedToolChoice = customTools.toolChoice;
   }
-  if (chatCompletionsProvider) {
+  if (chatCompletionsProvider || lazyLocalToolSurface) {
     const searchHistory = flattenToolSearchHistory(
       routedInput,
       tools,
