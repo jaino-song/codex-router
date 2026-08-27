@@ -24,6 +24,7 @@ const {
   MODELS,
   PROVIDERS,
   providerNeedsNoKey,
+  protocolForModel,
   readRegistryDocument,
   resolveProviderBaseUrl,
 } = await import("../src/model-registry.mjs");
@@ -404,6 +405,7 @@ test("provider registry exposes configured API and OAuth model families", () => 
   assert.equal(qwen38Mlx.displayName, "Qwen 3.8 27b Uncensored");
   assert.equal(qwen38Mlx.endpoint.baseUrl, "http://127.0.0.1:8080/v1");
   assert.equal(qwen38Mlx.endpoint.keyless, true);
+  assert.equal(qwen38Mlx.endpoint.protocol, "openai-responses");
   assert.equal(qwen38Mlx.endpoint.id, "custom/qwen3.8-27b-uncensored");
   assert.equal(qwen38Mlx.upstreamModel, "qwen3.8-27b-uncensored");
   assert.equal(qwen38Mlx.contextWindow, 131072);
@@ -415,6 +417,7 @@ test("provider registry exposes configured API and OAuth model families", () => 
   assert.match(qwen38Mlx.description, /8-bit KV cache/);
   assert.match(qwen38Mlx.description, /APC prefix reuse/);
   assert.equal(qwen38Mlx.supportsApplyPatchTool, false);
+  assert.equal(protocolForModel(qwen38Mlx), "openai-responses");
   // Every other provider is its own endpoint, so the two answers coincide.
   const deepseekModel = LISTED_MODELS.find(({ provider }) => provider === "deepseek");
   assert.equal(endpointForModel(deepseekModel), PROVIDERS.get("deepseek"));
@@ -925,6 +928,10 @@ test("LiteLLM configuration is generated from every registry route", () => {
     rendered,
     /model: "openai\/responses\/opencode-go-responses-muse-spark-1-2-contributor"/,
   );
+  assert.match(
+    rendered,
+    /model: "openai\/responses\/custom-qwen3-8-27b-uncensored"/,
+  );
   assert.equal(
     MODELS.some((model) => model.provider === "github-copilot"),
     false,
@@ -1420,6 +1427,13 @@ test("credential-free endpoints are allowlisted addresses, at the provider and a
     })));
     assert.equal(forged.status, 1);
     assert.match(forged.stderr, /endpoint must not declare id or kind/);
+
+    const unsupportedProtocol = load(customModel((model) => ({
+      ...model,
+      endpoint: { ...model.endpoint, protocol: "websocket" },
+    })));
+    assert.equal(unsupportedProtocol.status, 1);
+    assert.match(unsupportedProtocol.stderr, /endpoint has an unsupported API protocol/);
 
     // A container has no address of its own; two answers to "where does this
     // go" would have a silent winner.

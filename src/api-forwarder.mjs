@@ -20,6 +20,7 @@ import {
   PROVIDERS,
   providerForModel,
   endpointForModel,
+  protocolForModel,
   resolveProviderBaseUrl,
 } from "./model-registry.mjs";
 import { cooldownUntil, parseRateLimitHeaders } from "./rate-limit-headers.mjs";
@@ -549,10 +550,11 @@ function normalizeBody(buffer, contentType, route) {
     error.status = 400;
     throw error;
   }
+  const modelProtocol = protocolForModel(model);
   const expectedRoute =
-    provider.protocol === "anthropic"
+    modelProtocol === "anthropic"
       ? "/messages"
-      : provider.protocol === "openai-responses"
+      : modelProtocol === "openai-responses"
         ? "/responses"
         : "/chat/completions";
   if (route !== expectedRoute) {
@@ -564,7 +566,7 @@ function normalizeBody(buffer, contentType, route) {
   // Responses providers get one checked boundary here. The request remains a
   // Responses request, but legacy aliases are normalized before any provider
   // sees it and the original payload remains available for retries.
-  if (provider.protocol === "openai-responses") {
+  if (modelProtocol === "openai-responses") {
     payload = normalizeOpenAIRequest(payload);
   }
 
@@ -576,7 +578,7 @@ function normalizeBody(buffer, contentType, route) {
   if (
     route === "/chat/completions" &&
     payload.stream === true &&
-    (provider.protocol === undefined || provider.protocol === "openai")
+    (modelProtocol === undefined || modelProtocol === "openai")
   ) {
     const streamOptions = payload.stream_options;
     payload.stream_options = {
@@ -650,7 +652,7 @@ function normalizeBody(buffer, contentType, route) {
   // the bridge lives. Say that in the model's own turn instead of dropping the
   // part or letting the provider refuse the whole conversation.
   if (!supportsImageInput(model)) {
-    const textPartType = provider.protocol === "openai-responses" ? "input_text" : "text";
+    const textPartType = modelProtocol === "openai-responses" ? "input_text" : "text";
     const reason =
       `${model.displayName || model.gatewayModel} cannot read images, and an image sent ` +
       "straight to the gateway skips the router's vision bridge";
@@ -901,7 +903,7 @@ function normalizeBody(buffer, contentType, route) {
     provider,
     endpoint,
     payload,
-    responseAdapter: provider.protocol === "openai-responses" ? "responses" : undefined,
+    responseAdapter: modelProtocol === "openai-responses" ? "responses" : undefined,
   };
 }
 
@@ -929,11 +931,12 @@ function upstreamHeaders(requestHeaders, body, apiKey, provider, extraHeaders = 
     }
     if (value !== undefined) headers[name] = Array.isArray(value) ? value.join(", ") : value;
   }
+  const modelProtocol = endpoint.protocol ?? provider.protocol;
   if (endpoint.authMode === "anonymous") {
     // The upstream explicitly permits anonymous access -- for a reseller's
     // free-model subset, or for a single allowlisted community endpoint.
     // Never forward the gateway's internal bearer token to either.
-  } else if (provider.protocol === "anthropic") {
+  } else if (modelProtocol === "anthropic") {
     headers["x-api-key"] = apiKey;
     headers["anthropic-version"] ||= "2023-06-01";
   } else {
@@ -1207,8 +1210,12 @@ async function handleRequest(request, response) {
   const responsesJson = normalized.responseAdapter === "responses" &&
     upstream.ok && upstreamContentType.toLowerCase().includes("application/json");
   const transform = [
-    responsesStream ? createResponsesStreamTransform() : undefined,
-    responsesJson ? createResponsesJsonTransform() : undefined,
+    responsesStream
+      ? createResponsesStreamTransform({ profile: normalized.model.requestProfile })
+      : undefined,
+    responsesJson
+      ? createResponsesJsonTransform({ profile: normalized.model.requestProfile })
+      : undefined,
     zaiCacheUsageTransform(normalized.provider.id, upstreamContentType),
   ].filter(Boolean);
   const denylist = transform.length

@@ -150,6 +150,52 @@ test("Responses stream keeps independent tool indices and usage across chunk bou
   assert.equal(output.at(-1).data, "[DONE]");
 });
 
+test("MLX Qwen Responses streams expose safe progress without raw reasoning", async () => {
+  const secretReasoning = "private chain of thought must never reach Codex";
+  const message = { id: "msg-1", type: "message", status: "in_progress", role: "assistant", content: [] };
+  const tool = {
+    id: "fc-1",
+    type: "function_call",
+    call_id: "call-1",
+    name: "exec_command",
+    arguments: '{"cmd":"pwd"}',
+  };
+  const source = [
+    `event: response.created\ndata: ${JSON.stringify({ type: "response.created", response: { id: "resp-qwen" } })}\n\n`,
+    `event: response.output_item.added\ndata: ${JSON.stringify({ type: "response.output_item.added", output_index: 0, item: message })}\n\n`,
+    `event: response.content_part.added\ndata: ${JSON.stringify({ type: "response.content_part.added", item_id: "msg-1", output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } })}\n\n`,
+    `event: response.reasoning_text.delta\ndata: ${JSON.stringify({ type: "response.reasoning_text.delta", item_id: "rs-1", output_index: 0, delta: secretReasoning })}\n\n`,
+    `event: response.reasoning_text.done\ndata: ${JSON.stringify({ type: "response.reasoning_text.done", item_id: "rs-1", output_index: 0, text: secretReasoning })}\n\n`,
+    `event: response.output_text.done\ndata: ${JSON.stringify({ type: "response.output_text.done", item_id: "msg-1", output_index: 0, content_index: 0, text: "" })}\n\n`,
+    `event: response.content_part.done\ndata: ${JSON.stringify({ type: "response.content_part.done", item_id: "msg-1", output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } })}\n\n`,
+    `event: response.output_item.done\ndata: ${JSON.stringify({ type: "response.output_item.done", output_index: 0, item: { ...message, status: "completed" } })}\n\n`,
+    `event: response.output_item.added\ndata: ${JSON.stringify({ type: "response.output_item.added", output_index: 2, item: tool })}\n\n`,
+    `event: response.function_call_arguments.done\ndata: ${JSON.stringify({ type: "response.function_call_arguments.done", output_index: 2, item_id: "fc-1", call_id: "call-1", name: "exec_command", arguments: tool.arguments, item: tool })}\n\n`,
+    `event: response.output_item.done\ndata: ${JSON.stringify({ type: "response.output_item.done", output_index: 2, item: tool })}\n\n`,
+    `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { id: "resp-qwen", status: "completed", output: [{ type: "reasoning", summary: [{ type: "summary_text", text: secretReasoning }] }, tool] } })}\n\n`,
+    "data: [DONE]\n\n",
+  ];
+
+  const rendered = await transformText(
+    createResponsesStreamTransform({ profile: "qwen38-mlx" }),
+    source,
+  );
+  const output = frames(rendered);
+  assert.doesNotMatch(rendered, new RegExp(secretReasoning));
+  assert.equal(output.some((frame) => frame.data?.type === "response.reasoning_text.delta"), false);
+  assert.match(
+    output.find((frame) => frame.data?.type === "response.output_text.delta")?.data.delta || "",
+    /checking the current state/i,
+  );
+  assert.equal(
+    output.find((frame) => frame.data?.type === "response.output_item.added" && frame.data.item?.type === "function_call")?.data.output_index,
+    1,
+  );
+  const completed = output.find((frame) => frame.data?.type === "response.completed");
+  assert.deepEqual(completed.data.response.output.map((item) => item.type), ["message", "function_call"]);
+  assert.equal(output.some((frame) => frame.data?.code === "invalid_responses_stream"), false);
+});
+
 test("Responses stream emits a terminal error instead of silently ending", async () => {
   const output = frames(await transformText(createResponsesStreamTransform(), [
     "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-2\"}}\n\n",
@@ -220,6 +266,27 @@ test("Responses JSON transform preserves usage and error-shaped payloads", async
   assert.deepEqual(JSON.parse(await transformText(createResponsesJsonTransform(), [JSON.stringify(response)])), response);
   const errorPayload = { error: { type: "invalid_request_error", message: "bad" } };
   assert.deepEqual(JSON.parse(await transformText(createResponsesJsonTransform(), [JSON.stringify(errorPayload)])), errorPayload);
+});
+
+test("MLX Qwen JSON responses remove raw reasoning", async () => {
+  const secretReasoning = "private nonstream reasoning";
+  const response = {
+    id: "resp-qwen-json",
+    output: [
+      { type: "reasoning", summary: [{ type: "summary_text", text: secretReasoning }] },
+      {
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "safe answer" }],
+      },
+    ],
+  };
+  const rendered = await transformText(
+    createResponsesJsonTransform({ profile: "qwen38-mlx" }),
+    [JSON.stringify(response)],
+  );
+  assert.doesNotMatch(rendered, new RegExp(secretReasoning));
+  assert.deepEqual(JSON.parse(rendered).output.map((item) => item.type), ["message"]);
 });
 
 test("Responses JSON transform rejects malformed and invalid upstream bodies", async () => {

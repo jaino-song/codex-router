@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 
 import { protectPrivateFile } from "./file-security.mjs";
 import { LITELLM_CONFIG_PATH } from "./paths.mjs";
-import { MODELS, providerForModel } from "./model-registry.mjs";
+import { MODELS, protocolForModel, providerForModel } from "./model-registry.mjs";
 import { assertStateOwnership } from "./state-owner.mjs";
 
 // Big enough for real Codex turns, small enough that a small model stays
@@ -19,6 +19,7 @@ export function renderLiteLlmConfig() {
   const lines = ["model_list:"];
   for (const model of MODELS) {
     const provider = providerForModel(model);
+    const modelProtocol = protocolForModel(model);
     // A local model is routed with Ollama's own protocol rather than its
     // OpenAI-compatible surface, purely so `num_ctx` can be set. That surface
     // ignores it, and Ollama then reserves the model's maximum context: on a
@@ -47,13 +48,13 @@ export function renderLiteLlmConfig() {
     }
     const apiBaseEnv = provider.kind === "oauth"
       ? provider.proxyBaseEnv
-      : provider.protocol === "anthropic"
+      : modelProtocol === "anthropic"
         ? "CODEX_ROUTER_ANTHROPIC_FORWARD_BASE_URL"
         : "CODEX_ROUTER_API_FORWARD_BASE_URL";
     const translatedModel =
       provider.kind === "oauth" ? model.upstreamModel : model.gatewayModel;
-    const protocol = provider.protocol === "anthropic" ? "anthropic" : "openai";
-    const responsesSurface = provider.protocol === "openai-responses";
+    const protocol = modelProtocol === "anthropic" ? "anthropic" : "openai";
+    const responsesSurface = modelProtocol === "openai-responses";
     lines.push(
       `  - model_name: ${yamlString(model.gatewayModel)}`,
       "    litellm_params:",

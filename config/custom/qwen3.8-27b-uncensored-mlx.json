@@ -9,6 +9,7 @@
       "endpoint": {
         "baseUrl": "http://127.0.0.1:8080/v1",
         "keyless": true,
+        "protocol": "openai-responses",
         "note": "Runs on this Mac through the local MLX server. Start that server before selecting the model."
       },
       "listed": true,
@@ -39,7 +40,7 @@
       "instructionOverlay": "concise-progress-summaries",
       "supportsApplyPatchTool": false,
       "multiAgentVersion": "v1",
-      "compHash": "custom-qwen3-8-27b-uncensored-v2"
+      "compHash": "custom-qwen3-8-27b-uncensored-v3"
     }
   ]
 }

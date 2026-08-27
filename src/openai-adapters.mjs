@@ -197,13 +197,16 @@ function normalizeResponsesRequest(payload) {
   return next;
 }
 
-function normalizeResponseBody(payload) {
+function normalizeResponseBody(payload, { profile } = {}) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     throw upstreamResponseError("The upstream Responses response must be an object.");
   }
   const next = clone(payload);
   if (next.output !== undefined && !Array.isArray(next.output)) {
     throw upstreamResponseError("The upstream Responses response has an invalid output array.");
+  }
+  if (profile === QWEN38_MLX_PROFILE && Array.isArray(next.output)) {
+    next.output = next.output.filter((item) => item?.type !== "reasoning");
   }
   return next;
 }
@@ -267,6 +270,104 @@ const TERMINAL_EVENTS = new Set([
   "response.error",
 ]);
 
+const QWEN38_MLX_PROFILE = "qwen38-mlx";
+const QWEN38_SAFE_PROGRESS =
+  "I’m checking the current state and preparing the next verified coding action.";
+
+function prefixedQwenText(text) {
+  return text ? `${QWEN38_SAFE_PROGRESS}\n\n${text}` : QWEN38_SAFE_PROGRESS;
+}
+
+function qwenMessageItem(item, messageId) {
+  const content = Array.isArray(item?.content) ? item.content : [];
+  const outputText = content.find((part) => part?.type === "output_text");
+  return {
+    ...(item || {}),
+    id: item?.id || messageId,
+    type: "message",
+    status: item?.status || "completed",
+    role: "assistant",
+    content: [
+      {
+        ...(outputText || {}),
+        type: "output_text",
+        text: prefixedQwenText(outputText?.text || ""),
+        annotations: Array.isArray(outputText?.annotations) ? outputText.annotations : [],
+      },
+    ],
+  };
+}
+
+function repairQwenMlxEvent(frame, data, state) {
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    return { data, suffix: "" };
+  }
+  const item = data.item && typeof data.item === "object" ? data.item : undefined;
+  if (String(data.type || "").startsWith("response.reasoning_") || item?.type === "reasoning") {
+    return { suppress: true, data, suffix: "" };
+  }
+  if (data.type === "response.output_item.added" && item?.type === "message") {
+    state.qwenMessageId = item.id || state.qwenMessageId;
+  }
+  let suffix = "";
+  if (
+    data.type === "response.content_part.added" &&
+    data.part?.type === "output_text" &&
+    !state.qwenProgressInserted
+  ) {
+    state.qwenProgressInserted = true;
+    suffix = serializeFrame({ event: "response.output_text.delta" }, {
+      type: "response.output_text.delta",
+      response_id: state.responseId,
+      item_id: data.item_id || state.qwenMessageId,
+      output_index: validOutputIndex(data.output_index) ? data.output_index : 0,
+      content_index: validOutputIndex(data.content_index) ? data.content_index : 0,
+      delta: QWEN38_SAFE_PROGRESS,
+    });
+  }
+  if (data.type === "response.output_text.done") {
+    data.text = prefixedQwenText(typeof data.text === "string" ? data.text : "");
+  }
+  if (data.type === "response.content_part.done" && data.part?.type === "output_text") {
+    data.part = {
+      ...data.part,
+      text: prefixedQwenText(typeof data.part.text === "string" ? data.part.text : ""),
+    };
+  }
+  if (data.type === "response.output_item.done" && item?.type === "message") {
+    data.item = qwenMessageItem(item, state.qwenMessageId);
+  }
+  if (data.type === "response.output_item.added" && item?.type === "function_call") {
+    data.output_index = state.outputIndex;
+    const key = item.call_id || item.id;
+    if (key) state.qwenToolIndexes.set(key, data.output_index);
+    if (item.id) state.qwenToolIndexes.set(item.id, data.output_index);
+  }
+  if (
+    ["response.function_call_arguments.delta", "response.function_call_arguments.done"].includes(data.type)
+  ) {
+    const index = state.qwenToolIndexes.get(data.call_id || data.item_id);
+    if (validOutputIndex(index)) data.output_index = index;
+  }
+  if (data.type === "response.output_item.done" && item?.type === "function_call") {
+    const index = state.qwenToolIndexes.get(item.call_id || item.id);
+    if (validOutputIndex(index)) data.output_index = index;
+  }
+  if (data.type === "response.completed" && data.response && typeof data.response === "object") {
+    const output = Array.isArray(data.response.output)
+      ? data.response.output.filter((entry) => entry?.type !== "reasoning")
+      : [];
+    const existingMessage = output.find((entry) => entry?.type === "message");
+    const repairedMessage = qwenMessageItem(existingMessage, state.qwenMessageId);
+    data.response.output = [
+      repairedMessage,
+      ...output.filter((entry) => entry?.type !== "message"),
+    ];
+    data.response.output_text = repairedMessage.content[0].text;
+  }
+  return { data, suffix };
+}
+
 function validOutputIndex(value) {
   return Number.isInteger(value) && value >= 0;
 }
@@ -291,8 +392,8 @@ function rememberStreamIndex(state, key, index) {
   return true;
 }
 
-function normalizeResponsesEvent(frame, state) {
-  const data = frameData(frame);
+function normalizeResponsesEvent(frame, state, profile) {
+  let data = frameData(frame);
   state.sawEvent = true;
   if (state.invalid) return "";
   if (state.terminal && data !== "[DONE]") {
@@ -305,6 +406,13 @@ function normalizeResponsesEvent(frame, state) {
     }
     state.terminal = true;
     return serializeFrame(frame, data);
+  }
+  let suffix = "";
+  if (profile === QWEN38_MLX_PROFILE) {
+    const repaired = repairQwenMlxEvent(frame, data, state);
+    if (repaired.suppress) return "";
+    data = repaired.data;
+    suffix = repaired.suffix;
   }
   if (!data || typeof data !== "object" || Array.isArray(data)) return serializeFrame(frame, data);
   if (typeof data.type === "string" && TERMINAL_EVENTS.has(data.type)) state.terminal = true;
@@ -367,12 +475,17 @@ function normalizeResponsesEvent(frame, state) {
     }
     if (state.responseId && !data.response.id) data.response.id = state.responseId;
   }
-  return serializeFrame(frame, data);
+  return serializeFrame(frame, data) + suffix;
 }
 
-export function createResponsesStreamTransform() {
+export function createResponsesStreamTransform({ profile } = {}) {
   let buffer = "";
-  const state = streamState();
+  const state = {
+    ...streamState(),
+    qwenMessageId: undefined,
+    qwenProgressInserted: false,
+    qwenToolIndexes: new Map(),
+  };
   const decoder = new TextDecoder();
   const nextBoundary = (value) => {
     const match = /\r?\n\r?\n/.exec(value);
@@ -387,7 +500,7 @@ export function createResponsesStreamTransform() {
           const frame = buffer.slice(0, boundary.index);
           buffer = buffer.slice(boundary.index + boundary.length);
           if (frame.trim()) {
-            const normalized = normalizeResponsesEvent(parseFrame(frame), state);
+            const normalized = normalizeResponsesEvent(parseFrame(frame), state, profile);
             if (normalized) this.push(normalized);
           }
         }
@@ -400,7 +513,7 @@ export function createResponsesStreamTransform() {
       try {
         buffer += decoder.decode();
         if (buffer.trim()) {
-          const normalized = normalizeResponsesEvent(parseFrame(buffer), state);
+          const normalized = normalizeResponsesEvent(parseFrame(buffer), state, profile);
           if (normalized) this.push(normalized);
         }
         if (state.sawEvent && !state.terminal && !state.invalid) {
@@ -419,7 +532,7 @@ export function createResponsesStreamTransform() {
   });
 }
 
-export function createResponsesJsonTransform() {
+export function createResponsesJsonTransform({ profile } = {}) {
   let body = "";
   return new Transform({
     transform(chunk, _encoding, callback) {
@@ -435,7 +548,7 @@ export function createResponsesJsonTransform() {
         return;
       }
       try {
-        this.push(JSON.stringify(normalizeResponseBody(parsed)));
+        this.push(JSON.stringify(normalizeResponseBody(parsed, { profile })));
       } catch (error) {
         callback(error);
         return;
