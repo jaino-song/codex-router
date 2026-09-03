@@ -5,6 +5,7 @@ import {
   mkdirSync,
   readFileSync,
   statSync,
+  writeFileSync,
 } from "node:fs";
 import path from "node:path";
 
@@ -61,6 +62,42 @@ function safeTokenCount(value) {
 function safeRetryCount(value) {
   const count = safeTokenCount(value);
   return count ? count : undefined;
+}
+
+// `rotateLog` bounds router.log, but nothing bounded this ledger and it only
+// grows. One install reached 26 MB across 160k events in four weeks, and the
+// cost is not just disk: `usageEventLines` reads the whole file, a status probe
+// asks for both recent events and aging totals, and the desktop companion polls
+// every 60s. An untrimmed ledger is paid for continuously.
+//
+// Trim to the newest half rather than exactly to the cap, so the rewrite is
+// amortised -- trimming to the cap would rewrite the entire file on every
+// append once it sat at the boundary. The half that survives is far more than
+// any consumer reads: `recentUsageEvents` defaults to a 24h window and
+// `observedInputCeilings` only wants recent maxima.
+export const MAX_USAGE_EVENT_BYTES = 16 * 1024 * 1024;
+
+function trimUsageEvents(maxBytes = MAX_USAGE_EVENT_BYTES) {
+  let size;
+  try {
+    size = statSync(USAGE_EVENTS_PATH).size;
+  } catch {
+    return;
+  }
+  if (size <= maxBytes) return;
+  try {
+    const text = readFileSync(USAGE_EVENTS_PATH, "utf8");
+    // Cut at the first newline at or after the target offset, so the file never
+    // starts with half an event -- every consumer parses it line by line.
+    const boundary = text.indexOf("\n", text.length - Math.floor(maxBytes / 2));
+    if (boundary === -1) return;
+    writeFileSync(USAGE_EVENTS_PATH, text.slice(boundary + 1), {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+  } catch {
+    // Housekeeping must never break telemetry, which must never break a turn.
+  }
 }
 
 export function recordUsageEvent({
@@ -239,6 +276,7 @@ export function recordUsageEvent({
       mode: 0o600,
     });
     chmodSync(USAGE_EVENTS_PATH, 0o600);
+    trimUsageEvents();
   } catch {
     // Usage telemetry must never interrupt or fail a model request.
   }
