@@ -3,9 +3,11 @@ import { randomBytes } from "node:crypto";
 import {
   copyFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   unlinkSync,
@@ -1441,14 +1443,32 @@ function restoreNativeCatalog(contents) {
   ].join("\n").trimEnd()}\n`;
 }
 
+// `rename` replaces the name it is given, so writing straight to CONFIG_PATH
+// turns a symlink there into a regular file and silently detaches it from
+// whatever the user pointed it at -- a dotfiles checkout, a synced directory.
+// Resolve the link first and write the file it names instead, which is what a
+// symlink at CONFIG_PATH asks for. The temporary file has to sit beside the
+// resolved target too: `rename` cannot cross filesystems, and the link may well
+// point at another one.
+function configWriteTarget() {
+  try {
+    if (!lstatSync(CONFIG_PATH).isSymbolicLink()) return CONFIG_PATH;
+    return realpathSync(CONFIG_PATH);
+  } catch {
+    // No config yet, or a dangling link: write the path itself.
+    return CONFIG_PATH;
+  }
+}
+
 function atomicWrite(contents) {
-  mkdirSync(path.dirname(CONFIG_PATH), { recursive: true, mode: 0o700 });
-  const temporary = `${CONFIG_PATH}.tmp.${process.pid}`;
+  const target = configWriteTarget();
+  mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+  const temporary = `${target}.tmp.${process.pid}`;
   writeFileSync(temporary, contents, { encoding: "utf8", mode: 0o600 });
   try {
     protectPrivateFile(temporary);
-    renameSync(temporary, CONFIG_PATH);
-    protectPrivateFile(CONFIG_PATH);
+    renameSync(temporary, target);
+    protectPrivateFile(target);
   } catch (error) {
     if (existsSync(temporary)) unlinkSync(temporary);
     throw error;
