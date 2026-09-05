@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { Check, ChevronDown, Filter, KeyRound, Link2, LogIn, MoreHorizontal, Plus, SearchX, ShieldCheck, Trash2 } from "lucide-react";
-import { Badge, Button, CatalogSkeleton, Dialog, EmptyState, PageHeader, SearchField, SkeletonBlock, Toggle } from "../components";
+import { Badge, Button, CatalogSkeleton, Dialog, EmptyState, PageHeader, PanelSkeleton, SearchField, SkeletonBlock, Toggle } from "../components";
 import { BrandLogo, ProviderLogo, brandForModel } from "../provider-branding";
 import { formatContext, formatDateTime } from "../lib";
 import {
@@ -25,6 +25,7 @@ import type {
   ProviderUsageSnapshot,
   RouterCatalogSnapshot,
   RouterControlApi,
+  RouterDataReady,
   RouterKnownModel,
   RouterModel,
   RouterTarget,
@@ -82,6 +83,7 @@ interface ModelsPageProps {
   usage?: ProviderUsageSnapshot;
   api?: RouterControlApi;
   refreshing: boolean;
+  dataReady: RouterDataReady;
   onRefresh: () => void;
   runAction: RunAction;
   focusRequest?: ModelViewFocusRequest;
@@ -139,7 +141,7 @@ function routeUsable(model: RouterModel): boolean {
   return model.available !== false;
 }
 
-export function ModelsPage({ target, catalog, setup, usage, api, refreshing, onRefresh, runAction, focusRequest }: ModelsPageProps) {
+export function ModelsPage({ target, catalog, setup, usage, api, refreshing, dataReady, onRefresh, runAction, focusRequest }: ModelsPageProps) {
   const [modelSearch, setModelSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [filterMenuOpen, setFilterMenuOpen] = useState(false);
@@ -429,6 +431,61 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, onR
     setManagedProviderId((current) => (current === providerId ? null : providerId));
   };
 
+  const renderConnections = () => !dataReady.providers && !setup ? (
+    <section className="pm-connections pm-connections-loading" aria-label="Loading provider connections" aria-busy="true">
+      <SkeletonBlock />
+      <SkeletonBlock />
+      <SkeletonBlock />
+    </section>
+  ) : (
+    <ConnectionsBar
+      directory={directory}
+      enabledProviders={enabledProviders}
+      usageById={usageById}
+      apiAvailable={Boolean(api)}
+      platform={api?.platform}
+      openProviderId={managedProviderId}
+      onOpenProvider={openProviderMenu}
+      onCloseProvider={() => setManagedProviderId(null)}
+      connectMenuOpen={connectMenuOpen}
+      onConnectMenuOpen={setConnectMenuOpen}
+      isEnabled={(entry) => optimisticProviders.value(entry.id, enabledProviders.has(entry.id) || entry.models.some((model) => model.native))}
+      onEnabledChange={(entry, checked) => {
+        if (!api) return;
+        void optimisticProviders.mutate(entry.id, checked, `${checked ? "Enable" : "Disable"} ${entry.displayName}`, () => api.setProviderEnabled(entry.id, checked));
+      }}
+      onSignIn={(entry) => {
+        if (!api || !entry.setup) return;
+        const label = entry.setup.action === "probe"
+          ? `Run ${entry.displayName} live compatibility test`
+          : `Start ${entry.displayName} sign-in`;
+        void runProviderCredentialAction(entry.setup, label, () => api.connectProvider(entry.id));
+      }}
+      onKey={(entry) => entry.setup && setCredentialProvider(entry.setup)}
+      onRemove={(entry) => entry.setup && setRemoveProvider(entry.setup)}
+    />
+  );
+  const renderConnectionDialogs = () => (
+    <>
+      <CredentialDialog
+        provider={credentialProvider}
+        onSave={(provider, secret) => api
+          ? runProviderCredentialAction(provider, `Save ${provider.displayName} credential`, () => api.saveProviderCredential(provider.id, secret))
+          : Promise.resolve()}
+        onClose={() => setCredentialProvider(null)}
+      />
+      <Dialog open={Boolean(removeProvider)} title="Disconnect provider" description="The provider is withdrawn from installed clients before its managed credential is deleted." onClose={() => setRemoveProvider(null)}>
+        <div className="pm-credential-warning"><ShieldCheck aria-hidden size={17} strokeWidth={1.7} /><p>{removeProvider?.id === "antigravity-oauth"
+          ? "This removes only the router-owned OAuth client, session, and live proof. Official Antigravity or agy credentials are never read or changed."
+          : "If a credential also exists in the environment or Keychain, the router will still report it as connected."}</p></div>
+        <div className="dialog-actions">
+          <Button variant="secondary" onClick={() => setRemoveProvider(null)}>Cancel</Button>
+          <Button variant="danger" onClick={() => { const provider = removeProvider; setRemoveProvider(null); if (provider && api) void runProviderCredentialAction(provider, `Remove ${provider.displayName} credential`, () => api.removeProviderCredential(provider.id)); }}><Trash2 aria-hidden size={14} strokeWidth={1.7} /> Disconnect</Button>
+        </div>
+      </Dialog>
+    </>
+  );
+
   const filteredFamilies = useMemo(() => {
     const needle = modelSearch.trim().toLowerCase();
     if (!needle && activeProviderFilter === "all") return families;
@@ -466,7 +523,28 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, onR
   }, [focusRequest]);
 
   if (!target) {
-    return <EmptyState icon={<SearchX size={22} />} title="Router snapshot unavailable" body="Start the router or refresh after setup completes." />;
+    return (
+      <>
+        <div className="providers-models-page models-page">
+          <PageHeader
+            eyebrow="Models"
+            title="Models"
+            description="Choose which models your installed clients can use, and connect the accounts that serve them."
+            onRefresh={onRefresh}
+            refreshing={refreshing}
+          />
+          {renderConnections()}
+          {!dataReady.snapshot ? (
+            <section className="panel-section pm-models-loading" aria-label="Loading models" aria-busy="true">
+              <PanelSkeleton label="Loading model routes" count={6} />
+            </section>
+          ) : (
+            <EmptyState icon={<SearchX size={22} />} title="Router snapshot unavailable" body="Start the router or refresh after setup completes." />
+          )}
+        </div>
+        {renderConnectionDialogs()}
+      </>
+    );
   }
 
   const connectedProviderCount = directory.filter((entry) => providerConnected(entry, enabledProviders)).length;
@@ -548,29 +626,7 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, onR
           refreshing={refreshing}
         />
 
-        <ConnectionsBar
-          directory={directory}
-          enabledProviders={enabledProviders}
-          usageById={usageById}
-          apiAvailable={Boolean(api)}
-          platform={api?.platform}
-          openProviderId={managedProviderId}
-          onOpenProvider={openProviderMenu}
-          onCloseProvider={() => setManagedProviderId(null)}
-          connectMenuOpen={connectMenuOpen}
-          onConnectMenuOpen={setConnectMenuOpen}
-          isEnabled={(entry) => optimisticProviders.value(entry.id, enabledProviders.has(entry.id) || entry.models.some((model) => model.native))}
-          onEnabledChange={(entry, checked) => {
-            if (!api) return;
-            void optimisticProviders.mutate(entry.id, checked, `${checked ? "Enable" : "Disable"} ${entry.displayName}`, () => api.setProviderEnabled(entry.id, checked));
-          }}
-          onSignIn={(entry) => {
-            if (!api || !entry.setup) return;
-            void runProviderCredentialAction(entry.setup, `Start ${entry.displayName} sign-in`, () => api.connectProvider(entry.id));
-          }}
-          onKey={(entry) => entry.setup && setCredentialProvider(entry.setup)}
-          onRemove={(entry) => entry.setup && setRemoveProvider(entry.setup)}
-        />
+        {renderConnections()}
 
         <section className="panel-section pm-model-catalog" id="model-catalog-controls">
           <div className="pm-model-toolbar">
@@ -750,20 +806,7 @@ export function ModelsPage({ target, catalog, setup, usage, api, refreshing, onR
         onAdd={(selection) => void addCatalogModels(selection)}
         onClose={() => setAddModelsOpen(false)}
       />
-      <CredentialDialog
-        provider={credentialProvider}
-        onSave={(provider, secret) => api
-          ? runProviderCredentialAction(provider, `Save ${provider.displayName} credential`, () => api.saveProviderCredential(provider.id, secret))
-          : Promise.resolve()}
-        onClose={() => setCredentialProvider(null)}
-      />
-      <Dialog open={Boolean(removeProvider)} title="Disconnect provider" description="The provider is withdrawn from installed clients before its managed credential is deleted." onClose={() => setRemoveProvider(null)}>
-        <div className="pm-credential-warning"><ShieldCheck aria-hidden size={17} strokeWidth={1.7} /><p>If a credential also exists in the environment or Keychain, the router will still report it as connected.</p></div>
-        <div className="dialog-actions">
-          <Button variant="secondary" onClick={() => setRemoveProvider(null)}>Cancel</Button>
-          <Button variant="danger" onClick={() => { const provider = removeProvider; setRemoveProvider(null); if (provider && api) void runProviderCredentialAction(provider, `Remove ${provider.displayName} credential`, () => api.removeProviderCredential(provider.id)); }}><Trash2 aria-hidden size={14} strokeWidth={1.7} /> Disconnect</Button>
-        </div>
-      </Dialog>
+      {renderConnectionDialogs()}
     </>
   );
 }
@@ -954,12 +997,12 @@ function ProviderMenu({
             {setup.kind === "oauth" || setup.signIn ? (
               <Button
                 variant="ghost"
-                disabled={!apiAvailable || platform !== "darwin"}
-                title={platform === "darwin" ? undefined : "Open the provider CLI in your own terminal on Windows or Linux."}
+                disabled={!apiAvailable || setup.action === "blocked" || (entry.id !== "antigravity-oauth" && platform !== "darwin")}
+                title={entry.id === "antigravity-oauth" || platform === "darwin" ? undefined : "Open the provider CLI in your own terminal on Windows or Linux."}
                 onClick={onSignIn}
               >
                 <LogIn aria-hidden size={14} strokeWidth={1.7} />
-                {setup.configured ? "Sign in again" : "Open sign-in"}
+                {setup.action === "probe" ? "Run live test" : setup.configured ? "Sign in again" : "Open sign-in"}
               </Button>
             ) : null}
             {setup.kind === "api" && entry.id !== "local" ? (
@@ -967,7 +1010,7 @@ function ProviderMenu({
                 <KeyRound aria-hidden size={14} strokeWidth={1.7} /> {setup.configured ? "Replace key" : "Add key"}
               </Button>
             ) : null}
-            {setup.kind === "api" && setup.configured && entry.id !== "local" ? (
+            {((setup.kind === "api" && setup.configured) || setup.disconnectable) && entry.id !== "local" ? (
               <Button variant="ghost" disabled={!apiAvailable} onClick={onRemove}>
                 <Trash2 aria-hidden size={14} strokeWidth={1.7} /> Disconnect
               </Button>
@@ -1155,7 +1198,10 @@ function ModelDetails({
       {routeUsable(model) ? (
         <div>
           <dt>Subagents</dt>
-          <dd>
+          {/* The effort popup extends below this definition-list cell. Keep
+              this cell visibly overflowing; the generic text cells still
+              ellipsize long ids and route descriptions. */}
+          <dd className="pm-model-details-controls">
             <div className="pm-subagent-controls">
               <SubagentToggle
                 model={model}
@@ -1638,7 +1684,7 @@ function providerConnected(entry: ProviderDirectoryEntry, enabledProviders: Set<
   // the bulk "connected" request. Its explicit provider selection is the
   // connection boundary instead.
   if (entry.setup?.kind === "anonymous") return enabledProviders.has(entry.id);
-  if (entry.setup) return entry.setup.configured;
+  if (entry.setup) return entry.setup.configured || entry.setup.signedIn === true;
   return entry.models.some((model) => model.native) || enabledProviders.has(entry.id);
 }
 
@@ -1650,6 +1696,8 @@ function connectionMethod(entry: ProviderDirectoryEntry): string {
   if (entry.id === "openai") return "ChatGPT session";
   if (entry.id === "local") return "Local runtime";
   if (!entry.setup) return "Managed catalog";
+  if (entry.setup.action === "probe") return "Live test required";
+  if (entry.setup.action === "blocked") return "Disconnect required";
   if (entry.setup.kind === "oauth") return "Sign-in";
   if (entry.setup.kind === "anonymous") return "No key needed";
   if (entry.setup.signIn) return "Key or sign-in";
@@ -1660,6 +1708,8 @@ function connectionDetail(entry: ProviderDirectoryEntry, accountStatus?: string,
   if (entry.id === "openai") return "Uses the signed-in ChatGPT session available to this Codex installation.";
   if (!entry.setup) return "This provider catalog is managed by the router and has no separate credential action here.";
   if (entry.setup.kind === "anonymous") return "No API key is required. Make it available before routed prompts or catalog loading can use its endpoint.";
+  if (entry.setup.action === "probe") return entry.setup.probeNote || "Run the explicit live compatibility test; it sends a small prompt and uses provider quota.";
+  if (entry.setup.action === "blocked") return entry.setup.blockedNote || "Disconnect the incompatible router record before signing in again.";
   if (accountStatus === "unavailable") return accountMessage || "Account usage is unavailable. Sign in again if the session expired.";
   if (entry.setup.configured) return "Credential ready. You can take it away from your clients without disconnecting the account.";
   if (entry.setup.kind === "oauth") {

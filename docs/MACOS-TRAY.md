@@ -12,6 +12,41 @@ shared with the existing command-line control plane.
 The tray focuses on Codex and does not disable, uninstall, or change the
 existing router configuration.
 
+## Desktop widget
+
+On macOS 14 or newer, add **Codex Router Usage** or **Codex Router Reset** from
+the system widget gallery. The Usage widget shows today's tokens and a true
+seven-day cumulative line graph; Medium also shows up to two quota windows.
+The Reset widget gives the next reset a large countdown and keeps the relevant
+quota windows beside it. Both use the same text-only **Codex Router** header.
+
+Clicking Usage opens that source on the Control Center Usage page. Clicking
+Reset opens the same page and focuses the selected account's allowance and
+reset details, whether Control Center is already running or starts on demand.
+
+Codex is the default usage source. To show another connected account,
+Control-click a widget, choose **Edit Widget**, and select its **Usage Source**.
+The picker is populated from the router's current connected providers, so it
+does not offer an account the host cannot measure.
+
+The native host publishes a small, size-bounded, secret-free JSON snapshot
+after normal status and usage polls. The WidgetKit extension only reads that
+snapshot: it does not run router commands and never receives provider
+credentials, API keys, prompts, model output, or caller capabilities. A stale
+snapshot is called out after 45 minutes instead of presenting old data as live.
+
+Local source builds use ad-hoc signing. Their signed storage mode writes one
+private file at
+`~/Library/Application Support/Codex Router Widget/usage-widget.json` and the
+extension receives only the matching home-relative, read-only temporary
+filesystem exception. That exception is local-source-only: it is not present in
+production entitlements, and neither process reads or writes the extension's
+`~/Library/Containers` directory. Set `MODEL_ROUTER_CODESIGN_IDENTITY` to a
+non-ad-hoc signing identity for a provisioned build; that selects the production
+storage mode, where both sides use only the `group.io.github.codex-router` App
+Group. A redistributable build still needs the host app and extension signed by
+the same Apple team with that App Group provisioned for both bundle identifiers.
+
 ## Opening it like an app
 
 `./bin/model-router-tray` installs **Codex Router.app** into `~/Applications`,
@@ -25,12 +60,14 @@ assets are committed rather than rasterized during a normal tray build.
 
 The Swift host stays `LSUIElement`, so it does not add a Dock icon. A person
 opening `Codex Router.app` gets the embedded Control Center as a normal window;
-that window supplies the product's Dock and Command-Tab entry only while it is
-open. Opening the app also reveals the native tray surfaces for 20 seconds if
-**With Codex** would otherwise hide them. Closing the Control Center window
-leaves the native host running; reopen the app or choose **Control Center**
-from the menu-bar panel to restore it. The temporary reveal also starts the
-router and pulses the status dot, then follow mode resumes on its own.
+that process supplies the product's Dock and Command-Tab entry while Control
+Center is running, including after the window is closed or you switch away.
+Closing the window hides it rather than quitting, so Cmd+Tab and the Dock can
+bring it back. Opening the app also reveals the native tray surfaces for 20
+seconds if **With Codex** would otherwise hide them. The menu-bar host keeps
+running either way; choose **Control Center** from the panel to reopen if the
+Dock tile is not showing yet. The temporary reveal also starts the router and
+pulses the status dot, then follow mode resumes on its own.
 
 launchd passes `--supervised` when it starts the native host at login. That
 starts the menu-bar host without opening the Control Center window or forcing

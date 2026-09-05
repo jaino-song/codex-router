@@ -41,6 +41,7 @@ const ALLOWED_ENTRIES = new Set([
   "phase.next",
   "had-previous",
   "target-name",
+  "artifact-set",
   "staged",
   "previous",
   "failed",
@@ -121,7 +122,16 @@ export async function inspectMacosTrayTransaction(
   }
 
   const entries = Object.fromEntries(await Promise.all(
-    ["staged", "previous", "failed", "phase", "phase.next", "had-previous", "target-name"].map(
+    [
+      "staged",
+      "previous",
+      "failed",
+      "phase",
+      "phase.next",
+      "had-previous",
+      "target-name",
+      "artifact-set",
+    ].map(
       async (name) => [name, await statOrNull(path.join(transactionDirectory, name))],
     ),
   ));
@@ -152,6 +162,14 @@ export async function inspectMacosTrayTransaction(
       new Set(["codex-router"]),
     )
     : null;
+  const artifactSet = entries["artifact-set"]
+    ? await readJournalValue(
+      path.join(transactionDirectory, "artifact-set"),
+      uid,
+      "artifact-set",
+      new Set(["widget-v1"]),
+    )
+    : null;
   if (effectivePhase && hadPreviousValue === null) {
     throw refusal("a phase exists without the had-previous marker");
   }
@@ -164,6 +182,7 @@ export async function inspectMacosTrayTransaction(
     failed: Boolean(entries.failed),
     nextAction: nextPhase === null ? "none" : phase === null ? "promote" : "discard",
     targetName,
+    artifactSet,
   };
 }
 
@@ -184,10 +203,10 @@ export async function inspectMacosTrayLiveBundle(
 // lstat so a symlink in the middle cannot make a file outside the bundle count.
 export async function inspectMacosTrayCommittedBundle(
   bundleDirectory,
-  { uid = process.getuid?.() } = {},
+  { uid = process.getuid?.(), requireWidget = true } = {},
 ) {
   if (!await inspectMacosTrayLiveBundle(bundleDirectory, { uid })) return false;
-  for (const relative of [
+  const requiredDirectories = [
     "Contents",
     "Contents/MacOS",
     "Contents/Resources",
@@ -195,17 +214,36 @@ export async function inspectMacosTrayCommittedBundle(
     "Contents/Resources/Control Center.app/Contents",
     "Contents/Resources/Control Center.app/Contents/MacOS",
     "Contents/Resources/Control Center.app/Contents/Resources",
-  ]) {
+  ];
+  if (requireWidget) {
+    requiredDirectories.splice(2, 0,
+      "Contents/PlugIns",
+      "Contents/PlugIns/RouterUsageWidget.appex",
+      "Contents/PlugIns/RouterUsageWidget.appex/Contents",
+      "Contents/PlugIns/RouterUsageWidget.appex/Contents/MacOS",
+    );
+  }
+  for (const relative of requiredDirectories) {
     const stats = await statOrNull(path.join(bundleDirectory, relative));
     if (!stats) return false;
     requireDirectory(stats, uid, `live bundle ${relative}`);
   }
-  for (const [relative, executable] of [
+  const requiredFiles = [
     ["Contents/Info.plist", false],
     ["Contents/MacOS/ModelRouterTray", true],
     ["Contents/Resources/Control Center.app/Contents/MacOS/Codex Router", true],
     ["Contents/Resources/Control Center.app/Contents/Resources/app.asar", false],
-  ]) {
+  ];
+  if (requireWidget) {
+    requiredFiles.splice(2, 0,
+      ["Contents/PlugIns/RouterUsageWidget.appex/Contents/Info.plist", false],
+      [
+        "Contents/PlugIns/RouterUsageWidget.appex/Contents/MacOS/RouterUsageWidget",
+        true,
+      ],
+    );
+  }
+  for (const [relative, executable] of requiredFiles) {
     const stats = await statOrNull(path.join(bundleDirectory, relative));
     if (!stats) return false;
     requireNonemptyRegularFile(stats, uid, `live bundle ${relative}`, { executable });
@@ -275,6 +313,13 @@ export function planMacosTrayRecovery(
 }
 
 async function main() {
+  if (process.argv[2] === "validate-legacy-bundle" && process.argv.length === 4) {
+    if (!await inspectMacosTrayCommittedBundle(process.argv[3], { requireWidget: false })) {
+      throw refusal("the legacy candidate bundle is incomplete");
+    }
+    process.stdout.write("complete\n");
+    return;
+  }
   if (process.argv[2] === "validate-bundle" && process.argv.length === 4) {
     if (!await inspectMacosTrayCommittedBundle(process.argv[3])) {
       throw refusal("the candidate bundle is incomplete");
@@ -288,7 +333,8 @@ async function main() {
   ) {
     process.stderr.write(
       "Usage: node src/macos-tray-transaction.mjs plan TRANSACTION_DIR LIVE_BUNDLE [LEGACY_LIVE_BUNDLE]\n"
-      + "   or: node src/macos-tray-transaction.mjs validate-bundle BUNDLE\n",
+      + "   or: node src/macos-tray-transaction.mjs validate-bundle BUNDLE\n"
+      + "   or: node src/macos-tray-transaction.mjs validate-legacy-bundle BUNDLE\n",
     );
     process.exitCode = 2;
     return;
@@ -300,10 +346,12 @@ async function main() {
   }
   const liveExists = await inspectMacosTrayLiveBundle(process.argv[4]);
   const liveComplete = transaction.phase === "committed"
-    ? await inspectMacosTrayCommittedBundle(process.argv[4])
+    ? await inspectMacosTrayCommittedBundle(process.argv[4], {
+      requireWidget: transaction.artifactSet === "widget-v1",
+    })
     : false;
   const legacyLiveExists = process.argv[5]
-    ? await inspectMacosTrayCommittedBundle(process.argv[5])
+    ? await inspectMacosTrayCommittedBundle(process.argv[5], { requireWidget: false })
     : false;
   const action = planMacosTrayRecovery(transaction, {
     liveExists,

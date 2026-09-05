@@ -136,20 +136,61 @@ wire_api = "responses"
         0,
       );
 
+      const nativeCapturePath = path.join(stateDir, "native-models.json");
+      const nativeCapture = JSON.parse(readFileSync(nativeCapturePath, "utf8"));
+      nativeCapture.captured_with = "codex-cli 98.0.0";
+      writeFileSync(nativeCapturePath, `${JSON.stringify(nativeCapture)}\n`, { mode: 0o600 });
+
       const doctor = child("doctor.mjs", ["--json"], env);
       const report = JSON.parse(doctor.stdout);
       const byName = new Map(report.checks.map((check) => [check.name, check]));
       assert.deepEqual(byName.get("Merged catalog"), {
-        status: "ok",
+        status: "warn",
         name: "Merged catalog",
-        detail: "native-only; routed transport is inactive",
-        fix: "Run ./bin/refresh-catalog, or ./bin/doctor --fix if files are missing.",
+        detail: "native catalog captured by codex-cli 98.0.0; installed codex-cli 99.0.0",
+        fix: "Run ./bin/refresh-catalog, then fully quit and reopen Codex.",
       });
       assert.equal(byName.get("Catalog matches gateway routes").status, "ok");
       assert.equal(byName.get("Catalog matches gateway routes").detail, "0 routed models");
       assert.equal(byName.get("Routed model agents").status, "ok");
       assert.match(byName.get("Routed model agents").detail, /^0 current definitions/);
       assert.equal(byName.get("Signed router coexistence").status, "ok");
+
+      if (process.platform === "win32") {
+        // Codex Desktop writes config.toml atomically. Recreate the resulting
+        // inherited-ACL shape without changing the temporary directory ACL.
+        const configured = readFileSync(configPath, "utf8");
+        unlinkSync(configPath);
+        writeFileSync(configPath, configured, { mode: 0o600 });
+
+        const privacyDoctor = child("doctor.mjs", ["--json"], env);
+        const privacyReport = JSON.parse(privacyDoctor.stdout);
+        const privacy = privacyReport.checks.find((check) => check.name === "Codex config privacy");
+        assert.deepEqual(privacy, {
+          status: "ok",
+          name: "Codex config privacy",
+          detail: "router credentials stay outside config.toml",
+        });
+
+        const legacy = configured.replace(
+          /^openai_base_url\s*=.*$/m,
+          `openai_base_url = "http://127.0.0.1:46192/_codex-router/${callerSecret}/v1"`,
+        );
+        assert.notEqual(legacy, configured, "legacy fixture must replace the managed root URL");
+        assert.match(legacy, /\/_codex-router\/[A-Za-z0-9_-]+\/v1/);
+        unlinkSync(configPath);
+        writeFileSync(configPath, legacy, { mode: 0o600 });
+        assert.equal(readFileSync(configPath, "utf8"), legacy);
+        const legacyDoctor = child("doctor.mjs", ["--json"], env);
+        const legacyReport = JSON.parse(legacyDoctor.stdout);
+        const legacyPrivacy = legacyReport.checks.find((check) => check.name === "Codex config privacy");
+        assert.deepEqual(legacyPrivacy, {
+          status: "fail",
+          name: "Codex config privacy",
+          detail: "Windows ACL is broader than the current user",
+          fix: "Run ./bin/doctor --fix; the managed router URL contains a local caller capability.",
+        });
+      }
     } finally {
       rmSync(codexHome, { recursive: true, force: true });
     }

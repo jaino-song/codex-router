@@ -5,9 +5,16 @@ import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { operationDeadlineFromEnvironment } from "./process-tree.mjs";
 
 const CONTROL_TIMEOUT_MS = 120_000;
-const CATALOG_MUTATION_TIMEOUT_MS = 330_000;
+// execFile owns a control wrapper, which in turn contracts its service child.
+// Keep both ten-second tree reserves outside the platform + readiness phase.
+const SERVICE_START_TIMEOUT_MS = 350_000;
+// Two complete 640-second overlay epochs plus nested owner cleanup. A nominal
+// five-minute UI timeout deterministically truncated LiteLLM's own five-minute
+// readiness allowance after publication and service-status overhead.
+const CATALOG_MUTATION_TIMEOUT_MS = 1_320_000;
 const OAUTH_LOGIN_TIMEOUT_MS = 11 * 60_000;
 
 const SELF_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -135,7 +142,10 @@ export const COMMANDS = {
   }),
   presence_status: () => ({ args: ["presence", "status"] }),
   set_presence_mode: ({ mode }) => ({ args: ["presence", "set", String(mode || "always")] }),
-  service_start: () => ({ args: ["service", "start"] }),
+  service_start: () => ({
+    args: ["service", "start"],
+    timeoutMs: SERVICE_START_TIMEOUT_MS,
+  }),
   service_stop: () => ({ args: ["service", "stop"] }),
   maintenance: () => ({ args: ["maintenance"] }),
   doctor_fix: () => ({ args: ["doctor", "--fix", "--json"] }),
@@ -191,12 +201,34 @@ export function runControl(
       reject(new Error("Codex Router was not found. Set MODEL_ROUTER_SOURCE_ROOT."));
       return;
     }
+    const runtimeBaseline = { ...runtime.env };
+    delete runtimeBaseline.CODEX_ROUTER_OPERATION_DEADLINE_MS;
+    delete runtimeBaseline.CODEX_ROUTER_OPERATION_TIMEOUT_MS;
+    delete runtimeBaseline.CODEX_ROUTER_OPERATION_CHILD;
+    delete runtimeBaseline.CODEX_ROUTER_OWNER_SIGNAL_BUDGET_MS;
+    delete runtimeBaseline.CODEX_ROUTER_OWNER_SIGNAL_BARRIER_DIR;
+    const innerTimeoutMs = Math.max(1, timeoutMs - 10_000);
+    const operationDeadline = operationDeadlineFromEnvironment(runtimeBaseline, {
+      timeoutMs: innerTimeoutMs,
+      maximumMs: innerTimeoutMs,
+    });
+    const childEnvironment = {
+      ...runtimeBaseline,
+      CODEX_ROUTER_OPERATION_TIMEOUT_MS: String(innerTimeoutMs),
+      CODEX_ROUTER_OPERATION_DEADLINE_MS: String(operationDeadline),
+    };
+    // execFile's timeout kills only its direct child. Ensure control owns the
+    // separately terminable descendant tree even if this desktop process was
+    // itself launched as somebody else's bounded child.
+    delete childEnvironment.CODEX_ROUTER_OPERATION_CHILD;
+    delete childEnvironment.CODEX_ROUTER_OWNER_SIGNAL_BUDGET_MS;
+    delete childEnvironment.CODEX_ROUTER_OWNER_SIGNAL_BARRIER_DIR;
     const child = execFile(
       runtime.command,
       [path.join(root, "src", "control.mjs"), ...args],
       {
         cwd: root,
-        env: runtime.env,
+        env: childEnvironment,
         timeout: timeoutMs,
         maxBuffer: 32 * 1024 * 1024,
         windowsHide: true,

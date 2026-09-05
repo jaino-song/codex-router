@@ -9,6 +9,7 @@ import {
   recordProbeResult,
   recordProbeStarted,
 } from "./subagent-proofs.mjs";
+import { detachedOperationEnvironment } from "./process-tree.mjs";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -135,7 +136,7 @@ export function spawnDetachedVerification(
     [path.join(REPO_ROOT, "src", "subagent-verify.mjs"), "--worker", ...candidates],
     {
       cwd: REPO_ROOT,
-      env: { ...process.env, MODEL_ROUTER_TARGET: "codex" },
+      env: detachedOperationEnvironment(process.env, { MODEL_ROUTER_TARGET: "codex" }),
       detached: true,
       stdio: "ignore",
       windowsHide: true,

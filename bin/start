@@ -16,7 +16,7 @@ repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 case "${1-}" in
   --foreground)
     shift
-    exec node "$repo_dir/src/start.mjs" "$@"
+    exec node "$repo_dir/src/foreground-start.mjs" "$@"
     ;;
   "")
     ;;

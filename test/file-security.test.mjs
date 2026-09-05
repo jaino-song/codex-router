@@ -1,16 +1,36 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
+  ensureCheckoutReadable,
   privateFileIsProtected,
   protectPrivateFile,
   writePrivateJson,
+  writePrivateJsonAsync,
   writePrivateFile,
 } from "../src/file-security.mjs";
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+
+test("the Windows async ACL path uses the bounded one-shot script", () => {
+  const implementation = readFileSync(path.join(root, "src", "file-security.mjs"), "utf8");
+  assert.match(
+    implementation,
+    /protectPrivateFilesWin32Async\(paths\)/,
+  );
+  assert.match(implementation, /powershellPrivateArgs\(\)/);
+  assert.match(implementation, /"-EncodedCommand"/);
+  assert.match(implementation, /taskkill\.exe/);
+  assert.match(implementation, /treeKiller\.unref/);
+  assert.doesNotMatch(implementation, /execFileSync\(\s*\n?\s*"taskkill\.exe"/);
+  assert.match(implementation, /WINDOWS_PRIVATE_ASYNC_TIMEOUT_MS/);
+  assert.doesNotMatch(implementation, /powershellPrivateWorkerScript/);
+});
 
 test("private JSON state uses one owner-only atomic writer", () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "codex-router-private-json-"));
@@ -20,6 +40,20 @@ test("private JSON state uses one owner-only atomic writer", () => {
     assert.deepEqual(writePrivateJson(target, value, { directoryMode: 0o700 }), value);
     assert.deepEqual(JSON.parse(readFileSync(target, "utf8")), value);
     if (process.platform !== "win32") assert.equal(statSync(target).mode & 0o777, 0o600);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("private writes never chmod an existing caller-owned parent directory", {
+  skip: process.platform === "win32" ? "POSIX mode assertion" : false,
+}, () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "codex-router-existing-parent-"));
+  const target = path.join(directory, "state.json");
+  try {
+    chmodSync(directory, 0o755);
+    writePrivateJson(target, { ok: true }, { directoryMode: 0o700 });
+    assert.equal(statSync(directory).mode & 0o777, 0o755);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -224,6 +258,63 @@ test(
           inherited: false,
         },
       ]);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);
+test(
+  "Windows request-path private writes use bounded ACL operations and preserve the atomic target ACL",
+  { skip: process.platform !== "win32" },
+  async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "codex-router-write-async-"));
+    const target = path.join(directory, "pool.json");
+    try {
+      await writePrivateJsonAsync(target, { version: 1, value: "first" });
+      await writePrivateJsonAsync(target, { version: 1, value: "second" });
+      assert.deepEqual(JSON.parse(readFileSync(target, "utf8")), { version: 1, value: "second" });
+      assert.equal(privateFileIsProtected(target), true);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "ensureCheckoutReadable grants Users read access to the checkout directory on Windows",
+  { skip: process.platform !== "win32" },
+  () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "codex-router-checkout-"));
+    const file = path.join(directory, "src", "start.mjs");
+    try {
+      mkdirSync(path.join(directory, "src"), { recursive: true });
+      writeFileSync(file, "// test file\n");
+      // Call ensureCheckoutReadable to grant Users read access
+      ensureCheckoutReadable(directory);
+      // Verify that Users (S-1-5-32-545) has ReadAndExecute access
+      const script = [
+        "$acl = [System.IO.Directory]::GetAccessControl($env:CODEX_ROUTER_CHECKOUT)",
+        "$usersId = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')",
+        "$rules = @($acl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))",
+        "$usersRule = $rules | Where-Object { $_.IdentityReference.Value -eq $usersId.Value -and $_.AccessControlType -eq 'Allow' } | Select-Object -First 1",
+        "if ($null -ne $usersRule) {",
+        "  $readExecute = [System.Security.AccessControl.FileSystemRights]::ReadAndExecute",
+        "  $hasReadExecute = ($usersRule.FileSystemRights -band $readExecute) -eq $readExecute",
+        "  [Console]::Out.Write($hasReadExecute.ToString())",
+        "} else {",
+        "  [Console]::Out.Write('False')",
+        "}",
+      ].join("\n");
+      const result = execFileSync(
+        "powershell.exe",
+        ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+        {
+          encoding: "utf8",
+          env: { ...process.env, CODEX_ROUTER_CHECKOUT: directory },
+          stdio: ["ignore", "pipe", "ignore"],
+        },
+      ).trim().toLowerCase();
+      assert.equal(result, "true", "Users should have ReadAndExecute access to the checkout");
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

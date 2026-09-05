@@ -1,7 +1,9 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   renameSync,
   statSync,
@@ -10,7 +12,15 @@ import {
 } from "node:fs";
 import path from "node:path";
 
-// Windows private-file hardening is one PowerShell spawn per call.
+const WINDOWS_PRIVATE_ASYNC_TIMEOUT_MS = 30_000;
+const WINDOWS_PRIVATE_ASYNC_OUTPUT_LIMIT = 64 * 1024;
+
+// Windows private-file hardening is one bounded PowerShell operation per
+// atomic write. Keeping the async path one-shot is deliberate: Windows
+// PowerShell does not provide a stable line-oriented stdin protocol when it is
+// launched from a redirected Node child, and a hung helper otherwise strands
+// every request behind a thirty-second ACL timeout. The synchronous path below
+// already uses this exact script; the async wrapper only changes how we wait.
 //
 // Keeping it a single process is the point: `main` memoized the current SID
 // and then ran `icacls` per file, and icacls is what this module exists to
@@ -66,6 +76,89 @@ function powershellPrivateScript() {
   ].join("\n");
 }
 
+function windowsPowerShellEnvironment(paths) {
+  // The helper only needs the Windows runtime and the private-file list. Do
+  // not copy provider API keys or other caller secrets into PowerShell's
+  // environment while applying an ACL.
+  const allowed = new Set(
+    [
+      "SystemRoot",
+      "WINDIR",
+      "ComSpec",
+      "PATH",
+      "PATHEXT",
+      "TEMP",
+      "TMP",
+      "PSModulePath",
+      "SystemDrive",
+      "ProgramData",
+      "ProgramFiles",
+      "ProgramFiles(x86)",
+      "ProgramW6432",
+      "USERPROFILE",
+    ]
+      .map((name) => name.toLowerCase()),
+  );
+  const env = Object.fromEntries(
+    Object.entries(process.env).filter(
+      ([name, value]) => allowed.has(name.toLowerCase()) && typeof value === "string",
+    ),
+  );
+  env.CODEX_ROUTER_PRIVATE_FILES = JSON.stringify(paths);
+  return env;
+}
+
+function powershellPrivateArgs() {
+  // PowerShell's `-Command` argument is parsed again by the Windows process
+  // launcher.  That is observable with a spawned child (and especially when
+  // the command contains a block and newlines), so send the UTF-16LE script
+  // through the encoding PowerShell documents for application callers.
+  const encoded = Buffer.from(powershellPrivateScript(), "utf16le").toString("base64");
+  return ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded];
+}
+
+function powershellPrivateCommandArgs() {
+  // `execFileSync` already hands Node's argument vector directly to
+  // CreateProcess.  Keep the synchronous setup/control path on the proven
+  // `-Command` form; PowerShell's encoded-command decoder is much slower on
+  // the hosted Windows image and turns every private write into a timeout-
+  // shaped delay.  The async request path still uses powershellPrivateArgs()
+  // because its one-shot child is launched through spawn and must not depend
+  // on nested command-line quoting.
+  return ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", powershellPrivateScript()];
+}
+
+function terminateWindowsChild(child) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  // `ChildProcess.kill()` is not consistently tree-aware on Windows.  A
+  // PowerShell process can leave a native child behind while it is inside an
+  // ACL call, keeping the router process alive after our bounded operation has
+  // already failed.  Kill the process tree as a fallback; the PID is supplied
+  // by Node rather than user input and taskkill's output is discarded.
+  child.kill();
+  if (Number.isInteger(child.pid) && child.pid > 0) {
+    // Do not wait synchronously for taskkill: Windows can hold it while a
+    // descendant is inside the same ACL call, which would turn our bounded
+    // timeout into an unbounded event-loop stall.  The original child has
+    // already received kill(); taskkill is only best-effort tree cleanup.
+    let treeKiller;
+    try {
+      treeKiller = spawn(
+        "taskkill.exe",
+        ["/PID", String(child.pid), "/T", "/F"],
+        { stdio: "ignore", windowsHide: true },
+      );
+    } catch {
+      return;
+    }
+    treeKiller.on("error", () => {});
+    treeKiller.unref?.();
+    const timer = setTimeout(() => treeKiller.kill(), 5_000);
+    timer.unref?.();
+    treeKiller.on("close", () => clearTimeout(timer));
+  }
+}
+
 // Protect one or more paths in a single PowerShell process. Each file ends up
 // with exactly one current-identity FullControl Allow rule and no inheritance —
 // the same strictness privateFileIsProtected verifies. Owner/group are left
@@ -76,10 +169,18 @@ function protectPrivateFilesWin32(paths) {
   try {
     execFileSync(
       "powershell.exe",
-      ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", powershellPrivateScript()],
+      powershellPrivateCommandArgs(),
       {
-        env: { ...process.env, CODEX_ROUTER_PRIVATE_FILES: JSON.stringify(list) },
+        env: windowsPowerShellEnvironment(list),
         stdio: ["ignore", "ignore", "pipe"],
+        timeout: 15_000,
+        // Every private write reaches this helper, including the ones a
+        // Control Center status refresh performs. A console child of a GUI
+        // parent gets its own window unless this is set, which is how a
+        // routine refresh produced a burst of visible PowerShell windows
+        // (issue #565). The script is non-interactive and its stdio is
+        // already redirected, so nothing is hidden from the operator.
+        windowsHide: true,
       },
     );
   } catch (error) {
@@ -92,6 +193,63 @@ function protectPrivateFilesWin32(paths) {
   return list;
 }
 
+// The request-path writer is asynchronous, but it must use the same bounded
+// one-shot operation as setup/control writes. A persistent PowerShell child
+// cannot reliably consume redirected stdin on Windows; it can stay alive
+// without applying an ACL and strand every caller until the timeout. Keep the
+// credentials out of the helper environment and cap diagnostic output.
+function protectPrivateFilesWin32Async(paths) {
+  const list = [...paths];
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timer;
+    let stderr = "";
+    const child = spawn(
+      "powershell.exe",
+      powershellPrivateArgs(),
+      {
+        env: windowsPowerShellEnvironment(list),
+        stdio: ["ignore", "ignore", "pipe"],
+        windowsHide: true,
+      },
+    );
+    const settle = (error) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      if (error) reject(error);
+      else resolve(list);
+    };
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => {
+      stderr = `${stderr}${chunk}`.slice(-WINDOWS_PRIVATE_ASYNC_OUTPUT_LIMIT);
+      if (stderr.length >= WINDOWS_PRIVATE_ASYNC_OUTPUT_LIMIT) {
+        terminateWindowsChild(child);
+        settle(new Error("Windows private-file protection output exceeded its bound."));
+      }
+    });
+    child.on("error", (cause) => {
+      settle(new Error("Windows private-file protection could not start.", { cause }));
+    });
+    child.on("close", (code, signal) => {
+      if (code === 0) {
+        settle();
+        return;
+      }
+      const detail = stderr.trim();
+      settle(new Error(
+        detail
+          ? `Failed to protect private file ACL: ${detail}`
+          : `Failed to protect private file ACL (${signal || code || "unknown"}).`,
+      ));
+    });
+    timer = setTimeout(() => {
+      terminateWindowsChild(child);
+      settle(new Error("Timed out protecting a private file ACL."));
+    }, WINDOWS_PRIVATE_ASYNC_TIMEOUT_MS);
+  });
+}
+
 export function protectPrivateFile(target) {
   chmodSync(target, 0o600);
   if (process.platform === "win32") protectPrivateFilesWin32([target]);
@@ -102,11 +260,16 @@ export function protectPrivateFile(target) {
 // Keeping it here prevents one state writer from drifting away from the rest.
 export function writePrivateFile(target, contents, { directoryMode } = {}) {
   const directory = path.dirname(target);
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
-  if (directoryMode !== undefined) chmodSync(directory, directoryMode);
-  const temporary = `${target}.tmp.${process.pid}`;
+  const createdDirectory = mkdirSync(directory, { recursive: true, mode: 0o700 });
+  // A caller may inject a credential path for an isolated test, but it never
+  // owns an already-existing parent such as /tmp or a project checkout. Only
+  // apply the requested directory mode to a directory this write created.
+  if (createdDirectory !== undefined && directoryMode !== undefined) {
+    chmodSync(directory, directoryMode);
+  }
+  const temporary = `${target}.tmp.${process.pid}.${randomBytes(8).toString("hex")}`;
   try {
-    writeFileSync(temporary, contents, { encoding: "utf8", mode: 0o600 });
+    writeFileSync(temporary, contents, { encoding: "utf8", mode: 0o600, flag: "wx" });
     if (process.platform === "win32") {
       // One spawn hardens the temporary; the renameSync below then moves this
       // exact file over the target, and MoveFile carries the source's DACL
@@ -121,6 +284,32 @@ export function writePrivateFile(target, contents, { directoryMode } = {}) {
       protectPrivateFile(target);
     }
   } catch (error) {
+    try {
+      const metadata = lstatSync(temporary);
+      if (metadata.isFile() && !metadata.isSymbolicLink()) unlinkSync(temporary);
+    } catch {
+      // The exclusive temporary was never created or was already moved.
+    }
+    throw error;
+  }
+  return target;
+}
+
+// The API-key router updates bounded health/session metadata on every attempt.
+// This async form retains the exact same temporary-file/DACL/rename boundary
+// without blocking the event loop; each operation is independently bounded and
+// cannot strand later requests behind a persistent helper.
+export async function writePrivateFileAsync(target, contents, { directoryMode } = {}) {
+  if (process.platform !== "win32") return writePrivateFile(target, contents, { directoryMode });
+  const directory = path.dirname(target);
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  if (directoryMode !== undefined) chmodSync(directory, directoryMode);
+  const temporary = `${target}.tmp.${process.pid}.${randomBytes(8).toString("hex")}`;
+  try {
+    writeFileSync(temporary, contents, { encoding: "utf8", mode: 0o600 });
+    await protectPrivateFilesWin32Async([temporary]);
+    renameSync(temporary, target);
+  } catch (error) {
     if (existsSync(temporary)) unlinkSync(temporary);
     throw error;
   }
@@ -130,6 +319,67 @@ export function writePrivateFile(target, contents, { directoryMode } = {}) {
 export function writePrivateJson(target, value, { space = 2, directoryMode } = {}) {
   writePrivateFile(target, `${JSON.stringify(value, null, space)}\n`, { directoryMode });
   return value;
+}
+
+export async function writePrivateJsonAsync(target, value, { space = 2, directoryMode } = {}) {
+  await writePrivateFileAsync(target, `${JSON.stringify(value, null, space)}\n`, { directoryMode });
+  return value;
+}
+
+// Ensure a directory and its contents are readable by the Limited-level
+// scheduled task. On Windows, an elevated installer creates directories and
+// files with ACLs that only allow the elevated account to read them. The
+// scheduled task runs at Limited level (issue #548), so it cannot read a
+// checkout created by an elevated shell. This function grants Users read and
+// execute access to the directory tree, so the Limited task can load modules.
+//
+// Only the checkout directory needs this treatment: STATE_DIR files are
+// deliberately owner-only and are never loaded by the task directly.
+export function ensureCheckoutReadable(checkoutPath) {
+  if (process.platform !== "win32") return;
+  // The script grants Users (BUILTIN\Users) ReadAndExecute on the checkout
+  // directory, recursively. This allows the Limited-level task to traverse
+  // directories and read files while keeping write access restricted.
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    "try {",
+    "  $path = $env:CODEX_ROUTER_CHECKOUT_PATH",
+    "  $usersId = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')",
+    "  $readExecute = [System.Security.AccessControl.FileSystemRights]::ReadAndExecute",
+    "  $containerInherit = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit",
+    "  $objectInherit = [System.Security.AccessControl.InheritanceFlags]::ObjectInherit",
+    "  $propagationNone = [System.Security.AccessControl.PropagationFlags]::None",
+    "  $allow = [System.Security.AccessControl.AccessControlType]::Allow",
+    "  $acl = [System.IO.Directory]::GetAccessControl($path)",
+    "  $rule = [System.Security.AccessControl.FileSystemAccessRule]::new($usersId, $readExecute, ($containerInherit -bor $objectInherit), $propagationNone, $allow)",
+    "  $acl.AddAccessRule($rule)",
+    "  [System.IO.Directory]::SetAccessControl($path, $acl)",
+    "} catch {",
+    "  [Console]::Error.WriteLine($_.Exception.Message)",
+    "  exit 1",
+    "}",
+  ].join("\n");
+  const encoded = Buffer.from(script, "utf16le").toString("base64");
+  try {
+    execFileSync(
+      "powershell.exe",
+      ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+      {
+        env: { ...process.env, CODEX_ROUTER_CHECKOUT_PATH: checkoutPath },
+        stdio: ["ignore", "ignore", "pipe"],
+        timeout: 15_000,
+        windowsHide: true,
+      },
+    );
+  } catch (error) {
+    const detail = String(error?.stderr?.trim?.() || error?.message || "").trim();
+    // This is a best-effort operation: if PowerShell is unavailable or the
+    // ACL cannot be modified, the operator can still fix it manually per the
+    // diagnostic message. Do not fail the install outright.
+    if (detail) {
+      console.warn(`Warning: Could not grant Users read access to checkout: ${detail}`);
+    }
+  }
 }
 
 export function privateFileIsProtected(target) {
@@ -157,6 +407,10 @@ export function privateFileIsProtected(target) {
         encoding: "utf8",
         env: { ...process.env, CODEX_ROUTER_PRIVATE_FILE: target },
         stdio: ["ignore", "pipe", "ignore"],
+        timeout: 15_000,
+        // Verification runs from the same GUI-parented paths as the write
+        // above; see issue #565.
+        windowsHide: true,
       },
     ).trim().toLowerCase() === "true";
   } catch {

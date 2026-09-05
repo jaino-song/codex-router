@@ -33,9 +33,13 @@ jobs:
         if: runner.os == 'macOS'
         working-directory: apps/macos/ModelRouterTray
         run: swift test
+      - name: Test the macOS widget
+        if: runner.os == 'macOS'
+        working-directory: apps/macos/RouterUsageWidget
+        run: xcodebuild -project RouterUsageWidget.xcodeproj -scheme RouterUsageWidget -destination 'platform=macOS' test CODE_SIGNING_ALLOWED=NO
       - name: Check shell syntax
         if: runner.os != 'Windows'
-        run: for file in install.sh bin/* scripts/build-electron-companion.sh scripts/build-macos-tray-app.sh packaging/homebrew/check-core-readiness.sh; do [ "$(head -n 1 "$file")" != '#!/bin/sh' ] || sh -n "$file"; done
+        run: for file in install.sh bin/* scripts/build-electron-companion.sh scripts/build-macos-tray-app.sh scripts/build-macos-widget.sh packaging/homebrew/check-core-readiness.sh; do [ "$(head -n 1 "$file")" != '#!/bin/sh' ] || sh -n "$file"; done
       - name: Check installer help
         if: runner.os != 'Windows'
         run: ./install.sh --help
@@ -43,7 +47,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          foreach ($file in @("install.ps1", "codex-router.ps1", "model-router.ps1", "deploy-codex-router.ps1", "restart-codex-router.ps1", "scripts/build-electron-companion.ps1")) {
+          foreach ($file in @("install.ps1", "codex-router.ps1", "model-router.ps1", "deploy-codex-router.ps1", "restart-codex-router.ps1", "src/windows-process-tree.ps1", "scripts/build-electron-companion.ps1")) {
             $errors = $null
             [System.Management.Automation.Language.Parser]::ParseFile(
               (Resolve-Path $file),
@@ -86,7 +90,7 @@ jobs:
       - name: Set up Homebrew
         id: set-up-homebrew
         if: steps.changed.outputs.run == 'true'
-        uses: Homebrew/actions/setup-homebrew@a657b8b0cd35d0f65cce41fce9b24cf054b49869 # 2026.08.24.1
+        uses: Homebrew/actions/setup-homebrew@3cdb78d0f62ad29dd32de765782654f4eedea607 # 2026.08.31.1
       - name: Cache Homebrew Bundler RubyGems
         id: cache-homebrew-gems
         if: steps.changed.outputs.run == 'true'
@@ -115,7 +119,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Set up Homebrew
-        uses: Homebrew/actions/setup-homebrew@a657b8b0cd35d0f65cce41fce9b24cf054b49869 # 2026.08.24.1
+        uses: Homebrew/actions/setup-homebrew@3cdb78d0f62ad29dd32de765782654f4eedea607 # 2026.08.31.1
       - name: Build and test the formula from source
         run: packaging/homebrew/check-core-readiness.sh --install
 
@@ -308,8 +312,23 @@ jobs:
           test "$actual_control_version" = "$expected_control_version"
           test "$actual_build_version" = "$GITHUB_RUN_NUMBER"
           lipo "$app/Contents/MacOS/ModelRouterTray" -verify_arch x86_64 arm64
+          widget="$app/Contents/PlugIns/RouterUsageWidget.appex"
+          lipo "$widget/Contents/MacOS/RouterUsageWidget" -verify_arch x86_64 arm64
           lipo "$app/Contents/Resources/Control Center.app/Contents/MacOS/Codex Router" -verify_arch x86_64 arm64
           codesign --verify --deep --strict "$app"
+          codesign -d --entitlements :- "$widget" > "$RUNNER_TEMP/widget-entitlements.plist" 2>/dev/null
+          test "$(/usr/libexec/PlistBuddy -c 'Print :ModelRouterWidgetStorageMode' "$app/Contents/Info.plist")" = local
+          test "$(/usr/libexec/PlistBuddy -c 'Print :ModelRouterWidgetStorageMode' "$widget/Contents/Info.plist")" = local
+          test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.temporary-exception.files.home-relative-path.read-only:0' "$RUNNER_TEMP/widget-entitlements.plist")" = "/Library/Application Support/Codex Router Widget/"
+          ! /usr/libexec/PlistBuddy -c 'Print :com.apple.security.application-groups' "$RUNNER_TEMP/widget-entitlements.plist" >/dev/null 2>&1
+          host_entitlements=$(codesign -d --entitlements :- "$app" 2>/dev/null || true)
+          ! grep -q 'com.apple.security.application-groups' <<<"$host_entitlements"
+          production_entitlements=apps/macos/RouterUsageWidget/RouterUsageWidget/RouterUsageWidget.entitlements
+          local_entitlements=apps/macos/RouterUsageWidget/RouterUsageWidget/RouterUsageWidget.local.entitlements
+          test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.application-groups:0' "$production_entitlements")" = group.io.github.codex-router
+          ! /usr/libexec/PlistBuddy -c 'Print :com.apple.security.temporary-exception.files.home-relative-path.read-only' "$production_entitlements" >/dev/null 2>&1
+          test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.temporary-exception.files.home-relative-path.read-only:0' "$local_entitlements")" = "/Library/Application Support/Codex Router Widget/"
+          ! /usr/libexec/PlistBuddy -c 'Print :com.apple.security.application-groups' "$local_entitlements" >/dev/null 2>&1
       - name: Smoke the unified macOS app lifecycle
         env:
           CODEX_ROUTER_SOURCE_ROOT: ${{ github.workspace }}

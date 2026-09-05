@@ -200,6 +200,29 @@ export function migrateModelVisibility(replacements) {
     : modelPickerSnapshot();
 }
 
+// Remove decisions for routing identities that no longer exist. Provider
+// removal is stronger than hiding a model: retaining the old visible/hidden
+// decision would silently apply it if a different endpoint were later
+// registered under the same provider id and curated the same slug.
+export function forgetModelVisibility(slugs) {
+  const values = [...new Set(
+    (Array.isArray(slugs) ? slugs : [])
+      .map((slug) => String(slug || "").trim())
+      .filter(Boolean),
+  )];
+  if (values.length === 0) return modelPickerSnapshot();
+  const { hidden, visible, seeded, hasExplicitVisibility } = readPickerState();
+  let changed = false;
+  for (const value of values) {
+    changed = hidden.delete(value) || changed;
+    changed = visible.delete(value) || changed;
+    changed = seeded.delete(value) || changed;
+  }
+  return changed
+    ? writePickerState({ hidden, visible, seeded, hasExplicitVisibility })
+    : modelPickerSnapshot();
+}
+
 export function setAllModelsVisible(slugs, visible) {
   const known = [...new Set(slugs.map((slug) => String(slug).trim()).filter(Boolean))];
   const { hidden: currentHidden, visible: currentVisible, seeded } = readPickerState();

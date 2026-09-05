@@ -9,6 +9,7 @@ import {
   Tray,
 } from "electron";
 import path from "node:path";
+import { writeFileSync } from "node:fs";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { registerIpcHandlers } from "./ipc.mjs";
 import {
@@ -21,6 +22,7 @@ import {
   shouldQuitOnLastWindowClosed,
   writeLifecycleState,
 } from "./lifecycle-state.mjs";
+import { controlCenterDestination, controlCenterNavigationURL } from "./navigation.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const DEVELOPMENT_ICON = path.resolve(HERE, "..", "assets", "icon.png");
@@ -31,10 +33,12 @@ let mutationLifecycle = {
   whenMutationsIdle: () => Promise.resolve(),
 };
 let deferredQuit;
+let isQuitting = false;
 let applicationReady = false;
 let windowVisible = false;
 let windowContentReady = false;
 let showWhenContentReady = false;
+let pendingNavigationDestination = controlCenterDestination(process.argv);
 const lifecycleFile = lifecycleStatePath();
 
 // macOS keeps its existing Swift NSStatusItem. The Control Center is embedded
@@ -185,7 +189,17 @@ function createWindow() {
   createdWindow.on("hide", () => {
     windowVisible = false;
     publishLifecycleState();
-    hideDockForHiddenWindow();
+    // Keep the Dock / Command-Tab tile while Control Center is merely hidden.
+    // Retiring it made Cmd+Tab and the Dock look like the app had quit.
+  });
+  createdWindow.on("close", (event) => {
+    // Close means hide only while a recoverable owner can bring the window
+    // back (embedded macOS host or a live tray). Without that owner, destroy
+    // so window-all-closed can quit instead of stranding an invisible process.
+    if (isQuitting || createdWindow.isDestroyed()) return;
+    if (!(nativeTrayOwnedByHost || trayIsAvailable())) return;
+    event.preventDefault();
+    createdWindow.hide();
   });
   createdWindow.once("closed", () => {
     if (mainWindow !== createdWindow) return;
@@ -194,7 +208,7 @@ function createWindow() {
     showWhenContentReady = false;
     windowVisible = false;
     publishLifecycleState();
-    hideDockForHiddenWindow();
+    if (isQuitting) hideDockForHiddenWindow();
   });
   const loading = RENDERER.development
     ? createdWindow.loadURL(RENDERER.url)
@@ -208,13 +222,27 @@ function revealWindow() {
   if (mainWindow.isMinimized()) mainWindow.restore();
   // The native host is an LSUIElement and never owns a Dock tile. Let its
   // embedded Control Center represent the product in the Dock and Command-Tab
-  // while the actual application window is visible, then retire that tile
-  // when the window closes so the menu-bar host remains unobtrusive.
+  // for as long as this process is alive, including while the window is hidden,
+  // so switching away and back does not make the app look like it quit.
   showDockForVisibleWindow();
   mainWindow.show();
   mainWindow.focus();
   windowVisible = true;
   publishLifecycleState();
+}
+
+function flushNavigationDestination() {
+  if (!pendingNavigationDestination || !mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send("router-control:navigate", pendingNavigationDestination);
+  pendingNavigationDestination = undefined;
+}
+
+function requestNavigation(navigation) {
+  if (!navigation) return false;
+  pendingNavigationDestination = navigation;
+  openRequests.requestOpen();
+  if (windowContentReady) flushNavigationDestination();
+  return true;
 }
 
 function showWindow() {
@@ -283,11 +311,24 @@ if (lifecycleQueryInvocation) {
   // Query contract: one compact JSON object on stdout and status 0, including
   // for absent/stale state. This is directly consumable by jq or
   // ConvertFrom-Json without making "not running" a shell error.
-  process.stdout.write(`${JSON.stringify(queryLifecycleState(lifecycleFile))}\n`, () => app.exit(0));
+  // A packaged GUI may have a pipe that never reports its write callback even
+  // after the small lifecycle document is accepted. Exiting immediately after
+  // the synchronous write handoff keeps rebuild verification from parking a
+  // query helper forever.
+  writeFileSync(1, `${JSON.stringify(queryLifecycleState(lifecycleFile))}\n`);
+  process.exit(0);
 }
 
 const primaryInstance = !lifecycleQueryInvocation && app.requestSingleInstanceLock();
-if (!lifecycleQueryInvocation && (!primaryInstance || quitForUpdateInvocation)) app.quit();
+// These are helper invocations, not application sessions. app.quit() before
+// ready can remain alive in packaged Electron when there is no primary GUI to
+// receive the update request, which blocks the transactional bundle swap.
+if (!lifecycleQueryInvocation && (!primaryInstance || quitForUpdateInvocation)) process.exit(0);
+
+if (primaryInstance) app.on("open-url", (event, url) => {
+  event.preventDefault();
+  requestNavigation(controlCenterNavigationURL(url));
+});
 
 if (primaryInstance && !quitForUpdateInvocation) {
   // Replace a stale record as soon as this process owns the single-instance
@@ -335,6 +376,10 @@ if (primaryInstance && !quitForUpdateInvocation) {
       shell,
       senderGuard: trustedRendererSender,
     });
+    ipcMain.on("router-control:navigation-ready", (event) => {
+      if (!trustedRendererSender(event)) return;
+      flushNavigationDestination();
+    });
     // Even tray-only startup loads one hidden renderer before it publishes
     // ready. Otherwise a package with a missing/broken dist directory would
     // pass lifecycle validation merely because its tray icon was constructible.
@@ -347,30 +392,40 @@ if (primaryInstance && !quitForUpdateInvocation) {
 if (primaryInstance) app.on("second-instance", (_event, commandLine) => {
   if (commandLine.includes("--quit-for-update")) {
     app.quit();
-  } else openRequests.requestOpen();
+  } else {
+    const navigation = controlCenterDestination(commandLine);
+    if (navigation) requestNavigation(navigation);
+    else openRequests.requestOpen();
+  }
 });
 
 if (primaryInstance) app.on("before-quit", (event) => {
+  isQuitting = true;
   if (!mutationLifecycle.hasActiveMutations()) return;
   event.preventDefault();
+  isQuitting = false;
   if (!deferredQuit) {
     deferredQuit = mutationLifecycle.whenMutationsIdle().then(() => {
       deferredQuit = undefined;
+      isQuitting = true;
       app.quit();
     });
   }
 });
 
 if (primaryInstance) app.on("will-quit", () => {
+  isQuitting = true;
   applicationReady = false;
   windowVisible = false;
   publishLifecycleState();
+  hideDockForHiddenWindow();
 });
 
 if (primaryInstance) app.on("window-all-closed", () => {
-  // The outer Swift app owns the only macOS tray, so its embedded Electron
-  // child has no useful tray-only lifetime. Windows/Linux (and standalone macOS
-  // development) retain their Electron tray and can reopen the window.
+  // Prefer close-to-hide above. If the window is destroyed anyway, keep the
+  // embedded macOS process (and Windows/Linux tray builds) alive so Dock,
+  // Command-Tab, or the tray can reopen it. Only quit when no recoverable
+  // owner remains.
   if (shouldQuitOnLastWindowClosed({
     platform: process.platform,
     nativeTrayOwnedByHost,

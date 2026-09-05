@@ -2,11 +2,12 @@
 // the registry or publish a Codex catalog: live provider data is untrusted
 // input, and native GPT metadata remains owned by Codex itself.
 
+import { requestProfileKnown } from "./request-profiles.mjs";
+
 const MODALITIES = new Set(["text", "image", "audio", "video", "file"]);
 const MAX_CONTEXT_WINDOW = 16_777_216;
 const MAX_MODEL_ID_LENGTH = 512;
 const MAX_DISPLAY_NAME_LENGTH = 240;
-const PROFILE_PATTERN = /^[a-z0-9][a-z0-9._-]{0,79}$/;
 const COST_FIELDS = [
   "input",
   "output",
@@ -96,10 +97,10 @@ function normalizeCost(value) {
 
 function normalizeRequestProfile(value) {
   if (value === undefined) return undefined;
-  if (typeof value !== "string" || !PROFILE_PATTERN.test(value.trim())) {
-    throw new Error("requestProfile must be a short lower-case profile id.");
+  if (!requestProfileKnown(value)) {
+    throw new Error("requestProfile must name a supported router profile.");
   }
-  return value.trim();
+  return value;
 }
 
 /**
@@ -154,7 +155,7 @@ export function modelMetadataFromProviderRecord(record, { trusted = false } = {}
   if (!record || typeof record !== "object" || Array.isArray(record)) {
     throw new Error("Provider model metadata must be an object.");
   }
-  const upstreamId = first(record, ["id", "model", "upstreamId"]);
+  const upstreamId = first(record, ["id", "model", "upstreamId", "slug"]);
   if (typeof upstreamId !== "string" || !upstreamId.trim()) {
     throw new Error("Provider model metadata is missing id.");
   }

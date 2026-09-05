@@ -6,12 +6,19 @@
   --token-cached: #b477e3;
   --token-output: #ef8a5f;
   --token-total: color-mix(in srgb, var(--telemetry-accent) 72%, var(--surface-1));
+  --token-fallback: #c88a24;
   min-width: 0;
 }
 
 .usage-page {
   display: grid;
   gap: 24px;
+}
+
+.usage-page:focus-visible {
+  background-color: transparent;
+  box-shadow: none;
+  color: inherit;
 }
 
 .usage-status-page :where(button, select, input):focus-visible {
@@ -233,11 +240,6 @@
   vector-effect: non-scaling-stroke;
 }
 
-.usage-page .us-chart-request-bars rect {
-  fill: color-mix(in srgb, var(--ink-faint) 28%, transparent);
-  vector-effect: non-scaling-stroke;
-}
-
 .usage-page .us-chart-token-bars rect {
   fill: var(--token-total);
   vector-effect: non-scaling-stroke;
@@ -248,6 +250,12 @@
 .usage-page .us-chart-token-bars rect.cached-input { fill: var(--token-cached); }
 .usage-page .us-chart-token-bars rect.output { fill: var(--token-output); }
 .usage-page .us-chart-token-bars rect.other { fill: color-mix(in srgb, var(--ink-faint) 55%, var(--surface-2)); }
+
+.usage-page .us-chart-token-bars rect.router-fallback {
+  stroke: var(--token-fallback);
+  stroke-dasharray: 3 2;
+  stroke-width: 1.5;
+}
 
 .usage-page .us-chart-legend {
   position: absolute;
@@ -275,16 +283,16 @@
   content: "";
 }
 
-.usage-page .us-chart-legend .is-request::before {
-  height: 6px;
-  background: color-mix(in srgb, var(--ink-faint) 40%, transparent);
-}
-
 .usage-page .us-chart-legend .is-token::before { background: var(--token-total); }
 .usage-page .us-chart-legend .is-account::before { background: var(--token-total); }
 .usage-page .us-chart-legend .is-regular::before { background: var(--token-regular); }
 .usage-page .us-chart-legend .is-cached::before { background: var(--token-cached); }
 .usage-page .us-chart-legend .is-output::before { background: var(--token-output); }
+.usage-page .us-chart-legend .is-router-fallback::before {
+  height: 6px;
+  border: 1px dashed var(--token-fallback);
+  background: transparent;
+}
 
 .usage-page .us-chart-scale {
   position: absolute;
@@ -463,6 +471,11 @@
   line-height: 1.35;
 }
 
+.usage-page .us-chart-tooltip-note.is-router-fallback {
+  border-top-color: color-mix(in srgb, var(--token-fallback) 45%, var(--line));
+  color: color-mix(in srgb, var(--token-fallback) 72%, var(--ink-subtle));
+}
+
 .usage-page .us-chart-caption {
   display: flex;
   justify-content: space-between;
@@ -605,6 +618,12 @@
 
 .usage-page .us-allowance-panel {
   min-height: 0;
+  transition: border-color 180ms ease, background-color 180ms ease;
+}
+
+.usage-page .us-allowance-panel.is-navigation-focus {
+  border-color: color-mix(in srgb, var(--accent) 62%, var(--line));
+  background: color-mix(in srgb, var(--accent) 5%, var(--surface-0));
 }
 
 .usage-page .us-metric-stack {
@@ -618,6 +637,13 @@
   border: 1px solid var(--line);
   border-radius: 12px;
   background: var(--surface-1);
+  transition: border-color 180ms ease, background-color 180ms ease;
+}
+
+.usage-page .us-metric-card.is-navigation-focus {
+  border-color: color-mix(in srgb, var(--accent) 72%, var(--line));
+  background: color-mix(in srgb, var(--accent) 7%, var(--surface-1));
+  outline: none;
 }
 
 .usage-page .us-metric-card > header,
@@ -944,6 +970,15 @@
 
 .usage-page .us-loading-panels .skeleton-block { min-height: 340px; }
 
+.usage-page .us-loading-metric {
+  min-height: 86px;
+}
+
+.usage-page .us-loading-source {
+  min-height: 52px;
+  border-radius: 8px;
+}
+
 /* Status */
 
 .status-page .st-primary-grid {
@@ -956,6 +991,39 @@
 .status-page {
   display: grid;
   gap: 24px;
+}
+
+.status-page .st-skeleton-summary-value {
+  width: 64%;
+  height: 24px;
+}
+
+.status-page .st-skeleton-summary-detail {
+  width: 84%;
+  height: 10px;
+  margin-top: 7px;
+}
+
+.status-page .st-service-loading {
+  min-height: 96px;
+}
+
+.status-page .is-partition-loading {
+  position: relative;
+  min-height: 280px;
+}
+
+.status-page .is-partition-loading > :not(.st-partition-skeleton) {
+  visibility: hidden;
+}
+
+.status-page .st-partition-skeleton {
+  position: absolute;
+  inset: 22px;
+}
+
+.status-page .st-partition-skeleton .panel-skeleton-item {
+  min-height: 48px;
 }
 
 .status-page .st-operations-column {

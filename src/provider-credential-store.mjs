@@ -226,14 +226,19 @@ function validateCredentialId(value) {
   return id;
 }
 
-function generatedCredentialId(providerId, kind) {
-  // Random IDs are used for new entries. Migration uses this deterministic
-  // form so running the migration twice never creates duplicate references.
-  const random = randomBytes(18).toString("base64url");
-  return `cred_${random}`;
+export function generatedCredentialId(random = randomBytes) {
+  // Random IDs are used for new entries.
+  // Base64url may begin with `-` or `_`, while a generic provider's
+  // credentialRef requires the first post-prefix character to be alphanumeric.
+  // A fixed opaque marker makes every generated id valid without discarding
+  // entropy or retrying on a random outcome.
+  const opaque = random(18).toString("base64url");
+  return `cred_r${opaque}`;
 }
 
 function migratedCredentialId(providerId, kind) {
+  // Migration uses a deterministic form so running it twice never creates
+  // duplicate references.
   const digest = createHash("sha256")
     .update(`codex-router-provider-credential:${providerId}:${kind}`)
     .digest("base64url")
@@ -262,7 +267,7 @@ function normalizeSecretRef(value, providerId, { legacy = false, providerType } 
   const referenceProviderId = value.providerId === undefined
     ? providerId
     : providerType === "generic"
-      ? normalizeGenericProviderId(value.providerId)
+      ? normalizeGenericProviderId(value.providerId, { reservedProviderIds: PROVIDERS })
       : validateProviderId(value.providerId);
   if (referenceProviderId !== providerId) {
     throw new Error("secretRef.providerId must match providerId.");
@@ -324,7 +329,7 @@ function normalizeCredential(raw, { legacy = false } = {}) {
     throw new Error("Legacy credentials cannot declare providerType.");
   }
   const providerId = providerType === "generic"
-    ? normalizeGenericProviderId(raw.providerId)
+    ? normalizeGenericProviderId(raw.providerId, { reservedProviderIds: PROVIDERS })
     : validateProviderId(raw.providerId);
   const kind = normalizeText(raw.kind || (legacy ? "api_key" : undefined), "credential kind", {
     max: 20,
@@ -463,10 +468,10 @@ function createCredentialReferenceForType(input = {}, providerType) {
     updatedAt,
   } = input;
   const normalizedProviderId = providerType === "generic"
-    ? normalizeGenericProviderId(providerId)
+    ? normalizeGenericProviderId(providerId, { reservedProviderIds: PROVIDERS })
     : validateProviderId(providerId);
   const credential = normalizeCredential({
-    id: id || generatedCredentialId(normalizedProviderId, kind),
+    id: id || generatedCredentialId(),
     providerId: normalizedProviderId,
     ...(providerType ? { providerType } : {}),
     kind: providerType === "generic" ? (kind || "api_key") : kind,
@@ -507,6 +512,35 @@ function addCredentialReferenceWith(input, filePath, create) {
 
 export function addCredentialReference(input, filePath = PROVIDER_CREDENTIAL_STORE_PATH) {
   return addCredentialReferenceWith(input, filePath, createCredentialReference);
+}
+
+function sameSecretReference(left, right) {
+  return ["type", "providerId", "target", "service", "name"]
+    .every((field) => left?.[field] === right?.[field]);
+}
+
+export function ensureCredentialReference(input, filePath = PROVIDER_CREDENTIAL_STORE_PATH) {
+  const target = managedStatePath(filePath, "credential store path");
+  return withAtomicStateLock(target, () => {
+    const store = readProviderCredentialStoreStrict(target);
+    const credential = createCredentialReference(input);
+    const existing = store.credentials.find(
+      (entry) =>
+        entry.state === "active" &&
+        entry.providerId === credential.providerId &&
+        entry.kind === credential.kind &&
+        sameSecretReference(entry.secretRef, credential.secretRef),
+    );
+    if (existing) return { credential: existing, created: false };
+    if (store.credentials.some((entry) => entry.id === credential.id)) {
+      throw new Error(`Credential id already exists: ${credential.id}`);
+    }
+    store.credentials.push(credential);
+    return {
+      credential: writeProviderCredentialStore(store, target).credentials.at(-1),
+      created: true,
+    };
+  });
 }
 
 export function addGenericProviderCredentialReference(input, filePath = PROVIDER_CREDENTIAL_STORE_PATH) {

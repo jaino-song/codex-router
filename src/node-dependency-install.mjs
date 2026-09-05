@@ -1,9 +1,22 @@
-import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { recordStep, SOURCE_ROOT, stepStatus } from "./install-plan.mjs";
+import { operationDeadlineFromEnvironment, runProcessTree } from "./process-tree.mjs";
 import { commandOnPath, spawnableCommand } from "./spawnable-command.mjs";
+
+const DEFAULT_NODE_DEPENDENCY_INSTALL_MS = 10 * 60_000;
+const MAX_NODE_DEPENDENCY_INSTALL_MS = 10 * 60_000;
+
+export function nodeDependencyInstallDeadline(deadline, env = process.env) {
+  const boundedEnvironment = Number.isSafeInteger(deadline)
+    ? { ...env, CODEX_ROUTER_OPERATION_DEADLINE_MS: String(deadline) }
+    : env;
+  return operationDeadlineFromEnvironment(boundedEnvironment, {
+    timeoutMs: DEFAULT_NODE_DEPENDENCY_INSTALL_MS,
+    maximumMs: MAX_NODE_DEPENDENCY_INSTALL_MS,
+  });
+}
 
 // A failure here is never a credential problem, and callers must not fold it
 // into one: `npm ci` empties node_modules before it refills it, so a run that
@@ -21,10 +34,13 @@ function dependencyFailure(detail, options = {}) {
   });
 }
 
-export function ensureNodeDependencies({
+export async function ensureNodeDependencies({
   root = SOURCE_ROOT,
   env = process.env,
   platform = process.platform,
+  signal,
+  deadline,
+  run = runProcessTree,
 } = {}) {
   // Package managers assemble this tree themselves. Mutating their prefix with
   // npm would violate the same ownership boundary enforced by bin/install --
@@ -43,13 +59,23 @@ export function ensureNodeDependencies({
   if (!npm) throw dependencyFailure("npm is required and is normally included with Node.js.");
   process.stdout.write("Installing Node dependencies needed for credential setup...\n");
   const invocation = spawnableCommand(npm, ["ci", "--omit=dev"], platform);
-  const result = spawnSync(invocation.command, invocation.args, {
-    ...invocation.options,
-    cwd: root,
-    env,
-    stdio: "inherit",
-  });
-  if (result.error) throw dependencyFailure(result.error.message, { cause: result.error });
+  const operationDeadline = nodeDependencyInstallDeadline(deadline, env);
+  let result;
+  try {
+    result = await run(invocation.command, invocation.args, {
+      cwd: root,
+      env,
+      signal,
+      deadline: operationDeadline,
+      stdio: "inherit",
+      windowsVerbatimArguments: Boolean(invocation.options.windowsVerbatimArguments),
+    });
+  } catch (error) {
+    throw dependencyFailure(error instanceof Error ? error.message : String(error), {
+      cause: error,
+      ...(error?.code ? { code: error.code } : {}),
+    });
+  }
   if (result.status !== 0) {
     // A signalled npm reports a null status, and "exited with status null"
     // hides which signal ended it.
@@ -65,7 +91,7 @@ export function ensureNodeDependencies({
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
-    ensureNodeDependencies();
+    await ensureNodeDependencies();
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
     process.exit(1);

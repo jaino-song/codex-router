@@ -21,9 +21,9 @@ function safeStatus() {
   };
 }
 
-export function setChatGptSessionSharing(enabled) {
+export async function setChatGptSessionSharing(enabled) {
   setNativeSessionSharingEnabled(enabled);
-  const refreshed = refreshTargetPickerIfInstalled();
+  const refreshed = await refreshTargetPickerIfInstalled();
   return { ...safeStatus(), refreshed };
 }
 
@@ -52,7 +52,7 @@ function printStatus(status, { json = false } = {}) {
   }
 }
 
-export function runChatGptSessionCommand(args = process.argv.slice(2)) {
+export async function runChatGptSessionCommand(args = process.argv.slice(2)) {
   const command = args[0] || "status";
   const json = args.includes("--json");
   const extras = args.slice(1).filter((argument) => argument !== "--json");
@@ -64,7 +64,7 @@ export function runChatGptSessionCommand(args = process.argv.slice(2)) {
     printStatus(status, { json });
     return status;
   }
-  const status = setChatGptSessionSharing(command === "enable");
+  const status = await setChatGptSessionSharing(command === "enable");
   printStatus(status, { json });
   if (!json && status.refreshed) {
     process.stdout.write("Installed client model catalogs were refreshed.\n");
@@ -74,7 +74,7 @@ export function runChatGptSessionCommand(args = process.argv.slice(2)) {
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
-    runChatGptSessionCommand();
+    await runChatGptSessionCommand();
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
     process.exit(error?.exitCode || 1);

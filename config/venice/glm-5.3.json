@@ -2,13 +2,13 @@
   "version": 1,
   "models": [
     {
-      "slug": "nousresearch/glm-5.3-flash",
-      "gatewayModel": "nousresearch-glm-5-3-flash",
-      "upstreamModel": "z-ai/glm-5.3-flash",
-      "provider": "nousresearch",
+      "slug": "venice/glm-5.3",
+      "gatewayModel": "venice-glm-5-3",
+      "upstreamModel": "z-ai-glm-5-3",
+      "provider": "venice",
       "listed": true,
-      "displayName": "GLM-5.3-Flash (Nous Portal)",
-      "description": "GLM-5.3-Flash through Nous Research Portal. The 1M-context route uses the model's low/high/max reasoning ladder.",
+      "displayName": "GLM-5.3 (Venice)",
+      "description": "GLM-5.3 through Venice AI. The 1M-context route uses the model's low/high/max reasoning ladder.",
       "priority": 102,
       "defaultEffort": "max",
       "reasoningLevels": [
@@ -26,11 +26,11 @@
         }
       ],
       "contextWindow": 1000000,
-      "autoCompact": 400000,
+      "autoCompact": 900000,
       "inputModalities": [
         "text"
       ],
-      "compHash": "nousresearch-glm-5-3-flash-v1"
+      "compHash": "venice-glm-5-3-v1"
     }
   ]
 }

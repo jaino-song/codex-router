@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { once } from "node:events";
 import os from "node:os";
@@ -43,6 +43,8 @@ const {
 const { LOG_PATH } = await import("../src/paths.mjs");
 const { createSupportBundle } = await import("../src/support-bundle.mjs");
 const { discoverGenericProviderModels } = await import("../src/model-discovery.mjs");
+const { userModelEntry } = await import("../src/user-models.mjs");
+const { runGenericCommand } = await import("../src/providers.mjs");
 test.after(() => rmSync(testRoot, { recursive: true, force: true }));
 
 async function listen(server) {
@@ -219,6 +221,34 @@ test("generic requests revalidate DNS, reject redirects, and bound response read
   );
 });
 
+test("generic request transport keeps operator headers authoritative and can follow caller lifetime", async () => {
+  addGenericProvider({
+    id: "request-transport",
+    displayName: "Request transport",
+    baseUrl: "https://provider.example.test/v1",
+    headers: { "X-Tenant": "operator-tenant" },
+  });
+  const controller = new AbortController();
+  let observed;
+  const { dispatcher } = await requestGenericProvider("request-transport", "/chat/completions", {
+    lookup: async () => ["8.8.8.8"],
+    fetchImpl: async (_url, options) => {
+      observed = options;
+      return { ok: true, status: 200 };
+    },
+    timeoutMs: 0,
+    signal: controller.signal,
+    method: "POST",
+    headers: { "x-tenant": "caller-tenant", "Content-Type": "application/json" },
+    body: "{}",
+  });
+  assert.equal(dispatcher, undefined);
+  assert.equal(observed.headers["X-Tenant"], "operator-tenant");
+  assert.equal(observed.headers["x-tenant"], undefined);
+  assert.equal(observed.headers["Content-Type"], "application/json");
+  assert.equal(observed.signal, controller.signal);
+});
+
 test("generic credential references never enter descriptors or logs", async () => {
   addGenericProvider({
     id: "credential-boundary",
@@ -233,8 +263,47 @@ test("generic credential references never enter descriptors or logs", async () =
       lookup: async () => ["8.8.8.8"],
       fetchImpl: async () => ({ ok: true, status: 200 }),
     }),
-    /Credential cred_generic_provider_01 is unavailable/,
+    /bound credential is unavailable/,
   );
+});
+
+test("generic provider credential CLI binds a hidden-prompt key and removes it coherently", async () => {
+  const providerId = "generic-key-cli";
+  const secret = "TEST_GENERIC_HIDDEN_PROMPT_TOKEN_7d2f09";
+  addGenericProvider({
+    id: providerId,
+    displayName: "Generic Key CLI",
+    baseUrl: "https://provider.example.test/v1",
+  });
+  const transact = async ({ mutate, applyPublication }) => {
+    await mutate();
+    await applyPublication();
+  };
+  const configured = await runGenericCommand(
+    ["credential", providerId, "set", "--json"],
+    { prompt: () => secret, transact, applyPublication: async () => ({ published: false }) },
+  );
+  assert.equal(configured.configured, true);
+  assert.match(configured.credentialRef, /^cred_/);
+  assert.equal(JSON.stringify(configured).includes(secret), false);
+  assert.equal(getGenericProvider(providerId).credentialRef, configured.credentialRef);
+  assert.equal(existsSync(genericProviderCredentialPath(providerId)), true);
+  assert.equal(readProviderCredentialStore().credentials.some(
+    (credential) => credential.id === configured.credentialRef &&
+      credential.providerType === "generic" && credential.providerId === providerId,
+  ), true);
+
+  const removed = await runGenericCommand(
+    ["credential", providerId, "remove", "--json"],
+    { transact, applyPublication: async () => ({ published: false }) },
+  );
+  assert.equal(removed.configured, false);
+  assert.equal(removed.credentialRef, null);
+  assert.equal(getGenericProvider(providerId).credentialRef, undefined);
+  assert.equal(existsSync(genericProviderCredentialPath(providerId)), false);
+  assert.equal(readProviderCredentialStore().credentials.some(
+    (credential) => credential.id === configured.credentialRef,
+  ), false);
 });
 
 test("generic requests fail closed when a credential is unavailable or not an API key", async () => {
@@ -249,7 +318,7 @@ test("generic requests fail closed when a credential is unavailable or not an AP
       lookup: async () => ["8.8.8.8"],
       fetchImpl: async () => ({ ok: true, status: 200 }),
     }),
-    /Credential cred_generic_missing_01 is unavailable/,
+    /bound credential is unavailable/,
   );
 
   addGenericProvider({
@@ -263,7 +332,7 @@ test("generic requests fail closed when a credential is unavailable or not an AP
       lookup: async () => ["8.8.8.8"],
       fetchImpl: async () => ({ ok: true, status: 200 }),
     }),
-    /Credential cred_generic_account_01 is unavailable/,
+    /bound credential is unavailable/,
   );
 });
 
@@ -374,9 +443,13 @@ test("providers CLI exposes generic CRUD with sanitized JSON", () => {
     CODEX_HOME: path.join(testRoot, "codex-cli"),
     CODEX_ROUTER_STATE_DIR: path.join(testRoot, "state-cli"),
     MODEL_ROUTER_USER_MODELS: path.join(testRoot, "state-cli", "user-models.json"),
+    MODEL_ROUTER_MODEL_PICKER_STATE: path.join(testRoot, "state-cli", "model-picker.json"),
   };
   mkdirSync(env.CODEX_ROUTER_STATE_DIR, { recursive: true });
-  const add = spawnSync(process.execPath, ["src/providers.mjs", "generic", "add", "cli-test", "--name", "CLI Test", "--base-url", "https://cli.example.test/v1", "--header", "X-Org=demo", "--json"], { cwd: root, env, encoding: "utf8" });
+  // The control-center entry point must use the same transactional
+  // publication command as bin/providers rather than mutating descriptors
+  // directly and leaving a running route stale.
+  const add = spawnSync(process.execPath, ["src/control.mjs", "generic-providers", "add", "cli-test", "--name", "CLI Test", "--base-url", "https://cli.example.test/v1", "--header", "X-Org=demo", "--no-apply", "--json"], { cwd: root, env, encoding: "utf8" });
   assert.equal(add.status, 0, add.stderr);
   const added = JSON.parse(add.stdout);
   assert.equal(added.provider.id, "cli-test");
@@ -384,4 +457,45 @@ test("providers CLI exposes generic CRUD with sanitized JSON", () => {
   const list = spawnSync(process.execPath, ["src/providers.mjs", "generic", "list", "--json"], { cwd: root, env, encoding: "utf8" });
   assert.equal(list.status, 0, list.stderr);
   assert.equal(JSON.parse(list.stdout).providers[0].id, "cli-test");
+
+  const model = userModelEntry({
+    providerId: "cli-test",
+    upstreamId: "curated-model",
+    priority: 100,
+  });
+  writeFileSync(
+    env.MODEL_ROUTER_USER_MODELS,
+    `${JSON.stringify({ version: 1, models: [model] }, null, 2)}\n`,
+  );
+  writeFileSync(
+    env.MODEL_ROUTER_MODEL_PICKER_STATE,
+    `${JSON.stringify({
+      version: 1,
+      hidden: [],
+      visible: [model.slug],
+      seeded: [model.slug],
+    }, null, 2)}\n`,
+  );
+
+  const unsafeDrift = spawnSync(
+    process.execPath,
+    ["src/providers.mjs", "generic", "disable", "cli-test", "--no-apply"],
+    { cwd: root, env, encoding: "utf8" },
+  );
+  assert.equal(unsafeDrift.status, 1);
+  assert.match(unsafeDrift.stderr, /--no-apply is unsafe/);
+  assert.equal(JSON.parse(readFileSync(path.join(env.CODEX_ROUTER_STATE_DIR, "generic-providers.json"), "utf8")).providers[0].enabled, true);
+
+  const remove = spawnSync(
+    process.execPath,
+    ["src/providers.mjs", "generic", "remove", "cli-test", "--json"],
+    { cwd: root, env, encoding: "utf8" },
+  );
+  assert.equal(remove.status, 0, remove.stderr);
+  assert.equal(JSON.parse(remove.stdout).removed, "cli-test");
+  assert.deepEqual(JSON.parse(readFileSync(env.MODEL_ROUTER_USER_MODELS, "utf8")).models, []);
+  const picker = JSON.parse(readFileSync(env.MODEL_ROUTER_MODEL_PICKER_STATE, "utf8"));
+  assert.deepEqual(picker.visible, []);
+  assert.deepEqual(picker.hidden, []);
+  assert.deepEqual(picker.seeded, []);
 });

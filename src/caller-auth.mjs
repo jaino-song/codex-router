@@ -37,6 +37,10 @@ export function callerBaseUrl(port, secret) {
   return `http://127.0.0.1:${port}${callerBasePath(secret)}`;
 }
 
+export function cursorCliBaseUrl(port, secret) {
+  return `http://127.0.0.1:${port}${CALLER_PATH_PREFIX}/${assertCallerSecret(secret)}`;
+}
+
 // The Gemini API leaf, behind the identical capability in the identical
 // position. Gemini CLI hands its base URL to @google/genai, which appends
 // `/v1beta/models/{model}:{method}` itself -- so the secret has to be a path
@@ -49,6 +53,18 @@ export function geminiBasePath(secret) {
 
 export function geminiBaseUrl(port, secret) {
   return `http://127.0.0.1:${port}${geminiBasePath(secret)}`;
+}
+
+// Claude Code appends `/v1/messages` and `/v1/models` to this gateway origin.
+// Keeping the capability ahead of the protocol leaf lets the router expose an
+// Anthropic-compatible surface without placing a reusable credential in query
+// parameters or changing the shared caller authority.
+export function claudeBasePath(secret) {
+  return `${CALLER_PATH_PREFIX}/${assertCallerSecret(secret)}/anthropic`;
+}
+
+export function claudeBaseUrl(port, secret) {
+  return `http://127.0.0.1:${port}${claudeBasePath(secret)}`;
 }
 
 // The companion's browser surface sits behind the same capability as the API,
@@ -105,6 +121,26 @@ export function isManagedCallerBaseUrl(value, port) {
   return isManagedLeafBaseUrl(value, port, "v1");
 }
 
+// Codex can authenticate the router either with the legacy path capability or
+// with a bearer sent to the plain loopback Responses endpoint.
+export function isManagedCodexBaseUrl(value, port) {
+  if (isManagedCallerBaseUrl(value, port)) return true;
+  if (typeof value !== "string" || !value) return false;
+  try {
+    const url = new URL(value);
+    const expectedPort = port === undefined ? undefined : Number(port) === 80 ? "" : String(port);
+    return (
+      url.protocol === "http:" &&
+      url.hostname === "127.0.0.1" &&
+      (port === undefined || url.port === expectedPort) &&
+      !url.username && !url.password && !url.search && !url.hash &&
+      /^\/v1\/?$/.test(url.pathname)
+    );
+  } catch {
+    return false;
+  }
+}
+
 // The base URL the Gemini integration writes. Checked separately from the
 // Responses one because the two are not interchangeable: a client pointed at
 // `/v1` speaks Responses and a client pointed at `/gemini` speaks Gemini, so
@@ -112,6 +148,10 @@ export function isManagedCallerBaseUrl(value, port) {
 // configuration that 404s on every turn.
 export function isManagedGeminiBaseUrl(value, port) {
   return isManagedLeafBaseUrl(value, port, "gemini");
+}
+
+export function isManagedClaudeBaseUrl(value, port) {
+  return isManagedLeafBaseUrl(value, port, "anthropic");
 }
 
 // Every leaf the capability guards, not just `/v1`. Redaction is what keeps the
@@ -122,7 +162,7 @@ export function isManagedGeminiBaseUrl(value, port) {
 export function redactCallerUrl(value) {
   if (typeof value !== "string") return value;
   return value.replace(
-    new RegExp(`(${CALLER_PATH_PREFIX}/)[A-Za-z0-9_-]+(?=/(?:v1|panel|gemini)(?:/|$))`, "g"),
+    new RegExp(`(${CALLER_PATH_PREFIX}/)[A-Za-z0-9_-]+(?=/(?:v1|panel|gemini|anthropic)(?:/|$|[^A-Za-z0-9_-])|$)`, "g"),
     "$1[REDACTED]",
   );
 }

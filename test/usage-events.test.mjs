@@ -30,7 +30,11 @@ test("usage events persist only bounded request metadata in a private file", asy
       toolResultBytesBefore: 80_000,
       toolResultBytesAfter: 5_000,
       toolResultBytesSaved: 75_000,
+      searchSidecar: true,
+      searchCacheHit: false,
+      searchResults: 4,
       prompt: "never persisted",
+      credential: "never persisted",
     });
     assert.deepEqual(usage.recentUsageEvents(), [
       {
@@ -51,6 +55,9 @@ test("usage events persist only bounded request metadata in a private file", asy
         toolResultBytesBefore: 80_000,
         toolResultBytesAfter: 5_000,
         toolResultBytesSaved: 75_000,
+        searchSidecar: true,
+        searchCacheHit: false,
+        searchResults: 4,
       },
     ]);
     if (process.platform !== "win32") {
@@ -348,7 +355,7 @@ test("totals separate a pass that ran and aged nothing from one that never ran",
   }
 });
 
-test("token-maxxing shaping contributes savings without being reported as aged", async () => {
+test("RTK compaction shaping contributes savings without being reported as aged", async () => {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "model-router-usage-"));
   const previousStateDir = process.env.MODEL_ROUTER_STATE_DIR;
   process.env.MODEL_ROUTER_STATE_DIR = stateDir;

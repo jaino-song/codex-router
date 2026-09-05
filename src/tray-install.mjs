@@ -6,14 +6,29 @@ import path from "node:path";
 
 const TRAY_PLATFORMS = new Set(["darwin", "linux", "win32"]);
 
-export function trayDecision({ platform, withTray, noTray, guided }) {
+export function trayDecision({ platform, withTray, noTray, guided, packageManager }) {
   if (noTray) return "skip";
+  // Package-manager installs must stay inside the files their package manager
+  // owns. The desktop companions are built from separate Swift/Electron trees,
+  // so offering that build here would either mutate a Homebrew keg or download
+  // an Electron toolchain during first-run setup. The source installer remains
+  // the supported all-in-one desktop path.
+  if (packageManager === "homebrew") return "skip";
   // Windows was excluded here while it had no tray build, which left the
   // installer silently skipping the one platform whose tray has to be built by
   // hand -- so nothing ever appeared and nothing said why.
   if (!TRAY_PLATFORMS.has(platform)) return "skip";
   if (withTray) return "install";
   return guided ? "ask" : "skip";
+}
+
+export function traySetupError({ packageManager, withTray, noTray }) {
+  if (packageManager !== "homebrew" || !withTray || noTray) return undefined;
+  return (
+    "--with-tray is unavailable for Homebrew installations. Homebrew installs " +
+    "the router and CLI only; use the recommended curl installer in the README " +
+    "for the Electron Control Center, tray/menu-bar app, and macOS desktop widget."
+  );
 }
 
 // Legacy Tauri release path retained only to recognize and migrate older

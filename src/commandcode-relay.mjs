@@ -64,6 +64,7 @@ export async function relayCommandCodeGenerate({
   baseUrl,
   response,
   signal,
+  deferErrors = false,
   fetchImpl = fetch,
   at = Date.now(),
 }) {
@@ -82,18 +83,33 @@ export async function relayCommandCodeGenerate({
     signal,
   });
 
+  const finishError = async (status, raw) => {
+    const body = JSON.stringify(errorBody(status, raw));
+    const responseHeaders = {
+      "Content-Type": "application/json",
+      "Content-Length": String(Buffer.byteLength(body)),
+    };
+    if (deferErrors) {
+      return {
+        status,
+        ok: false,
+        committed: false,
+        headers: upstream.headers,
+        responseHeaders,
+        bodyText: body,
+      };
+    }
+    response.writeHead(status, responseHeaders);
+    response.end(body);
+    return { status, ok: false, committed: true, headers: upstream.headers };
+  };
+
   if (!upstream.ok || !upstream.body) {
     const raw = await upstream.text().catch(() => "");
-    const body = JSON.stringify(errorBody(upstream.status, raw));
-    response.writeHead(upstream.status, {
-      "Content-Type": "application/json",
-      "Content-Length": Buffer.byteLength(body),
-    });
-    response.end(body);
-    return { status: upstream.status, ok: false, headers: upstream.headers };
+    return finishError(upstream.ok ? 502 : upstream.status, raw);
   }
 
-  const outcome = (status) => ({ status, ok: upstream.ok, headers: upstream.headers });
+  const outcome = (status) => ({ status, ok: upstream.ok, committed: true, headers: upstream.headers });
 
   const translator = new GenerateTranslator({
     protocol,
@@ -106,13 +122,7 @@ export async function relayCommandCodeGenerate({
     // one assembled here rather than a stream it never agreed to parse.
     for await (const event of readGenerateEvents(upstream.body)) translator.push(event);
     if (translator.error) {
-      const body = JSON.stringify(errorBody(502, JSON.stringify({ message: translator.error })));
-      response.writeHead(502, {
-        "Content-Type": "application/json",
-        "Content-Length": Buffer.byteLength(body),
-      });
-      response.end(body);
-      return outcome(502);
+      return finishError(502, JSON.stringify({ message: translator.error }));
     }
     const body = JSON.stringify(translator.body());
     response.writeHead(200, {

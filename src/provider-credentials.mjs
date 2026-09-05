@@ -149,7 +149,7 @@ function canonicalProviderId(provider) {
 }
 
 function genericCredentialProvider(providerId) {
-  const id = normalizeGenericProviderId(providerId);
+  const id = normalizeGenericProviderId(providerId, { reservedProviderIds: PROVIDERS });
   return {
     id,
     kind: "openai-compatible",

@@ -13,6 +13,17 @@ test("dashboard route controls use the existing validated IPC mutation", async (
   assert.doesNotMatch(panel, /credential|apiKey|accessToken|sessionId/);
 });
 
+test("dashboard places token activity before the expanded provider routes card", async () => {
+  const source = (await readFile(new URL("../apps/control-center/src/pages/DashboardPage.tsx", import.meta.url), "utf8"))
+    .replace(/\r\n/g, "\n");
+  const tokenActivity = source.indexOf("<TokenActivity");
+  const providerRoutes = source.indexOf("<RouteDashboardPanel");
+  assert.ok(tokenActivity >= 0, "token activity should be rendered");
+  assert.ok(providerRoutes > tokenActivity, "provider routes should follow token activity");
+  const panel = source.match(/function RouteDashboardPanel[\s\S]*?\n}\n\n/)?.[0] || "";
+  assert.doesNotMatch(panel, /accordion|detailsOpen|aria-expanded/);
+});
+
 test("dashboard contract is attached to the shared catalog snapshot", async () => {
   const source = (await readFile(new URL("../src/control.mjs", import.meta.url), "utf8"))
     .replace(/\r\n/g, "\n");

@@ -1,58 +1,38 @@
 import { promises as dns } from "node:dns";
-import { existsSync, readFileSync } from "node:fs";
 import { isIP } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Agent, fetch as undiciFetch } from "undici";
 
-import { normalizeGenericProviderId } from "./generic-provider-identity.mjs";
-import { GENERIC_PROVIDERS_PATH } from "./paths.mjs";
 import { withAtomicStateLock } from "./atomic-state-lock.mjs";
+import {
+  GENERIC_PROVIDER_SCHEMA_VERSION,
+  GENERIC_PROVIDERS_PATH,
+  genericProviderRuntimeDescriptor,
+  isPrivateGenericProviderAddress,
+  isPrivateGenericProviderHostname,
+  parseGenericProviderDocument,
+  readGenericProviders as readGenericProviderState,
+  redactGenericProvider as redactGenericProviderState,
+  validateGenericProvider,
+  validateGenericProviderHeaders,
+} from "./generic-provider-state.mjs";
 import { providerCatalogIdentityFingerprint } from "./model-catalog-cache.mjs";
+import { PROVIDERS } from "./model-registry.mjs";
 import { readProviderCredentialStore } from "./provider-credential-store.mjs";
 import { resolveGenericProviderCredentialReference } from "./provider-credentials.mjs";
 
-export { GENERIC_PROVIDERS_PATH } from "./paths.mjs";
+export {
+  GENERIC_PROVIDER_ADAPTERS,
+  GENERIC_PROVIDER_SCHEMA_VERSION,
+  GENERIC_PROVIDERS_PATH,
+} from "./generic-provider-state.mjs";
+export { genericProviderConfigured } from "./generic-provider-readiness.mjs";
 import { writePrivateJson } from "./file-security.mjs";
 import { fetchUntrustedModelCatalog } from "./untrusted-model-discovery.mjs";
 
-// Generic providers are deliberately kept in a separate user-owned document.
-// The checked-in registry remains the authority for native and curated models;
-// P06 can merge this descriptor into that registry after capability discovery.
-// Keeping the two documents separate also means a checkout update cannot erase
-// an operator's endpoint definitions.
-export const GENERIC_PROVIDER_SCHEMA_VERSION = 1;
-export const GENERIC_PROVIDER_ADAPTERS = Object.freeze([
-  "openai-chat",
-  "openai-responses",
-  "openai-completions",
-]);
-
-// These names are either hop-by-hop transport headers or common secret
-// carriers. A generic provider may declare static routing metadata, but P02's
-// credential references must be used for authentication headers later.
-const FORBIDDEN_HEADER_NAMES = new Set([
-  "authorization",
-  "proxy-authorization",
-  "x-api-key",
-  "api-key",
-  "cookie",
-  "set-cookie",
-  "host",
-  "content-length",
-  "connection",
-  "keep-alive",
-  "transfer-encoding",
-  "upgrade",
-]);
-
-const HEADER_NAME_PATTERN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
-const MAX_HEADERS = 64;
-const MAX_HEADER_VALUE_LENGTH = 4_096;
-const MAX_DESCRIPTION_LENGTH = 240;
 const MAX_RESPONSE_BYTES = 64 * 1024;
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
-const SECRET_HEADER_PATTERN = /(?:^|[-_])(auth|authorization|api[-_]?key|key|token|secret|credential|cookie|password|session|signature)(?:$|[-_])/i;
 
 function text(value) {
   return typeof value === "string" ? value.trim() : "";
@@ -62,227 +42,18 @@ function errorMessage(error) {
   return error instanceof Error ? error.message : String(error);
 }
 
-function normalizeBaseUrl(value) {
-  return text(value).replace(/\/+$/, "");
-}
-
-function isIpv4(value) {
-  const parts = value.split(".");
-  return parts.length === 4 && parts.every((part) => /^\d+$/.test(part) && Number(part) <= 255);
-}
-
-function isPrivateIpv4(value) {
-  if (!isIpv4(value)) return false;
-  const [a, b] = value.split(".").map(Number);
-  return (
-    a === 0 ||
-    a === 10 ||
-    a === 127 ||
-    (a === 100 && b >= 64 && b <= 127) ||
-    (a === 169 && b === 254) ||
-    (a === 172 && b >= 16 && b <= 31) ||
-    (a === 192 && [0, 2, 168].includes(b)) ||
-    (a === 198 && b >= 18 && b <= 19) ||
-    (a === 198 && b === 51) ||
-    (a === 203 && b === 0) ||
-    a >= 224
-  );
-}
-
-function isPrivateAddress(value) {
-  const address = String(value || "").toLowerCase();
-  const family = isIP(address);
-  if (family === 4) return isPrivateIpv4(address);
-  if (family !== 6) return false;
-  const withoutZone = address.split("%")[0];
-  const parts = withoutZone.split("::");
-  if (parts.length > 2) return false;
-  const expand = (segment) => {
-    if (!segment) return [];
-    const values = segment.split(":");
-    const result = [];
-    for (const valuePart of values) {
-      if (valuePart.includes(".")) {
-        if (!isIpv4(valuePart)) return undefined;
-        const [first, second, third, fourth] = valuePart.split(".").map(Number);
-        result.push(((first << 8) | second).toString(16), ((third << 8) | fourth).toString(16));
-      } else if (/^[0-9a-f]{1,4}$/.test(valuePart)) {
-        result.push(valuePart);
-      } else {
-        return undefined;
-      }
-    }
-    return result;
-  };
-  const left = expand(parts[0]);
-  const right = expand(parts[1] || "");
-  if (!left || !right) return false;
-  const hextets = parts.length === 2
-    ? [...left, ...Array(8 - left.length - right.length).fill("0"), ...right]
-    : left;
-  if (hextets.length !== 8) return false;
-  const first = Number.parseInt(hextets[0], 16);
-  const high = hextets.map((part) => BigInt(`0x${part}`)).reduce((valuePart, part) => (valuePart << 16n) | part, 0n);
-  if (high === 0n || high === 1n) return true;
-  if ((high >> 32n) === 0xffffn) {
-    const mapped = Number(high & 0xffffffffn);
-    const mappedAddress = `${mapped >>> 24}.${(mapped >>> 16) & 255}.${(mapped >>> 8) & 255}.${mapped & 255}`;
-    return isPrivateIpv4(mappedAddress);
-  }
-  return (first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80 || (first & 0xff00) === 0xff00;
-}
-
-function isPrivateHostname(hostname) {
-  const host = String(hostname || "").toLowerCase().replace(/^\[|\]$/g, "");
-  if (!host) return false;
-  if (isPrivateAddress(host)) return true;
-  if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local")) {
-    return true;
-  }
-  // IPv6 loopback, link-local and unique-local ranges. This intentionally
-  // does not try to parse every IPv6 spelling; DNS lookup in testGenericProvider
-  // catches resolved private addresses before a request is sent.
-  return false;
-}
-
-function validateEndpoint(urlValue, allowPrivate) {
-  const baseUrl = normalizeBaseUrl(urlValue);
-  let parsed;
-  try {
-    parsed = new URL(baseUrl);
-  } catch {
-    throw new Error("baseUrl must be an absolute HTTP(S) URL.");
-  }
-  if (!["http:", "https:"].includes(parsed.protocol)) {
-    throw new Error("baseUrl must use http or https.");
-  }
-  if (!parsed.hostname || parsed.username || parsed.password) {
-    throw new Error("baseUrl must not contain credentials and must include a hostname.");
-  }
-  if (parsed.search || parsed.hash) {
-    throw new Error("baseUrl must not contain a query string or fragment.");
-  }
-  const privateHost = isPrivateHostname(parsed.hostname);
-  if (parsed.protocol === "http:" && (!allowPrivate || !privateHost)) {
-    throw new Error("Plain HTTP endpoints must be private and require allowPrivate=true.");
-  }
-  if (privateHost && !allowPrivate) {
-    throw new Error("Private or loopback endpoints require allowPrivate=true.");
-  }
-  return { baseUrl, privateHost };
-}
-
-function validateHeaders(raw) {
-  if (raw === undefined) return {};
-  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-    throw new Error("headers must be an object of static header values.");
-  }
-  const entries = Object.entries(raw);
-  if (entries.length > MAX_HEADERS) throw new Error(`headers may contain at most ${MAX_HEADERS} entries.`);
-  const headers = {};
-  for (const [nameValue, valueValue] of entries) {
-    const name = text(nameValue);
-    const lower = name.toLowerCase();
-    const value = typeof valueValue === "string" ? valueValue : "";
-    if (!HEADER_NAME_PATTERN.test(name)) throw new Error(`Invalid header name: ${nameValue}`);
-    if (FORBIDDEN_HEADER_NAMES.has(lower) || SECRET_HEADER_PATTERN.test(lower)) {
-      throw new Error(`Header ${name} is reserved for credential or transport handling.`);
-    }
-    if (!value || value.length > MAX_HEADER_VALUE_LENGTH || /[\r\n]/.test(value)) {
-      throw new Error(`Header ${name} has an invalid value.`);
-    }
-    headers[name] = value;
-  }
-  return headers;
-}
-
-function validateCredentialRef(value) {
-  if (value === undefined || value === null || value === "") return undefined;
-  const ref = text(value);
-  if (!/^cred_[a-zA-Z0-9][a-zA-Z0-9._:-]{2,127}$/.test(ref)) {
-    throw new Error("credentialRef must be an opaque id beginning with cred_.");
-  }
-  return ref;
-}
-
-function validateProvider(input, { existingId } = {}) {
-  if (!input || typeof input !== "object" || Array.isArray(input)) {
-    throw new Error("A generic provider must be an object.");
-  }
-  const id = normalizeGenericProviderId(input.id);
-  if (existingId !== undefined && id !== existingId) {
-    throw new Error("Provider id cannot be changed; remove and add a new provider instead.");
-  }
-  const displayName = text(input.displayName);
-  if (!displayName || displayName.length > 120) {
-    throw new Error("displayName must be a non-empty string of at most 120 characters.");
-  }
-  const adapter = text(input.adapter) || "openai-chat";
-  if (!GENERIC_PROVIDER_ADAPTERS.includes(adapter)) {
-    throw new Error(`adapter must be one of: ${GENERIC_PROVIDER_ADAPTERS.join(", ")}.`);
-  }
-  const allowPrivate = input.allowPrivate === undefined ? false : input.allowPrivate;
-  if (typeof allowPrivate !== "boolean") throw new Error("allowPrivate must be a boolean.");
-  const { baseUrl } = validateEndpoint(input.baseUrl, allowPrivate);
-  const headers = validateHeaders(input.headers);
-  const credentialRef = validateCredentialRef(input.credentialRef);
-  const description = input.description === undefined ? undefined : text(input.description);
-  if (description !== undefined && description.length > MAX_DESCRIPTION_LENGTH) {
-    throw new Error(`description must be at most ${MAX_DESCRIPTION_LENGTH} characters.`);
-  }
-  const enabled = input.enabled === undefined ? true : input.enabled;
-  if (typeof enabled !== "boolean") throw new Error("enabled must be a boolean.");
-  return {
-    id,
-    displayName,
-    ...(description ? { description } : {}),
-    baseUrl,
-    adapter,
-    headers,
-    ...(credentialRef ? { credentialRef } : {}),
-    allowPrivate,
-    enabled,
-  };
-}
-
-function parseDocument(payload) {
-  if (payload === undefined) return { version: GENERIC_PROVIDER_SCHEMA_VERSION, providers: [] };
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-    throw new Error(`Invalid generic provider state ${GENERIC_PROVIDERS_PATH}: expected an object.`);
-  }
-  if (payload.version !== GENERIC_PROVIDER_SCHEMA_VERSION || !Array.isArray(payload.providers)) {
-    throw new Error(
-      `Invalid generic provider state ${GENERIC_PROVIDERS_PATH}: version must be ${GENERIC_PROVIDER_SCHEMA_VERSION} and providers must be an array.`,
-    );
-  }
-  const providers = [];
-  const seen = new Set();
-  for (const entry of payload.providers) {
-    const provider = validateProvider(entry);
-    if (seen.has(provider.id)) throw new Error(`Duplicate generic provider id ${provider.id}.`);
-    seen.add(provider.id);
-    providers.push(provider);
-  }
-  return { version: GENERIC_PROVIDER_SCHEMA_VERSION, providers };
+function unavailable(message) {
+  const error = new Error(message);
+  error.status = 503;
+  return error;
 }
 
 export function readGenericProviders() {
-  if (!existsSync(GENERIC_PROVIDERS_PATH)) return [];
-  let payload;
-  try {
-    payload = JSON.parse(readFileSync(GENERIC_PROVIDERS_PATH, "utf8"));
-  } catch (error) {
-    throw new Error(`Could not read generic provider state: ${errorMessage(error)}`);
-  }
-  return parseDocument(payload).providers;
+  return readGenericProviderState({ reservedProviderIds: PROVIDERS });
 }
 
 export function redactGenericProvider(provider) {
-  const value = validateProvider(provider, { existingId: provider.id });
-  return {
-    ...value,
-    headers: Object.fromEntries(Object.keys(value.headers).map((name) => [name, "[redacted]"])),
-  };
+  return redactGenericProviderState(provider, { reservedProviderIds: PROVIDERS });
 }
 
 export function listGenericProviders({ redacted = true } = {}) {
@@ -309,14 +80,17 @@ function mutateProviders(mutator) {
     const current = readGenericProviders();
     const next = mutator(current.map((provider) => ({ ...provider, headers: { ...provider.headers } })));
     if (!Array.isArray(next)) throw new Error("Generic provider mutation returned an invalid list.");
-    const validated = parseDocument({ version: GENERIC_PROVIDER_SCHEMA_VERSION, providers: next }).providers;
+    const validated = parseGenericProviderDocument(
+      { version: GENERIC_PROVIDER_SCHEMA_VERSION, providers: next },
+      { reservedProviderIds: PROVIDERS },
+    ).providers;
     saveProviders(validated);
     return validated;
   });
 }
 
 export function addGenericProvider(input) {
-  const provider = validateProvider(input);
+  const provider = validateGenericProvider(input, { reservedProviderIds: PROVIDERS });
   const providers = mutateProviders((current) => {
     if (current.some((entry) => entry.id === provider.id)) {
       throw new Error(`Generic provider ${provider.id} already exists.`);
@@ -332,7 +106,10 @@ export function updateGenericProvider(id, patch) {
   mutateProviders((current) => {
     const existing = current.find((entry) => entry.id === providerId);
     if (!existing) throw new Error(`Unknown generic provider: ${id}`);
-    updated = validateProvider({ ...existing, ...patch, id: existing.id }, { existingId: existing.id });
+    updated = validateGenericProvider(
+      { ...existing, ...patch, id: existing.id },
+      { existingId: existing.id, reservedProviderIds: PROVIDERS },
+    );
     return current.map((entry) => entry.id === existing.id ? updated : entry);
   });
   return redactGenericProvider(updated);
@@ -354,30 +131,14 @@ export function setGenericProviderEnabled(id, enabled) {
   return updateGenericProvider(id, { enabled });
 }
 
-// This descriptor is intentionally not inserted into PROVIDERS yet. P05/P06
-// can map `adapter` to a wire protocol and merge it with discovered models,
-// while native GPT catalog ownership stays untouched in the meantime.
 export function genericProviderDescriptor(providerOrId) {
   const provider = typeof providerOrId === "string"
     ? getGenericProvider(providerOrId)
-    : validateProvider(providerOrId, { existingId: providerOrId.id });
-  return {
-    id: provider.id,
-    displayName: provider.displayName,
-    kind: "openai-compatible",
-    ownedBy: provider.id,
-    baseUrl: provider.baseUrl,
-    adapter: provider.adapter,
-    protocol: provider.adapter === "openai-responses" ? "openai-responses" : "openai",
-    // The descriptor is safe to hand to catalogs and UI surfaces. Raw static
-    // header values stay inside the request boundary and never become a model
-    // descriptor or loggable catalog field.
-    headers: Object.fromEntries(Object.keys(provider.headers).map((name) => [name, "[redacted]"])),
-    allowPrivate: provider.allowPrivate,
-    enabled: provider.enabled,
-    ...(provider.credentialRef ? { credentialRef: provider.credentialRef } : {}),
-    generic: true,
-  };
+    : validateGenericProvider(providerOrId, {
+        existingId: providerOrId.id,
+        reservedProviderIds: PROVIDERS,
+      });
+  return genericProviderRuntimeDescriptor(provider);
 }
 
 async function lookupHost(hostname) {
@@ -407,12 +168,12 @@ function destinationUrl(provider, requestPath) {
 }
 
 async function validateResolvedDestination(endpoint, provider, lookup = lookupHost) {
-  if (isPrivateHostname(endpoint.hostname) && !provider.allowPrivate) {
+  if (isPrivateGenericProviderHostname(endpoint.hostname) && !provider.allowPrivate) {
     throw new Error("Provider host is private or loopback; set allowPrivate=true explicitly.");
   }
   const resolved = await lookup(endpoint.hostname);
   if (!resolved.length) throw new Error(`Provider host ${endpoint.hostname} has no addresses.`);
-  if (!provider.allowPrivate && resolved.some(isPrivateAddress)) {
+  if (!provider.allowPrivate && resolved.some(isPrivateGenericProviderAddress)) {
     throw new Error("Provider host resolved to a private or link-local address; set allowPrivate=true explicitly.");
   }
   return resolved;
@@ -420,20 +181,9 @@ async function validateResolvedDestination(endpoint, provider, lookup = lookupHo
 
 function safeHeaderEntries(headers) {
   const values = headers instanceof Headers ? [...headers.entries()] : Object.entries(headers || {});
-  const result = {};
-  for (const [nameValue, valueValue] of values) {
-    const name = text(nameValue);
-    const lower = name.toLowerCase();
-    const value = String(valueValue ?? "");
-    if (FORBIDDEN_HEADER_NAMES.has(lower) || SECRET_HEADER_PATTERN.test(lower)) {
-      throw new Error(`Header ${name} is reserved for credential or transport handling.`);
-    }
-    if (!HEADER_NAME_PATTERN.test(name) || !value || value.length > MAX_HEADER_VALUE_LENGTH || /[\r\n]/.test(value)) {
-      throw new Error(`Header ${name} has an invalid value.`);
-    }
-    result[name] = value;
-  }
-  return result;
+  return validateGenericProviderHeaders(
+    Object.fromEntries(values.map(([name, value]) => [name, String(value ?? "")])),
+  );
 }
 
 function credentialSecret(provider) {
@@ -491,6 +241,7 @@ export function genericProviderDiscoverySnapshot(id) {
 }
 
 function requestSignal(signal, timeoutMs) {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return signal;
   const timeout = AbortSignal.timeout(timeoutMs);
   return signal ? AbortSignal.any([signal, timeout]) : timeout;
 }
@@ -499,7 +250,7 @@ function createDestinationDispatcher(endpoint, provider, timeoutMs) {
   const lookup = (hostname, options, callback) => {
     lookupHost(hostname)
       .then((addresses) => {
-        if (!provider.allowPrivate && addresses.some(isPrivateAddress)) {
+        if (!provider.allowPrivate && addresses.some(isPrivateGenericProviderAddress)) {
           throw new Error("Provider host resolved to a private or link-local address.");
         }
         if (options?.all) {
@@ -514,10 +265,25 @@ function createDestinationDispatcher(endpoint, provider, timeoutMs) {
   return new Agent({
     allowH2: false,
     pipelining: 1,
-    headersTimeout: timeoutMs,
-    bodyTimeout: timeoutMs,
+    // Discovery and `providers generic test` are bounded. A generation request
+    // passes zero and lives exactly as long as its caller: an arbitrary
+    // ten-second body timeout would cut off healthy streamed model output.
+    headersTimeout: Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 0,
+    bodyTimeout: Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 0,
     connect: { lookup },
   });
+}
+
+function mergeRequestHeaders(requestHeaders, staticHeaders) {
+  const result = { ...requestHeaders };
+  for (const [name, value] of Object.entries(staticHeaders)) {
+    const lower = name.toLowerCase();
+    for (const existing of Object.keys(result)) {
+      if (existing.toLowerCase() === lower) delete result[existing];
+    }
+    result[name] = value;
+  }
+  return result;
 }
 
 async function boundedResponseBody(response, maxBytes = MAX_RESPONSE_BYTES) {
@@ -559,14 +325,17 @@ export async function requestGenericProvider(
   { fetchImpl = undiciFetch, lookup = lookupHost, timeoutMs = 10_000, ...init } = {},
 ) {
   const provider = getGenericProvider(id);
-  if (!provider.enabled) throw new Error(`Generic provider ${provider.id} is disabled.`);
+  if (!provider.enabled) throw unavailable(`Generic provider ${provider.id} is disabled.`);
   const endpoint = destinationUrl(provider, requestPath);
   await validateResolvedDestination(endpoint, provider, lookup);
   const requestHeaders = safeHeaderEntries(init.headers);
-  const headers = { ...provider.headers, ...requestHeaders };
+  // Static provider headers are operator-owned routing metadata. A caller can
+  // add ordinary content-negotiation headers, but cannot replace tenant or
+  // gateway selection chosen in the protected provider descriptor.
+  const headers = mergeRequestHeaders(requestHeaders, provider.headers);
   const secret = credentialSecret(provider);
   if (provider.credentialRef && !secret) {
-    throw new Error(`Credential ${provider.credentialRef} is unavailable for generic provider ${provider.id}.`);
+    throw unavailable(`The bound credential is unavailable for generic provider ${provider.id}.`);
   }
   if (secret) headers.Authorization = `Bearer ${secret}`;
   const useDispatcher = fetchImpl === undiciFetch;
@@ -635,7 +404,8 @@ function cliUsage() {
     "Usage: providers generic list [--json] | add ID --name NAME --base-url URL " +
       "[--adapter openai-chat|openai-responses|openai-completions] [--header Name=Value] " +
       "[--credential-ref cred_ID] [--description TEXT] [--allow-private] | edit ID [options] | show ID [--json] | " +
-      "enable ID | disable ID | remove ID | test ID [--json]",
+      "enable ID | disable ID | remove ID | test ID [--json]. Descriptor mutations also accept --no-apply only while no curated routes exist. " +
+      "Use `providers generic credential ID status|set|remove` to manage its protected key.",
   );
 }
 

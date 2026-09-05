@@ -99,7 +99,7 @@ function probe(target, providers, usageEvents = [], options = {}) {
     const ownershipId = "00000000000000000000000000000000";
     writeFileSync(
       path.join(stateDir, "config.toml"),
-      `model = ${JSON.stringify(options.selectedModel || "deepseek/deepseek-v4-pro")}\nmodel_provider = ${JSON.stringify(loginFreeProvider)}\n\n# codex-router-signed-provider-tree-slot ${ownershipId} 0\n# BEGIN codex-router-signed-provider-managed\n[model_providers.${loginFreeProvider}]\nname = "Codex Router (external models)"\nbase_url = "http://127.0.0.1:4202/v1"\nwire_api = "responses"\nrequires_openai_auth = false\nsupports_standalone_web_search = true\nsupports_websockets = false\n# END codex-router-signed-provider-managed\n`,
+      `model = ${JSON.stringify(options.selectedModel || "deepseek/deepseek-v4-pro")}\nmodel_provider = ${JSON.stringify(loginFreeProvider)}\n\n# codex-router-signed-provider-tree-slot ${ownershipId} 0\n# BEGIN codex-router-signed-provider-managed\n[model_providers.${loginFreeProvider}]\nname = "Codex Router (external models)"\nbase_url = "http://127.0.0.1:4202/v1"\nwire_api = "responses"\nrequires_openai_auth = false\nsupports_standalone_web_search = true\nsupports_websockets = false\n[model_providers.${loginFreeProvider}.auth]\ncommand = ${JSON.stringify(process.execPath)}\nargs = [${JSON.stringify(path.join(root, "src", "caller-key-auth-command.mjs"))}, ${JSON.stringify(path.join(stateDir, "caller-secret"))}]\ntimeout_ms = 5000\nrefresh_interval_ms = 0\n# END codex-router-signed-provider-managed\n`,
       { mode: 0o600 },
     );
     writePrivateJson(
@@ -607,6 +607,17 @@ test("set-apply keeps provider mutation, publication, and rollback in one transa
   assert.match(atomic, /applyProviderSelectionForTargets\(TARGETS, \{ activate \}\)/);
   assert.match(atomic, /const activate = args\.includes\("--activate"\)/);
   assert.match(source, /args\[0\] === "set-apply"[\s\S]{0,260}runSetApply\(args\[1\], args\[2\]\)/);
+});
+
+test("OpenClaw client setup uses the shared transactional enable path", () => {
+  const source = readFileSync(path.join(root, "src", "control.mjs"), "utf8");
+  const setup = source.match(
+    /async function handleClientSetup[\s\S]*?\r?\n}\r?\n\r?\nasync function handleClientExport/,
+  )?.[0];
+  assert.ok(setup, "client setup helper should be readable");
+  assert.match(setup, /"openclaw"/);
+  assert.match(setup, /currentCheckoutInstaller\(process\.platform, target, \{ posixScript: "enable" \}\)/);
+  assert.doesNotMatch(setup, /setupOpenClaw/);
 });
 
 test("login-free control selects a ready external model and restores Codex defaults", () => {

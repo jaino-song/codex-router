@@ -499,6 +499,11 @@ h2 {
   transition: opacity 130ms ease, r 130ms ease;
 }
 
+.chart-point.router-fallback {
+  stroke: var(--amber);
+  stroke-dasharray: 2 2;
+}
+
 .chart-hit {
   fill: transparent;
   cursor: crosshair;
@@ -512,6 +517,11 @@ h2 {
 .chart-point.is-active {
   opacity: 1;
   r: 4.5;
+}
+
+.chart-point.router-fallback {
+  stroke: var(--amber);
+  stroke-dasharray: 2 2;
 }
 
 .chart-tooltip {
@@ -551,6 +561,13 @@ h2 {
   color: #687486;
   font-size: 8px;
   text-align: center;
+}
+
+.usage-source-note {
+  margin: 7px 2px 0;
+  color: var(--amber);
+  font-size: 8.5px;
+  line-height: 1.35;
 }
 
 .section-heading {

@@ -211,6 +211,11 @@ function controlCenterSources(root) {
     path.join(base, "package.json"),
     path.join(base, "package-lock.json"),
     path.join(base, "electron-builder.yml"),
+    path.join(root, "src", "spawnable-command.mjs"),
+    path.join(root, "src", "chatgpt-login-lease.mjs"),
+    path.join(root, "src", "file-security.mjs"),
+    path.join(root, "src", "path-security.mjs"),
+    path.join(root, "src", "process-identity.mjs"),
     path.join(base, "index.html"),
     path.join(base, "main.mjs"),
     path.join(base, "vite.config.ts"),
@@ -245,16 +250,28 @@ const TRAY_PLATFORMS = {
   darwin: {
     sources: (root) => {
       const base = path.join(root, "apps", "macos", "ModelRouterTray");
+      const widget = path.join(root, "apps", "macos", "RouterUsageWidget");
       return [
         path.join(root, "scripts", "build-macos-tray-app.sh"),
+        path.join(root, "scripts", "build-macos-widget.sh"),
+        path.join(root, "src", "macos-developer-tools.mjs"),
         path.join(base, "Package.swift"),
         path.join(base, "Resources", "Info.plist"),
+        path.join(base, "Resources", "ModelRouterTray.entitlements"),
         path.join(base, "Resources", "AppIcon.icns"),
         ...sourceFilesIn(path.join(base, "Sources"), [".swift"]),
         // SwiftPM copies this tree recursively into the resource bundle. Every
         // file is a build input regardless of extension, including future icon
         // formats that are not known to this installer yet.
         ...sourceTreeFiles(path.join(base, "Sources", "Resources"), []),
+        ...sourceTreeFiles(widget, [
+          ".swift",
+          ".plist",
+          ".entitlements",
+          ".pbxproj",
+          ".xcscheme",
+          ".yml",
+        ]),
         ...controlCenterSources(root),
       ];
     },
@@ -270,6 +287,15 @@ const TRAY_PLATFORMS = {
       );
       return [
         path.join(bundle, "Contents", "MacOS", "ModelRouterTray"),
+        path.join(
+          bundle,
+          "Contents",
+          "PlugIns",
+          "RouterUsageWidget.appex",
+          "Contents",
+          "MacOS",
+          "RouterUsageWidget",
+        ),
         path.join(embedded, "MacOS", "Codex Router"),
         path.join(embedded, "Resources", "app.asar"),
       ];

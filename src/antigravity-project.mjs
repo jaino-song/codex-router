@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { randomUUID } from "node:crypto";
 
 import {
   ANTIGRAVITY_ENDPOINT,
@@ -6,7 +6,10 @@ import {
   antigravityBootstrapHeaders,
   antigravityLoadCodeAssistMetadata,
 } from "./antigravity-oauth-constants.mjs";
-import { updateAntigravityToken } from "./antigravity-oauth-session.mjs";
+import {
+  assertAntigravitySessionCurrent,
+  updateAntigravityToken,
+} from "./antigravity-oauth-session.mjs";
 
 const PROJECT_CACHE_TTL_MS = 30 * 60_000;
 const projectCache = new Map();
@@ -47,6 +50,49 @@ function projectUnavailable(message, { code = "project_required", status = 502 }
   return error;
 }
 
+// Google answers a disabled private API with a structured reason that names
+// the service. Discarding the body reduced that to `HTTP 403`, which reads as
+// a credential problem and sends the operator back through sign-in that is
+// already working (issue #566).
+//
+// Only the structured fields are read. The free-text `message` embeds the
+// caller's project number and a console URL built from it, and an error string
+// the router prints and logs is the wrong place for either.
+const PRIVATE_BOOTSTRAP_SERVICE = "cloudcode-pa.googleapis.com";
+const MAX_ERROR_BODY_BYTES = 16 * 1024;
+
+export function antigravityBootstrapFailure(status, bodyText) {
+  const base = `HTTP ${status}`;
+  if (typeof bodyText !== "string" || bodyText.length === 0) return base;
+  let parsed;
+  try {
+    parsed = JSON.parse(bodyText.slice(0, MAX_ERROR_BODY_BYTES));
+  } catch {
+    return base;
+  }
+  const error = parsed?.error;
+  if (!error || typeof error !== "object") return base;
+  const details = Array.isArray(error.details) ? error.details : [];
+  const disabled = details.find((detail) => detail?.reason === "SERVICE_DISABLED");
+  const service = String(disabled?.metadata?.service || "");
+  if (disabled && service === PRIVATE_BOOTSTRAP_SERVICE) {
+    // Binding this service is gated by a producer-side permission
+    // (`servicemanagement.services.bind`), so no IAM role an operator can
+    // grant themselves enables it. Saying "enable the API" here would send
+    // them to a console page that does not exist for a private API.
+    return (
+      `${base}: the OAuth client's Google Cloud project is not allowlisted for ` +
+      `${service}, which is a private Google API that an ordinary project cannot ` +
+      "enable. Antigravity sign-in succeeded; only the project behind the " +
+      "operator-owned OAuth client is unauthorized"
+    );
+  }
+  const status_ = typeof error.status === "string" ? error.status : undefined;
+  const reason = typeof disabled?.reason === "string" ? disabled.reason : undefined;
+  const detail = [status_, reason, service].filter(Boolean).join(", ");
+  return detail ? `${base} (${detail})` : base;
+}
+
 function projectIdFrom(payload) {
   const project = payload?.cloudaicompanionProject;
   if (typeof project === "string" && project) return project;
@@ -61,15 +107,17 @@ function tierIdFrom(payload) {
 }
 
 function defaultTierId(allowedTiers) {
-  if (!Array.isArray(allowedTiers)) return "free-tier";
+  if (!Array.isArray(allowedTiers)) return undefined;
   const selected = allowedTiers.find(
     (tier) => tier?.isDefault && typeof tier.id === "string" && tier.id,
   ) || allowedTiers.find((tier) => typeof tier?.id === "string" && tier.id);
-  return selected?.id || "free-tier";
+  return selected?.id;
 }
 
-function projectCacheKey(refreshToken) {
-  return createHash("sha256").update(refreshToken).digest("hex");
+function projectCacheKey(sessionGeneration) {
+  // session_generation is already a validated router-created UUID. It is an
+  // in-memory cache namespace, not a credential and not persisted or exposed.
+  return sessionGeneration;
 }
 
 function projectGeneration(key) {
@@ -86,43 +134,115 @@ function generationIsCurrent(key, generation) {
   );
 }
 
-export function invalidateAntigravityProjectCache(refreshToken) {
-  if (!refreshToken) {
+function projectContextChangedError(message =
+  "The Antigravity project context changed while discovery was running; retry it.") {
+  const error = new Error(message);
+  error.code = "project_context_changed";
+  error.status = 409;
+  return error;
+}
+
+export function assertAntigravityProjectRevisionCurrent(session) {
+  const latest = assertAntigravitySessionCurrent(session);
+  if (
+    typeof session?.project_revision !== "string" ||
+    latest.project_revision !== session.project_revision
+  ) {
+    throw projectContextChangedError();
+  }
+  return latest;
+}
+
+export async function claimAntigravityProjectRevision(session) {
+  const current = assertAntigravityProjectRevisionCurrent(session);
+  const claimedRevision = randomUUID();
+  const saved = await updateAntigravityToken((latest) => {
+    if (
+      latest.session_generation !== current.session_generation ||
+      latest.project_revision !== current.project_revision
+    ) return undefined;
+    return { ...latest, project_revision: claimedRevision };
+  });
+  if (
+    saved.session_generation !== current.session_generation ||
+    saved.project_revision !== claimedRevision
+  ) {
+    throw projectContextChangedError(
+      "Another Antigravity project discovery superseded this one before it began.",
+    );
+  }
+  return saved;
+}
+
+export function invalidateAntigravityProjectCache(sessionGeneration) {
+  if (!sessionGeneration) {
     projectCacheGeneration += 1;
     projectKeyGenerations.clear();
     projectCache.clear();
     projectPending.clear();
-    return;
+    return undefined;
   }
-  const key = projectCacheKey(refreshToken);
+  const key = projectCacheKey(sessionGeneration);
   projectKeyGenerations.set(key, (projectKeyGenerations.get(key) || 0) + 1);
   projectCache.delete(key);
   projectPending.delete(key);
+  const revision = randomUUID();
+  return updateAntigravityToken((latest) => {
+    if (latest.session_generation !== sessionGeneration) return undefined;
+    return { ...latest, project_revision: revision };
+  }).then((saved) => {
+    if (
+      saved.session_generation !== sessionGeneration ||
+      saved.project_revision !== revision
+    ) {
+      const error = new Error(
+        "The Antigravity OAuth session changed while its project context was invalidated; retry it.",
+      );
+      error.code = "oauth_session_changed";
+      error.status = 409;
+      throw error;
+    }
+    return saved;
+  });
 }
 
 export async function loadAntigravityProject(
   accessToken,
-  { fetchImpl = fetch, timeoutMs = 15_000, signal } = {},
+  { fetchImpl = fetch, timeoutMs = 15_000, signal, assertCurrent = () => {} } = {},
 ) {
   const headers = antigravityBootstrapHeaders(accessToken);
   const body = JSON.stringify({ metadata: antigravityLoadCodeAssistMetadata() });
+  const failures = [];
   for (const base of [...new Set([ANTIGRAVITY_ENDPOINT, ANTIGRAVITY_PROD_ENDPOINT])]) {
     try {
+      assertCurrent();
       const response = await fetchImpl(`${base}/v1internal:loadCodeAssist`, {
         method: "POST",
         headers,
         body,
         signal: combinedSignal(signal, timeoutMs),
       });
-      if (!response.ok) continue;
-      const payload = await response.json();
-      if (payload && typeof payload === "object") return payload;
-    } catch {
+      if (!response.ok) {
+        // The body carries the only actionable part of this failure; a bare
+        // status cannot distinguish "your project is not allowlisted" from
+        // "your credential is bad".
+        const bodyText = await response.text().catch(() => "");
+        failures.push(antigravityBootstrapFailure(response.status, bodyText));
+        continue;
+      }
+      const payload = await response.json().catch(() => undefined);
+      if (payload && typeof payload === "object" && !Array.isArray(payload)) return payload;
+      failures.push("malformed success response");
+    } catch (error) {
       if (signal?.aborted) throw signal.reason || new Error("aborted");
-      // Daily and production discovery are independent rollout surfaces.
+      if (["oauth_session_changed", "project_context_changed"].includes(error?.code)) throw error;
+      failures.push(error instanceof Error ? error.message : "network error");
     }
   }
-  return null;
+  throw projectUnavailable(
+    `Antigravity project bootstrap failed (${failures.join("; ") || "no usable response"}).`,
+    { code: "project_bootstrap_failed", status: 502 },
+  );
 }
 
 export async function onboardAntigravityProject(
@@ -135,12 +255,14 @@ export async function onboardAntigravityProject(
     delayImpl = abortableDelay,
     timeoutMs = 15_000,
     signal,
+    assertCurrent = () => {},
   } = {},
 ) {
   const body = JSON.stringify({ tierId });
   for (const base of [...new Set([ANTIGRAVITY_PROD_ENDPOINT, ANTIGRAVITY_ENDPOINT])]) {
     for (let attempt = 0; attempt < attempts; attempt += 1) {
       try {
+        assertCurrent();
         const response = await fetchImpl(`${base}/v1internal:onboardUser`, {
           method: "POST",
           headers: antigravityBootstrapHeaders(accessToken),
@@ -151,8 +273,9 @@ export async function onboardAntigravityProject(
         const payload = await response.json().catch(() => ({}));
         const projectId = projectIdFrom(payload?.response);
         if (payload?.done && projectId) return projectId;
-      } catch {
+      } catch (error) {
         if (signal?.aborted) throw signal.reason || new Error("aborted");
+        if (["oauth_session_changed", "project_context_changed"].includes(error?.code)) throw error;
         break;
       }
       if (attempt < attempts - 1) {
@@ -174,9 +297,15 @@ export async function discoverAntigravityProject(
     timeoutMs = 15_000,
     signal,
     allowOnboard = false,
+    assertCurrent = () => {},
   } = {},
 ) {
-  const payload = await loadAntigravityProject(accessToken, { fetchImpl, timeoutMs, signal });
+  const payload = await loadAntigravityProject(accessToken, {
+    fetchImpl,
+    timeoutMs,
+    signal,
+    assertCurrent,
+  });
   const capturedTierId = tierIdFrom(payload);
   const managedProjectId = projectIdFrom(payload);
   if (managedProjectId) {
@@ -189,20 +318,26 @@ export async function discoverAntigravityProject(
   }
 
   // Provisioning creates a Google Cloud project under the signed-in account,
-  // so it is a sign-in-time action gated by explicit consent. The request path
-  // never provisions implicitly; if no managed project is discoverable there,
-  // fail with a clear message rather than routing through a foreign project.
+  // so only the explicit live probe may opt into it. Sign-in and the request
+  // path never provision implicitly; if no managed project is discoverable,
+  // fail rather than route through a foreign project.
   if (!allowOnboard) {
     throw projectUnavailable(
-      "Antigravity could not discover a Google Cloud project. Check Google connectivity and try again; sign-in can provision a project when none exists.",
+      "Antigravity could not discover a Google Cloud project. Retry the explicit live probe with --provision-project only if you authorize creating one.",
     );
   }
 
   const selectedTierId = defaultTierId(payload?.allowedTiers);
+  if (!selectedTierId) {
+    throw projectUnavailable(
+      "Antigravity did not explicitly advertise an allowed provisioning tier; no project was created.",
+      { code: "project_provisioning_not_advertised", status: 409 },
+    );
+  }
   const provisionedProjectId = await onboardAntigravityProject(
     accessToken,
     selectedTierId,
-    { fetchImpl, attempts, retryDelayMs, delayImpl, timeoutMs, signal },
+    { fetchImpl, attempts, retryDelayMs, delayImpl, timeoutMs, signal, assertCurrent },
   );
   if (provisionedProjectId) {
     return {
@@ -213,15 +348,10 @@ export async function discoverAntigravityProject(
     };
   }
   throw projectUnavailable(
-    "Antigravity could not provision a Google Cloud project during sign-in.",
+    "Antigravity could not provision a Google Cloud project during the explicit live probe.",
   );
 }
 
-// Compatibility wrapper used from the explicit sign-in flow, where provisioning
-// a Google Cloud project is an explicitly consented action.
-export async function resolveAntigravityProject(accessToken, options = {}) {
-  return (await discoverAntigravityProject(accessToken, { allowOnboard: true, ...options })).projectId;
-}
 
 function alreadyResolved(session, nowMs) {
   if (session.project_id && session.project_source !== "fallback") {
@@ -249,11 +379,17 @@ function alreadyResolved(session, nowMs) {
   return undefined;
 }
 
-async function persistProjectContext(session, context) {
+async function persistProjectContext(session, context, expectedProjectRevision) {
+  assertAntigravitySessionCurrent(session);
+  const committedRevision = randomUUID();
   const saved = await updateAntigravityToken((latest) => {
-    if (latest.refresh_token !== session.refresh_token) return undefined;
+    if (
+      latest.session_generation !== session.session_generation ||
+      latest.project_revision !== expectedProjectRevision
+    ) return undefined;
     return {
       ...latest,
+      project_revision: committedRevision,
       // A fallback records that discovery produced nothing usable. Writing its
       // placeholder id would make the next `alreadyResolved` treat it as a
       // managed project and route through it.
@@ -263,6 +399,19 @@ async function persistProjectContext(session, context) {
       tier_id: context.tierId,
     };
   });
+  if (
+    saved.session_generation !== session.session_generation ||
+    saved.project_revision !== committedRevision
+  ) {
+    const error = new Error(
+      "The Antigravity project context was invalidated during discovery; retry it.",
+    );
+    error.code = saved.session_generation !== session.session_generation
+      ? "oauth_session_changed"
+      : "project_context_changed";
+    error.status = 409;
+    throw error;
+  }
   return saved;
 }
 
@@ -280,81 +429,41 @@ export async function ensureAntigravityProject(
     forceFallbackRefresh = false,
   } = {},
 ) {
+  let currentSession = assertAntigravitySessionCurrent(session);
   const nowMs = now();
   // An explicit retry is the one caller allowed past the fallback TTL: it has
   // already failed a turn and is asking for a fresh answer, not a cached
   // absence.
-  const refreshFallback = forceFallbackRefresh && session.project_source === "fallback";
-  if (refreshFallback) invalidateAntigravityProjectCache(session.refresh_token);
-  const resolved = refreshFallback ? undefined : alreadyResolved(session, nowMs);
-  if (resolved) return { session, ...resolved };
+  const refreshFallback = forceFallbackRefresh && currentSession.project_source === "fallback";
+  if (refreshFallback) {
+    currentSession = await invalidateAntigravityProjectCache(currentSession.session_generation);
+  }
+  const resolved = refreshFallback ? undefined : alreadyResolved(currentSession, nowMs);
+  if (resolved) {
+    const latest = assertAntigravityProjectRevisionCurrent(currentSession);
+    return { session: latest, ...resolved };
+  }
 
-  const refreshToken = session.refresh_token;
-  const key = projectCacheKey(refreshToken);
+  const sessionGeneration = currentSession.session_generation;
+  const key = projectCacheKey(sessionGeneration);
   const cached = projectCache.get(key);
   if (cached && nowMs - cached.cachedAt < PROJECT_CACHE_TTL_MS) {
-    const saved = await persistProjectContext(session, cached.context);
-    if (saved.refresh_token !== refreshToken) {
-      return ensureAntigravityProject(saved, {
-        fetchImpl,
-        now,
-        attempts,
-        retryDelayMs,
-        delayImpl,
-        timeoutMs,
-        signal,
-        allowOnboard,
-        forceFallbackRefresh,
-      });
-    }
-    return { session: saved, ...cached.context };
+    const latest = assertAntigravityProjectRevisionCurrent(cached.session);
+    return { session: latest, ...cached.context };
   }
   if (cached) projectCache.delete(key);
 
   const pending = projectPending.get(key);
   if (pending) {
-    const context = await pending;
-    const saved = await persistProjectContext(session, context);
-    if (saved.refresh_token !== refreshToken) {
-      return ensureAntigravityProject(saved, {
-        fetchImpl,
-        now,
-        attempts,
-        retryDelayMs,
-        delayImpl,
-        timeoutMs,
-        signal,
-        allowOnboard,
-        forceFallbackRefresh,
-      });
-    }
-    return { session: saved, ...context };
+    const result = await pending;
+    const latest = assertAntigravityProjectRevisionCurrent(result.session);
+    return { session: latest, ...result.context };
   }
 
   const generation = projectGeneration(key);
-  const promise = discoverAntigravityProject(session.access_token, {
-    fetchImpl,
-    now,
-    attempts,
-    retryDelayMs,
-    delayImpl,
-    timeoutMs,
-    signal,
-    allowOnboard,
-  }).then((context) => {
-    if (generationIsCurrent(key, generation)) {
-      projectCache.set(key, { context, cachedAt: now() });
-    }
-    return context;
-  }).finally(() => {
-    if (projectPending.get(key) === promise) projectPending.delete(key);
-  });
-  projectPending.set(key, promise);
-
-  const context = await promise;
-  const saved = await persistProjectContext(session, context);
-  if (saved.refresh_token !== refreshToken) {
-    return ensureAntigravityProject(saved, {
+  const promise = (async () => {
+    const claimedSession = await claimAntigravityProjectRevision(currentSession);
+    const context = await discoverAntigravityProject(claimedSession.access_token, {
       fetchImpl,
       now,
       attempts,
@@ -363,8 +472,24 @@ export async function ensureAntigravityProject(
       timeoutMs,
       signal,
       allowOnboard,
-      forceFallbackRefresh,
+      assertCurrent: () => assertAntigravityProjectRevisionCurrent(claimedSession),
     });
-  }
-  return { session: saved, ...context };
+    assertAntigravityProjectRevisionCurrent(claimedSession);
+    const saved = await persistProjectContext(
+      claimedSession,
+      context,
+      claimedSession.project_revision,
+    );
+    if (generationIsCurrent(key, generation)) {
+      projectCache.set(key, { context, session: saved, cachedAt: now() });
+    }
+    return { context, session: saved };
+  })().finally(() => {
+    if (projectPending.get(key) === promise) projectPending.delete(key);
+  });
+  projectPending.set(key, promise);
+
+  const result = await promise;
+  const latest = assertAntigravityProjectRevisionCurrent(result.session);
+  return { session: latest, ...result.context };
 }

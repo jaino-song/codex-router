@@ -23,8 +23,10 @@ import {
   DSH_SETTINGS_PATH,
   CALLER_SECRET_PATH,
   PORTS,
+  LEGACY_PORTS,
 } from "./paths.mjs";
 import { protectPrivateFile } from "./file-security.mjs";
+import { refreshDshCallerCapabilityDocuments } from "./caller-key-client-refresh.mjs";
 import {
   DSH_CREDENTIAL_REF,
   DSH_ROUTE_ID,
@@ -496,6 +498,14 @@ export function subagentPreset() {
   };
 }
 
+export function refreshCallerCapability() {
+  assertStateOwnership("refresh the DeepSeek Harness caller capability");
+  const refreshed = refreshDshCallerCapabilityDocuments({ settings: readDocument(DSH_SETTINGS_PATH), credentials: readDocument(DSH_CREDENTIALS_PATH), baseUrl: callerBase(), secret: routerCallerKey(), port: PORTS.router, legacyPort: LEGACY_PORTS.router });
+  writeDocument(DSH_CREDENTIALS_PATH, refreshed.credentials);
+  writeDocument(DSH_SETTINGS_PATH, refreshed.settings);
+  return { refreshed: true, settings: DSH_SETTINGS_PATH, credentials: DSH_CREDENTIALS_PATH };
+}
+
 export function status() {
   const settings = readDocument(DSH_SETTINGS_PATH);
   let route;
@@ -549,6 +559,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   const command = process.argv[2] || "status";
   const handlers = {
     status: () => status(),
+    "caller-capability-refresh": () => refreshCallerCapability(),
     install: () => install({ setDefaultModel: process.argv.includes("--set-default-model") }),
     uninstall: () => uninstall(),
     "subagent-preset": () => subagentPreset(),

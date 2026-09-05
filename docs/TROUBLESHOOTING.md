@@ -21,6 +21,20 @@ If a recognized older Kimi router is reported:
 
 Neither command prints credential values. Repair refuses unknown router owners.
 
+## New native models (GPT-6 Astra, GPT-7, etc.)
+
+**Uninstall is never required** to see new OpenAI/Codex native models. The router watches both `~/.codex/models_cache.json` and a lightweight fingerprint of the resolved Codex executable, then republishes when either source changes. This also catches Desktop primary-runtime replacements that keep the same `codex --version` string. Drift is checked on startup and periodically while the router stays running.
+
+**Codex full quit/reopen is still required** to reload the catalog file. Codex reads `model_catalog_json` once at startup; the router cannot make Codex hot-reload.
+
+Expected flow:
+1. OpenAI releases new native (e.g., GPT-7)
+2. Codex updates `models_cache.json` or replaces its bundled/runtime executable
+3. Router detects drift on startup or a periodic check → republishes automatically
+4. Fully quit and reopen Codex → new native appears in picker
+
+No uninstall needed. The router stays installed while merging ALL natives + routed models.
+
 ## State directory belongs to another checkout
 
 If `doctor` reports a state ownership failure, you are running from a clone
@@ -138,6 +152,27 @@ official CLI build that Windows allows, use the API-key provider instead:
 An OAuth session created while the executable was allowed is not a durable
 workaround. The router invokes the official CLI again near token expiry, so the
 session eventually stops refreshing if Windows blocks the executable later.
+
+## Windows reports that process containment is unavailable
+
+Commands that can mutate router state run inside a kill-on-close Windows Job
+Object. The owner is compiled in-memory by Windows PowerShell before the target
+command starts. If the error names `ConstrainedLanguage`, `Add-Type`, AppLocker,
+or WDAC, the local application-control policy does not permit that safety
+boundary. The router fails before launching the mutation; `-ExecutionPolicy
+Bypass` does not and must not override system application control.
+
+Check the effective language mode without exposing credentials:
+
+```powershell
+powershell.exe -NoLogo -NoProfile -NonInteractive -Command '$ExecutionContext.SessionState.LanguageMode'
+```
+
+`FullLanguage` is required. Keep the policy enabled and ask the machine
+administrator to allow the reviewed checkout/helper through the organization's
+normal trusted-script policy, or run the router on a supported host where the
+boundary is permitted. Do not work around the failure by disabling AppLocker,
+WDAC, or antivirus protection.
 
 ## An API key is missing or invalid
 
@@ -308,7 +343,16 @@ emits a status sentence, and never calls a tool. On turns following a user
 message, attempt 1 still streams live; when the client offered tools and the
 short-text/token trigger fires, the forwarder retries once and appends a
 retry tool call onto the same stream. On turns following a tool result, the
-stricter certified-repair path below stages the response before sending it.
+stricter certified-repair path opens the response as soon as xAI returns its
+headers and relays reasoning, but stages the short visible answer until the
+terminal event proves it is safe.
+After a conversation has exhibited that shape once, later user-message turns
+buffer only a short visible prefix up to the same text threshold. Headers and
+preceding reasoning remain live, and a tool call or longer answer releases the
+prefix; if the upstream stream aborts instead, Codex receives the terminal
+stream error without first recording another partial progress sentence. Unaffected
+conversation IDs retain the fully live path, and the evidence set is bounded
+in memory.
 
 The trigger is a shape, not a diagnosis, and it is worth knowing which turns
 pay for it. After a tool result, every no-tool prose response is held and
@@ -328,7 +372,13 @@ Both attempts are billed. The usage returned to Codex reports only the
 selected attempt's context size, while the local ledger retains the aggregate
 as billed input/output tokens. The response sets
 `progress_only_retried: true`, and the log line `progress-only-retried=true`
-is never gated on `MODEL_ROUTER_QUIET`. To disable the invariant and see the
+is never gated on `MODEL_ROUTER_QUIET`. That line includes `attempt_*` and
+`repair_*` header, first-event, and total durations plus each request's
+`x-grok-req-id`. A failure while reading either stream emits
+`upstream-phase-failed=true` with the same safe fields. `headers_ms` shows how
+long xAI took to accept the request; `first_event_ms` separates an upstream
+that emitted nothing from output the forwarder deliberately withheld. Prompt
+and response content are never logged. To disable the invariant and see the
 raw first attempt, set `CODEX_ROUTER_GROK_PROGRESS_ONLY_RETRY=0`; this kill
 switch is intentionally unsafe for unattended tool loops.
 
@@ -466,23 +516,27 @@ Legacy migration rollback is separate:
 
 The generated mode-`600` JSON includes versions, doctor checks, service state,
 provider presence, config ownership, and file metadata. It excludes credential
-values, prompts, responses, and log contents.
+values, prompts, responses, and log contents on every invocation. The legacy
+`--include-logs` option remains accepted for script compatibility, but is a
+deprecated no-op: an old log may contain a credential that was later rotated
+or deleted, so discovering only current values cannot prove a historical tail
+safe. The tool never uploads a bundle automatically.
 
-Only when log context is necessary:
+## Responses WebSocket does not connect
 
-```sh
-./bin/support-bundle --include-logs
-```
+Current Codex Router releases accept the Responses WebSocket v2 upgrade on the
+managed caller-capability URL. A 401 means Codex is using a stale managed URL;
+run `./bin/doctor --fix`, then fully quit and reopen Codex. A 426 carrying the
+supported `OpenAI-Beta: responses_websockets=2026-02-06` hint means Codex will
+fall back to HTTP because the attempted WebSocket contract did not match. The
+WebSocket adapter re-enters the ordinary HTTP Responses route, so provider and
+model failures are reported as normal Responses error events rather than by a
+separate provider path.
 
-The log tail is mechanically redacted but may still contain private prompt or
-response text. Inspect it before uploading or attaching it anywhere. The tool
-never uploads a bundle automatically.
-
-## WebSocket warning followed by HTTP fallback
-
-This is expected. Codex Router declines the optional Responses WebSocket
-upgrade, and current Codex falls back to compressed HTTP. A warning alone is not
-a failed model request.
+`X-Reasoning-Included` is a WebSocket-upgrade response flag in Codex. The
+adapter cannot truthfully add a value learned from its later internal HTTP
+response to an already-completed upgrade, so that one accounting hint is not
+projected as a per-request WebSocket event.
 
 ## Voice Mode reports an unsupported `/v1/live` route
 

@@ -58,7 +58,7 @@ catalog, router, gateway generator, API forwarder, and doctor.
 `enabled-providers.json` is a separate local policy owned by the router plane.
 It controls routed picker visibility and dispatcher access. `model-picker.json`
 stores the durable per-model decision, including explicit show choices, and the
-Codex, DeepSeek Harness, and Gemini publishers all consume that same state for
+Codex, DeepSeek Harness, Gemini, and Cursor publishers all consume that same state for
 external models. In a signed-in Codex install, the native GPT catalog and its
 base-entry visibility remain Codex-owned, so a router "hide all" action cannot
 erase the original native picker. A known namespaced model whose provider is hidden receives a local
@@ -95,6 +95,8 @@ map, which restores native GPT routing.
 | Grok 4.5 | `grok-api/grok-4.5` | `grok-api-grok-4-5` | `grok-4.5` |
 | Claude Opus 4.8 | `anthropic-api/claude-opus-4.8` | `anthropic-api-claude-opus-4-8` | `claude-opus-4-8` |
 | GLM-5.2 Ollama Cloud | `ollama-cloud/glm-5.2` | `ollama-cloud-glm-5-2` | `glm-5.2` |
+| GLM-5.3 Ollama Cloud | `ollama-cloud/glm-5.3` | `ollama-cloud-glm-5-3` | `glm-5.3:cloud` |
+| GLM-5.3-Flash Ollama Cloud | `ollama-cloud/glm-5.3-flash` | `ollama-cloud-glm-5-3-flash` | `glm-5.3-flash:cloud` |
 | Kimi K2.7 Code Ollama Cloud | `ollama-cloud/kimi-k2.7-code` | `ollama-cloud-kimi-k2-7-code` | `kimi-k2.7-code` |
 | MiniMax M3 Ollama Cloud | `ollama-cloud/minimax-m3` | `ollama-cloud-minimax-m3` | `minimax-m3` |
 | DeepSeek V4 Pro Ollama Cloud | `ollama-cloud/deepseek-v4-pro` | `ollama-cloud-deepseek-v4-pro` | `deepseek-v4-pro` |
@@ -103,6 +105,7 @@ map, which restores native GPT routing.
 | GLM-5.3 Coding Plan | `zai-coding/glm-5.3` | `zai-coding-glm-5-3` | `glm-5.3` |
 | GLM-5.2 Coding Plan | `zai-coding/glm-5.2` | `zai-coding-glm-5-2` | `glm-5.2` |
 | GLM-5-Turbo Coding Plan | `zai-coding/glm-5-turbo` | `zai-coding-glm-5-turbo` | `glm-5-turbo` |
+| GLM-5.3-Flash Z.ai API | `zai-api/glm-5.3-flash` | `zai-api-glm-5-3-flash` | `glm-5.3-flash` |
 | GLM-5.3 Z.ai API | `zai-api/glm-5.3` | `zai-api-glm-5-3` | `glm-5.3` |
 | GLM-5.2 Z.ai API | `zai-api/glm-5.2` | `zai-api-glm-5-2` | `glm-5.2` |
 | GLM-4.7 Z.ai API | `zai-api/glm-4.7` | `zai-api-glm-4-7` | `glm-4.7` |
@@ -156,6 +159,24 @@ redact it, while Codex config and all snapshots are current-user-only files.
 The router additionally requires JSON content, rejects browser-origin headers,
 and never grants CORS access.
 
+### Capability-gated embeddings
+
+The caller-capability `/v1/embeddings` edge resolves a registered routed model
+and refuses it unless that exact model declares `/embeddings` in
+`supportedEndpoints`. It rewrites only the public slug to the gateway model,
+then re-enters the credential-owning API forwarder; that forwarder rewrites the
+gateway model to the upstream id and otherwise preserves the embeddings JSON.
+The body never enters LiteLLM or a chat/Responses adapter. Unknown, hidden, and
+undeclared models fail before an upstream request.
+
+Both directions have an 8 MiB default bound. Client cancellation aborts the
+internal and provider requests, caller query parameters are not relayed, and
+the route performs no automatic retry because a provider may already have
+billed the input before a transport failure. Endpoint-only models stay
+unlisted so the Codex picker cannot advertise them as conversational models.
+Both hops refuse redirects so a 307/308 cannot replay the POST, and
+Messages-native providers cannot declare this OpenAI endpoint.
+
 ## Credential boundaries
 
 | Route | Incoming Codex credential | Upstream credential |
@@ -165,6 +186,7 @@ and never grants CORS access.
 | Kimi API | Discarded | Kimi Platform API key |
 | DeepSeek | Discarded | DeepSeek API key |
 | GitHub Copilot | Discarded | Stored fine-grained GitHub token, after Copilot entitlement and endpoint validation |
+| Capability-gated embeddings | Router caller capability is consumed locally | The selected routed provider's isolated credential |
 
 The Codex-to-router and internal-service trust boundaries use two different
 random keys, each stored with mode `600` or a current-user Windows ACL. Neither
@@ -202,25 +224,70 @@ Codex sends the search result back through the normal routed Responses turn.
 This is a per-model compatibility declaration, not a claim that the upstream
 provider hosts search. Only enable it after verifying that the provider's
 model accepts Codex's web-search result items and preserves tool/function-call
-history. Do not enable a global Codex feature or provider flag for this: Codex
-does not use those settings to gate the tool per model, so they would expose
-`web.run` to unrelated routed models and could select a native OpenAI search
-path without the required ChatGPT session. The registry declaration is the
-only capability switch, and it is scoped to the exact model/provider route.
+history. The managed Codex provider block sets
+`supports_standalone_web_search = true` because Codex requires that provider
+half before any verified routed model can execute standalone search. It is not
+the advertisement gate: the merged catalog exposes search only for an exact
+model/provider route with a `searchTool` declaration (or a ready exact sidecar
+binding). An OpenAI-compatible endpoint proves neither capability. If Codex
+still sends ambient hosted-search extensions to an unsupported runtime-generic
+route, the router strips those extensions at its managed Responses boundary;
+it does not mutate direct gateway calls or ordinary caller-owned functions.
 
 The checked-in registry currently enables this mode for DeepSeek V4 Flash on
 its direct API and opencode Go routes, DeepSeek V4 Flash Vision Exp, Xiaomi
 MiMo v2.5, and GLM-5.3 on the Z.ai Coding Plan. Other provider/model pairs
 stay off until verified -- including GLM-5.3 on the opencode Go relay, which
-is a different transport from the Z.ai route the capability was proven on. User-model curation can opt in locally without changing the
-shared registry.
+is a different transport from the Z.ai route the capability was proven on. An
+operator can opt in locally only by adding `searchTool` to that exact entry in
+the protected `user-models.json` after verifying the route. The curation CLI
+does not ask for or infer search mode from an upstream catalog claim.
+
+Accepting a completed `web_search_call` in conversation history is a narrower
+input-compatibility capability than executing a new search. A route that has
+been live-tested for history replay may declare `supportsSearchHistory: true`
+without a `searchTool`; this keeps new search unavailable while allowing that
+route to continue or compact an existing searched conversation. The flag is
+false by default and, like `searchTool`, belongs to the exact model/provider
+route rather than to an OpenAI-compatible protocol family.
+
+### Per-model search sidecar
+
+A model without `searchTool` can be opted into the Perplexity Search sidecar.
+The model catalog advertises search only while the exact binding, trusted
+generic-provider descriptor, and protected credential are all ready. Codex's
+authenticated `/alpha/search` request is then handled locally and never falls
+through to the native ChatGPT search backend. Unbound requests retain the
+native behavior above.
+
+The sidecar does not accept an arbitrary destination. Its provider must be an
+enabled, public-only generic `openai-chat` descriptor whose base URL is exactly
+`https://api.perplexity.ai`, and the request path is fixed to `/search`. The
+generic-provider transport resolves and pins the destination, refuses private
+addresses and redirects, and attaches the credential inside that boundary.
+Returned citations receive their own public-DNS and credential checks before
+they become model-visible data.
+
+The accepted wire subset is deliberately smaller than a general browser:
+one through four `search_query` entries, each containing only `q`. Results,
+body size, text length, retry count, timeout, backoff, and cache size/TTL are
+bounded by the versioned per-model policy. One operation deadline covers the
+adapter, response read, result DNS checks, retries, and backoff. Cancellation
+propagates from the Codex request. Usage records contain status, duration,
+attempt/cache/result counts, model, and provider id, never query text,
+citations, endpoints, or credentials.
 
 ## Transport and compaction
 
-Current Codex builds first attempt a Responses WebSocket. The router responds
-with HTTP 426, and Codex falls back to HTTP. Request bodies may use Zstandard,
-gzip, deflate, or Brotli; the router safely decompresses them before inspecting
-the model ID.
+Current Codex builds use the Responses WebSocket v2 transport. The router
+authenticates the caller capability before upgrading, accepts
+`response.create` messages, reconstructs full history when Codex sends a
+`previous_response_id` delta, and re-enters its own caller-authenticated HTTP
+Responses route. SSE response events are translated back to WebSocket JSON
+frames. The WebSocket edge never selects or contacts a provider itself, and
+the caller capability is never relayed to an upstream. HTTP request bodies may
+use Zstandard, gzip, deflate, or Brotli; the router safely decompresses them
+before inspecting the model ID.
 
 Codex can compact history through `/responses/compact` or a
 `compaction_trigger`. External Chat Completions providers cannot create OpenAI's

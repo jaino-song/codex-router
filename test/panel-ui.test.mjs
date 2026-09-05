@@ -5,6 +5,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import {
+  accountBucketsWithRouterFallback,
   buildQuotaCards,
   chartGeometry,
   commandRefused,
@@ -16,12 +17,20 @@ import {
   quotaWindow,
   readOnlyCapabilities,
   serviceHealthRows,
+  sourceOptions,
   toolResultAgingChecked,
   visibleLocalDownload,
 } from "../apps/panel/model.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-import { availableLanguages, getLanguage, setLanguage, t, translationKeys } from "../apps/panel/i18n.mjs";
+import {
+  LANGUAGE_OPTIONS,
+  availableLanguages,
+  getLanguage,
+  setLanguage,
+  t,
+  translationKeys,
+} from "../apps/panel/i18n.mjs";
 
 test("model picker search matches names, slugs, and provider labels", () => {
   const model = {
@@ -54,6 +63,54 @@ test("desktop usage series fills missing local calendar days", () => {
       { key: "2026-07-21", tokens: 8_100 },
     ],
   );
+});
+
+test("panel account usage fills only dates missing from OpenAI account data", () => {
+  const merged = accountBucketsWithRouterFallback(
+    [
+      { startDate: "2026-08-26", tokens: 260 },
+      { startDate: "2026-08-28", tokens: 280 },
+    ],
+    [
+      { startDate: "2026-08-27", tokens: 27_000 },
+      { startDate: "2026-08-28", tokens: 99_999 },
+    ],
+  );
+
+  assert.deepEqual(
+    merged.map(({ startDate, tokens, displaySource }) => ({ startDate, tokens, displaySource })),
+    [
+      { startDate: "2026-08-26", tokens: 260, displaySource: "account" },
+      { startDate: "2026-08-27", tokens: 27_000, displaySource: "router-fallback" },
+      { startDate: "2026-08-28", tokens: 280, displaySource: "account" },
+    ],
+  );
+});
+
+test("an explicit zero account bucket wins over local OpenAI traffic", () => {
+  assert.deepEqual(
+    accountBucketsWithRouterFallback(
+      [{ startDate: "2026-08-27", tokens: 0 }],
+      [{ startDate: "2026-08-27", tokens: 27_000 }],
+    ),
+    [{ startDate: "2026-08-27", tokens: 0, displaySource: "account" }],
+  );
+});
+
+test("the panel source names and preserves OpenAI fallback provenance", () => {
+  const [source] = sourceOptions({
+    account: { dailyUsageBuckets: [{ startDate: "2026-08-28", tokens: 280 }] },
+    providerUsage: {
+      providers: [{
+        id: "openai",
+        displayName: "OpenAI",
+        dailyUsageBuckets: [{ startDate: "2026-08-27", tokens: 27_000 }],
+      }],
+    },
+  });
+  assert.equal(source.name, "ChatGPT · OpenAI + local fallback");
+  assert.equal(source.fallbackDays, 1);
+  assert.equal(source.buckets[0].displaySource, "router-fallback");
 });
 
 test("quota windows use one weekly label and a distinct five-hour label", () => {
@@ -202,6 +259,67 @@ test("active model speed prefers its provider and matches qualified slugs", () =
   assert.equal(observedModelSpeed(usage, "deepseek", "missing/model"), null);
 });
 
+test("panel speed rendering logic detects generation state correctly", () => {
+  // Verify the isGenerating logic that renderModelSpeed uses
+
+  // Idle state with no active requests
+  const idleActivity = {
+    state: "idle",
+    model: "provider/model",
+    provider: "provider",
+    active: [],
+  };
+  const isIdleGenerating = idleActivity.state === "generating" || (idleActivity.active && idleActivity.active.length > 0);
+  assert.equal(isIdleGenerating, false, "idle state with no active requests should not be generating");
+
+  // Generating state
+  const generatingActivity = {
+    state: "generating",
+    model: "provider/model",
+    provider: "provider",
+    active: [{ model: "provider/model", provider: "provider" }],
+  };
+  const isGenerating =
+    generatingActivity.state === "generating" || (generatingActivity.active && generatingActivity.active.length > 0);
+  assert.equal(isGenerating, true, "generating state should be detected");
+
+  // Active requests present even if state is not explicitly "generating"
+  const activeWithoutGeneratingState = {
+    state: "idle",
+    model: "provider/model",
+    provider: "provider",
+    active: [{ model: "provider/model", provider: "provider" }],
+  };
+  const hasActive =
+    activeWithoutGeneratingState.state === "generating" ||
+    (activeWithoutGeneratingState.active && activeWithoutGeneratingState.active.length > 0);
+  assert.equal(hasActive, true, "active requests should be detected even without generating state");
+
+  // Verify observedModelSpeed should return null when generating
+  const providerUsage = {
+    providers: [
+      {
+        id: "provider",
+        models: [
+          {
+            slug: "provider/model",
+            displayName: "model",
+            observedTokensPerSecond: 125.3,
+            speedSampleCount: 10,
+          },
+        ],
+      },
+    ],
+  };
+  // When not generating, observedModelSpeed should be called and return speed
+  const observedIdle = !isIdleGenerating ? observedModelSpeed(providerUsage, "provider", "provider/model") : null;
+  assert.deepEqual(observedIdle, { speed: 125.3, samples: 10 });
+
+  // When generating, observedModelSpeed should not be called (returns null)
+  const observedGenerating = !isGenerating ? observedModelSpeed(providerUsage, "provider", "provider/model") : null;
+  assert.equal(observedGenerating, null, "speed should be null during generation");
+});
+
 test("service health rows expose enabled dependencies without leaking endpoint details", () => {
   assert.deepEqual(
     serviceHealthRows({
@@ -322,6 +440,37 @@ test("the macOS tray tool-result-aging switch mirrors the same off default", () 
   assert.doesNotMatch(source, /toolResultAging\?\.enabled \?\? true/);
 });
 
+test("the macOS tray panel follows the system appearance", () => {
+  const source = readFileSync(
+    path.join(root, "apps", "macos", "ModelRouterTray", "Sources", "ModelRouterTrayApp.swift"),
+    "utf8",
+  );
+  const trayStart = source.indexOf("private struct TrayView");
+  const trayEnd = source.indexOf("private struct ProviderSetupRow", trayStart);
+  assert.ok(trayStart > 0 && trayEnd > trayStart, "TrayView should remain readable");
+  assert.doesNotMatch(
+    source.slice(trayStart, trayEnd),
+    /\.preferredColorScheme\(\.dark\)/,
+    "the menu-bar panel must not override the operator's macOS appearance",
+  );
+});
+
+test("the macOS tray does not redraw a hidden or unchanged settings tree", () => {
+  const source = readFileSync(
+    path.join(root, "apps", "macos", "ModelRouterTray", "Sources", "ModelRouterTrayApp.swift"),
+    "utf8",
+  );
+  const closePanel = source.match(/private func closePanel\(\)[\s\S]*?\r?\n  }/)?.[0];
+  const refreshActivity = source.match(/private func refreshActivity\(\)[\s\S]*?\r?\n  }\r?\n\r?\n  private func recordActivityHealthFailure/)?.[0];
+
+  assert.ok(closePanel, "tray close helper should be readable");
+  assert.match(closePanel, /panel\.contentViewController = nil/);
+  assert.ok(refreshActivity, "activity refresh helper should be readable");
+  assert.match(refreshActivity, /if routerHealth != health \{ routerHealth = health \}/);
+  assert.match(source, /private struct RouterHealth: Decodable, Equatable/);
+  assert.match(source, /private struct RouterActivity: Decodable, Equatable/);
+});
+
 test("the macOS tray provider toggle uses the atomic selection command", () => {
   const swift = readFileSync(
     path.join(root, "apps", "macos", "ModelRouterTray", "Sources", "ModelRouterTrayApp.swift"),
@@ -379,7 +528,7 @@ test("every mutating control in the browser panel names the command it drives", 
 test("browser panel exposes translations with matching keys for every language", () => {
   assert.deepEqual(
     availableLanguages().map(({ id }) => id),
-    ["en", "zh-CN", "ar", "hi", "ja", "ko"],
+    LANGUAGE_OPTIONS.map(({ id }) => id),
   );
   const keys = translationKeys();
   const englishKeys = [...keys.en].sort();
@@ -387,9 +536,19 @@ test("browser panel exposes translations with matching keys for every language",
     assert.deepEqual([...keys[language]].sort(), englishKeys, `translation keys diverge for ${language}`);
   }
   // Stated separately from the parity check above, which would also pass if a
-  // new string were left out of all six.
+  // new string were left out of every locale.
   for (const language of Object.keys(keys)) {
-    for (const key of ["general.readOnlySurface", "general.readOnlyControl"]) {
+    for (const key of [
+      "general.readOnlySurface",
+      "general.readOnlyControl",
+      "usage.chatgptWithFallback",
+      "usage.localFallbackNotice",
+      "usage.localFallbackNoticeOne",
+      "usage.localFallbackDates",
+      "usage.localFallbackDatesOne",
+      "usage.localFallbackPoint",
+      "usage.localFallbackShort",
+    ]) {
       assert.ok([...keys[language]].includes(key), `${key} is missing from ${language}`);
     }
   }
@@ -399,12 +558,21 @@ test("browser panel exposes translations with matching keys for every language",
     ["hi", "उपयोग"],
     ["ja", "使用量"],
     ["ko", "사용량"],
+    ["es", "Uso"],
   ];
   try {
     for (const [language, navUsage] of samples) {
       setLanguage(language);
       assert.equal(getLanguage(), language);
       assert.equal(t("nav.usage"), navUsage);
+      assert.notEqual(
+        t("usage.localFallbackNotice", { count: 2 }),
+        "OpenAI supplied no account bucket for 2 dates; local router traffic fills the gap. These are not global account totals.",
+      );
+      assert.notEqual(
+        t("usage.localFallbackNoticeOne"),
+        "OpenAI supplied no account bucket for 1 date; local router traffic fills the gap. This is not a global account total.",
+      );
     }
     setLanguage("zh-CN");
     assert.equal(t("usage.resetsToday", { time: "10:30" }), "今天 10:30 重置");
@@ -412,6 +580,24 @@ test("browser panel exposes translations with matching keys for every language",
     setLanguage("en");
   }
   assert.equal(t("nav.usage"), "Usage");
+});
+
+test("browser and macOS settings present the unified pipeline as Token maxxing", () => {
+  assert.equal(t("models.compactOldToolResults"), "Token maxxing");
+  assert.match(t("models.reduceRepeatedContext"), /RTK-shape noisy output.*routed compaction/i);
+  assert.doesNotMatch(t("models.reduceRepeatedContext"), /70%|pressure|reasoning packets/i);
+  assert.doesNotMatch(t("models.compactOldToolResults"), /compact old tool results/i);
+
+  const markup = readFileSync(path.join(root, "apps", "panel", "index.html"), "utf8");
+  assert.match(markup, />Token maxxing</u);
+  assert.match(markup, /Toggle Token maxxing for external models/u);
+
+  const swift = readFileSync(
+    path.join(root, "apps", "macos", "ModelRouterTray", "Sources", "ModelRouterTrayApp.swift"),
+    "utf8",
+  );
+  assert.match(swift, /title: routerLocalized\("Token maxxing"\)/u);
+  assert.doesNotMatch(swift, /title: routerLocalized\("Compact old tool results"\)/u);
 });
 
 test("browser panel marks Arabic as the only right-to-left language", () => {

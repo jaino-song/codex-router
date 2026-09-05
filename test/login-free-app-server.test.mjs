@@ -17,6 +17,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { codexCandidatePaths, findCodexBinary } from "../src/codex-binary.mjs";
+import { handleResponsesWebSocketUpgrade } from "../src/responses-websocket.mjs";
 import { spawnableCommand } from "../src/spawnable-command.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -40,6 +41,10 @@ function cleanCredentialEnvironment(extra = {}) {
 
 function codexSync(binary, args, env) {
   const target = spawnableCommand(binary, args);
+  // CodeQL conflates spawnableCommand's direct-exec and escaped Windows-batch
+  // return shapes across unrelated callers. The helper rejects illegal batch
+  // paths and escapes every cmd.exe metacharacter before this test spawn.
+  // codeql[js/shell-command-injection-from-environment]
   return execFileSync(target.command, target.args, {
     ...target.options,
     cwd: root,
@@ -156,6 +161,10 @@ function responseStream(model) {
 function runAppServerTurn(binary, env, model, modelProvider) {
   return new Promise((resolve, reject) => {
     const target = spawnableCommand(binary, ["app-server"]);
+    // CodeQL conflates spawnableCommand's direct-exec and escaped Windows-batch
+    // return shapes across unrelated callers. The helper rejects illegal batch
+    // paths and escapes every cmd.exe metacharacter before this test spawn.
+    // codeql[js/shell-command-injection-from-environment]
     const child = spawn(target.command, target.args, {
       ...target.options,
       cwd: root,
@@ -173,9 +182,19 @@ function runAppServerTurn(binary, env, model, modelProvider) {
       settled = true;
       clearTimeout(timer);
       lines.close();
+      const complete = () => {
+        child.stdin.destroy();
+        child.stdout.destroy();
+        child.stderr.destroy();
+        if (error) reject(error);
+        else resolve(value);
+      };
+      if (child.exitCode !== null || child.signalCode !== null) {
+        complete();
+        return;
+      }
+      child.once("exit", complete);
       child.kill();
-      if (error) reject(error);
-      else resolve(value);
     };
     const send = (message) => child.stdin.write(`${JSON.stringify(message)}\n`);
     const timer = setTimeout(
@@ -262,10 +281,26 @@ async function verifySignedOutTurn(binary, { initialProvider = "openai" } = {}) 
       response.end(responseStream(requests.at(-1).body.model));
     });
   });
+  const upgradedSockets = new Set();
+  const upgrades = [];
 
   try {
     await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
     const port = server.address().port;
+    server.on("upgrade", (request, socket, head) => {
+      upgrades.push({ headers: request.headers, url: request.url });
+      upgradedSockets.add(socket);
+      socket.once("close", () => upgradedSockets.delete(socket));
+      handleResponsesWebSocketUpgrade(request, socket, head, {
+        callerKey: CALLER_KEY,
+        authenticateUpgrade: (upgradeRequest, requestUrl) =>
+          requestUrl.pathname === "/v1/responses" &&
+          upgradeRequest.headers.authorization === `Bearer ${CALLER_KEY}`
+            ? requestUrl.pathname
+            : undefined,
+        responsesUrl: `http://127.0.0.1:${port}/_codex-router/${CALLER_KEY}/v1/responses`,
+      });
+    });
     const env = cleanCredentialEnvironment({
       CODEX_BIN: binary,
       CODEX_HOME: codexHome,
@@ -303,6 +338,9 @@ async function verifySignedOutTurn(binary, { initialProvider = "openai" } = {}) 
     assert.match(config, new RegExp(`^model_provider = ${JSON.stringify(expectedProvider)}$`, "m"));
     assert.match(config, new RegExp(`\\[model_providers\\.${expectedProvider}\\]`));
     assert.doesNotMatch(config, /\[model_providers\.openai\]/);
+    assert.match(config, new RegExp(`\\[model_providers\\.${expectedProvider}\\.auth\\]`));
+    assert.match(config, /caller-key-auth-command\.mjs/);
+    assert.doesNotMatch(config, new RegExp(CALLER_KEY));
     if (initialProvider !== "openai") {
       assert.match(config, /requires_openai_auth = false/);
       assert.doesNotMatch(config, /direct\.invalid/);
@@ -310,13 +348,29 @@ async function verifySignedOutTurn(binary, { initialProvider = "openai" } = {}) 
 
     const notifications = await runAppServerTurn(binary, env, model, expectedProvider);
     assert.equal(requests.length, 1);
-    assert.match(requests[0].url, /\/_codex-router\/[^/]+\/v1\/responses$/);
-    assert.equal(requests[0].headers.authorization, undefined);
+    if (upgrades.length > 0) {
+      assert.equal(upgrades.length, 1);
+      assert.equal(upgrades[0].url, "/v1/responses");
+      assert.equal(upgrades[0].headers.authorization, `Bearer ${CALLER_KEY}`);
+      assert.equal(
+        requests[0].url,
+        `/_codex-router/${CALLER_KEY}/v1/responses`,
+      );
+      assert.equal(
+        requests[0].headers.authorization,
+        undefined,
+        "the caller capability stops at the WebSocket edge",
+      );
+    } else {
+      assert.equal(requests[0].url, "/v1/responses");
+      assert.equal(requests[0].headers.authorization, `Bearer ${CALLER_KEY}`);
+    }
     assert.equal(requests[0].body.model, model);
     assert.match(JSON.stringify(notifications), new RegExp(MARKER));
   } finally {
+    for (const socket of upgradedSockets) socket.destroy();
     await new Promise((resolve) => server.close(resolve));
-    rmSync(codexHome, { recursive: true, force: true });
+    rmSync(codexHome, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
   }
 }
 

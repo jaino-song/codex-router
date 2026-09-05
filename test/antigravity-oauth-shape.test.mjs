@@ -21,6 +21,7 @@ test("translates a plain user turn into Gemini contents", () => {
   );
   assert.equal(request.model, "gemini-3-pro-high");
   assert.equal(request.project, "my-project");
+  assert.equal(request.userAgent, "codex-router");
   assert.equal(request.request.systemInstruction.parts[0].text, "You are a coding assistant.");
   assert.deepEqual(request.request.contents, [
     { role: "user", parts: [{ text: "hello" }] },
@@ -118,6 +119,8 @@ test("sanitizes unsupported JSON Schema constructs for Antigravity", () => {
               type: "object",
               properties: {
                 mode: { type: "string", const: "fast" },
+                retries: { type: "integer", enum: [1, 2] },
+                enabled: { type: "boolean", const: true },
                 count: { type: "integer", default: 1, encrypted: true },
                 bounded: { type: "number", minimum: 0, exclusiveMaximum: 10 },
               },
@@ -131,12 +134,406 @@ test("sanitizes unsupported JSON Schema constructs for Antigravity", () => {
   );
   const declaration = request.request.tools[0].functionDeclarations[0];
   assert.equal(declaration.parameters.properties.mode.enum[0], "fast");
+  assert.deepEqual(declaration.parameters.properties.retries.enum, ["1", "2"]);
+  assert.deepEqual(declaration.parameters.properties.enabled.enum, ["true"]);
   assert.equal("const" in declaration.parameters.properties.mode, false);
   assert.equal("default" in declaration.parameters.properties.count, false);
   assert.equal("encrypted" in declaration.parameters.properties.count, false);
   assert.equal("minimum" in declaration.parameters.properties.bounded, false);
   assert.equal("exclusiveMaximum" in declaration.parameters.properties.bounded, false);
   assert.equal("$schema" in declaration.parameters, false);
+});
+
+test("sanitizes Codex tool schemas accepted by Claude Antigravity", () => {
+  const request = toAntigravityRequest({
+    model: "claude-opus-4-6-thinking",
+    messages: [{ role: "user", content: "inspect" }],
+    tools: [{
+      type: "function",
+      function: {
+        name: "inspect",
+        parameters: {
+          type: "object",
+          id: "legacy-root",
+          discriminator: { propertyName: "kind" },
+          properties: {
+            optional: { anyOf: [{ type: "string" }, { type: "null" }] },
+            flexible: { anyOf: [{ type: "string" }, { type: "number" }] },
+            metadata: { type: "array", items: true },
+          },
+        },
+      },
+    }],
+  });
+  const schema = request.request.tools[0].functionDeclarations[0].parameters;
+  assert.equal("id" in schema, false);
+  assert.equal("discriminator" in schema, false);
+  assert.deepEqual(schema.properties.optional, { type: "string" });
+  assert.deepEqual(schema.properties.flexible, { type: "string" });
+  assert.deepEqual(schema.properties.metadata.items, {});
+});
+
+test("omits only Claude tools whose false schemas or conjunctions cannot be represented", () => {
+  const request = toAntigravityRequest({
+    model: "claude-opus-4-6-thinking",
+    messages: [{ role: "user", content: "inspect" }],
+    tools: [
+      {
+        type: "function",
+        function: {
+          name: "safe",
+          parameters: {
+            type: "object",
+            properties: { value: { type: "string" } },
+          },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "false_property",
+          parameters: {
+            type: "object",
+            properties: { impossible: false },
+          },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "conjunction",
+          parameters: {
+            type: "object",
+            properties: {
+              value: {
+                allOf: [
+                  { type: "string", minLength: 1 },
+                  { type: "string", pattern: "^[a-z]+$" },
+                ],
+              },
+            },
+          },
+        },
+      },
+    ],
+  });
+
+  assert.deepEqual(
+    request.request.tools[0].functionDeclarations.map((declaration) => declaration.name),
+    ["safe"],
+  );
+});
+
+test("omits Claude tools whose refs cannot be dereferenced without widening", () => {
+  const request = toAntigravityRequest({
+    model: "claude-opus-4-6-thinking",
+    messages: [{ role: "user", content: "inspect" }],
+    tools: [
+      {
+        type: "function",
+        function: {
+          name: "safe",
+          parameters: { type: "object", properties: { value: { type: "string" } } },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "safe_ref",
+          parameters: {
+            type: "object",
+            properties: {
+              value: { $ref: "#/$defs/alias", description: "Alias value." },
+            },
+            required: ["value"],
+            $defs: {
+              base: { type: "string", enum: ["a"] },
+              alias: { $ref: "#/$defs/base" },
+            },
+          },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "safe_unused_defs",
+          parameters: {
+            type: "object",
+            properties: { value: { type: "string" } },
+            $defs: { node: { $ref: "#/$defs/node" } },
+          },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "dangling_ref",
+          parameters: {
+            type: "object",
+            properties: { value: { $ref: "#/$defs/missing" } },
+            required: ["value"],
+            $defs: {},
+          },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "recursive_ref",
+          parameters: {
+            type: "object",
+            properties: { node: { $ref: "#/$defs/node" } },
+            $defs: {
+              node: {
+                type: "object",
+                properties: { child: { $ref: "#/$defs/node" } },
+              },
+            },
+          },
+        },
+      },
+      {
+        type: "function",
+        function: {
+          name: "conflicting_ref",
+          parameters: {
+            type: "object",
+            properties: {
+              base: { type: "string", enum: ["a"] },
+              alias: { $ref: "#/properties/base", enum: ["a", "b"] },
+            },
+            required: ["alias"],
+          },
+        },
+      },
+    ],
+  });
+
+  assert.deepEqual(
+    request.request.tools[0].functionDeclarations.map((declaration) => declaration.name),
+    ["safe", "safe_ref", "safe_unused_defs"],
+  );
+  const safeRef = request.request.tools[0].functionDeclarations.find(
+    (declaration) => declaration.name === "safe_ref",
+  );
+  assert.deepEqual(safeRef.parameters, {
+    type: "object",
+    properties: {
+      value: { type: "string", enum: ["a"], description: "Alias value." },
+    },
+    required: ["value"],
+  });
+});
+
+test("narrows Claude anyOf and provably disjoint oneOf branches deterministically", () => {
+  const request = toAntigravityRequest({
+    model: "claude-opus-4-6-thinking",
+    messages: [{ role: "user", content: "pick" }],
+    tools: [{
+      type: "function",
+      function: {
+        name: "pick",
+        parameters: {
+          type: "object",
+          properties: {
+            alternative: {
+              anyOf: [
+                { type: "string", pattern: "^safe$" },
+                { type: "number" },
+              ],
+            },
+            exclusive: { oneOf: [{ type: "string" }, { type: "number" }] },
+            literalUnion: { type: ["number", "string"], enum: [1, "safe"] },
+          },
+        },
+      },
+    }],
+  });
+  const schema = request.request.tools[0].functionDeclarations[0].parameters;
+  assert.deepEqual(schema.properties.alternative, { type: "number" });
+  assert.deepEqual(schema.properties.exclusive, { type: "string" });
+  assert.deepEqual(schema.properties.literalUnion, { type: "string", enum: ["safe"] });
+});
+
+test("omits a Claude oneOf tool when branch overlap cannot be excluded", () => {
+  const request = toAntigravityRequest({
+    model: "claude-opus-4-6-thinking",
+    messages: [{ role: "user", content: "pick" }],
+    tools: [
+      {
+        type: "function",
+        function: {
+          name: "ambiguous",
+          parameters: {
+            type: "object",
+            properties: {
+              value: { oneOf: [{ type: "number" }, { type: "integer" }] },
+            },
+          },
+        },
+      },
+      {
+        type: "function",
+        function: { name: "fallback", parameters: { type: "object", properties: {} } },
+      },
+    ],
+  });
+  assert.deepEqual(
+    request.request.tools[0].functionDeclarations.map((declaration) => declaration.name),
+    ["fallback"],
+  );
+});
+
+test("narrows a discriminated Claude oneOf to its first provably exclusive branch", () => {
+  const request = toAntigravityRequest({
+    model: "claude-opus-4-6-thinking",
+    messages: [{ role: "user", content: "read" }],
+    tools: [{
+      type: "function",
+      function: {
+        name: "file_action",
+        parameters: {
+          oneOf: [
+            {
+              type: "object",
+              properties: {
+                action: { type: "string", const: "read" },
+                path: { type: "string" },
+              },
+              required: ["action", "path"],
+            },
+            {
+              type: "object",
+              properties: {
+                action: { type: "string", const: "write" },
+                path: { type: "string" },
+                content: { type: "string" },
+              },
+              required: ["action", "path", "content"],
+            },
+          ],
+        },
+      },
+    }],
+  });
+  assert.deepEqual(request.request.tools[0].functionDeclarations[0].parameters, {
+    type: "object",
+    properties: {
+      action: { type: "string", enum: ["read"] },
+      path: { type: "string" },
+    },
+    required: ["action", "path"],
+  });
+});
+
+test("rejects a forced Claude tool when its schema was omitted", () => {
+  assert.throws(
+    () => toAntigravityRequest({
+      model: "claude-opus-4-6-thinking",
+      messages: [{ role: "user", content: "use impossible" }],
+      tool_choice: { type: "function", function: { name: "impossible" } },
+      tools: [{
+        type: "function",
+        function: {
+          name: "impossible",
+          parameters: { type: "object", properties: { value: false } },
+        },
+      }],
+    }),
+    (error) =>
+      error.status === 400 &&
+      error.code === "unsupported_forced_tool_schema" &&
+      /impossible/.test(error.message),
+  );
+});
+
+test("rejects required Claude tool use when every declaration was omitted", () => {
+  assert.throws(
+    () => toAntigravityRequest({
+      model: "claude-opus-4-6-thinking",
+      messages: [{ role: "user", content: "use a tool" }],
+      tool_choice: "required",
+      tools: [{
+        type: "function",
+        function: {
+          name: "impossible",
+          parameters: { type: "object", properties: { value: false } },
+        },
+      }],
+    }),
+    (error) =>
+      error.status === 400 &&
+      error.code === "no_representable_required_tool",
+  );
+});
+
+test("does not mutate messages or schemas while shaping Claude tools", () => {
+  const chat = {
+    model: "claude-opus-4-6-thinking",
+    messages: [
+      { role: "user", content: "inspect" },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [{
+          id: "call_1",
+          type: "function",
+          function: { name: "inspect", arguments: "{}" },
+        }],
+      },
+      { role: "assistant", content: "checking" },
+      { role: "tool", tool_call_id: "call_1", content: "done" },
+    ],
+    tools: [{
+      type: "function",
+      function: {
+        name: "inspect",
+        parameters: {
+          type: "object",
+          id: "legacy",
+          properties: {
+            value: { anyOf: [{ type: "string" }, { type: "null" }] },
+          },
+        },
+      },
+    }],
+  };
+  const before = structuredClone(chat);
+  toAntigravityRequest(chat);
+  assert.deepEqual(chat, before);
+});
+
+test("keeps Gemini boolean, union, id, and discriminator schemas unchanged", () => {
+  const request = toAntigravityRequest({
+    model: "gemini-3.6-flash",
+    messages: [{ role: "user", content: "inspect" }],
+    tools: [{
+      type: "function",
+      function: {
+        name: "inspect",
+        parameters: {
+          type: "object",
+          id: "legacy",
+          discriminator: { propertyName: "kind" },
+          properties: {
+            forbidden: false,
+            list: { type: "array", items: true },
+            union: { anyOf: [{ type: "string" }, { type: "number" }] },
+          },
+        },
+      },
+    }],
+  });
+  assert.deepEqual(request.request.tools[0].functionDeclarations[0].parameters, {
+    type: "object",
+    id: "legacy",
+    discriminator: { propertyName: "kind" },
+    properties: {
+      forbidden: false,
+      list: { type: "array", items: true },
+      union: { anyOf: [{ type: "string" }, { type: "number" }] },
+    },
+  });
 });
 
 test("accumulates Gemini SSE parts into an OpenAI-style turn", () => {

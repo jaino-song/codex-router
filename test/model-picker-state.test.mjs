@@ -10,6 +10,7 @@ process.env.CODEX_ROUTER_STATE_DIR = stateDir;
 const {
   MODEL_PICKER_STATE_PATH,
   effectiveVisibleModels,
+  forgetModelVisibility,
   migrateLegacyVisibleModels,
   migrateModelVisibility,
   modelPickerSnapshot,
@@ -61,6 +62,23 @@ test("provider-sized picker changes preserve other providers", () => {
   assert.deepEqual(modelPickerSnapshot().hidden, ["kimi-oauth/k3"]);
   assert.ok(modelPickerSnapshot().visible.includes("commandcode/kimi-k3"));
   assert.ok(modelPickerSnapshot().visible.includes("commandcode-messages/claude-opus-4.8"));
+});
+
+test("forgetting retired routes removes every old picker decision", () => {
+  setModelsVisible(["generic/visible", "generic/hidden"], true);
+  setModelVisible("generic/hidden", false);
+  setModelVisible("other/retained", true);
+
+  forgetModelVisibility(["generic/visible", "generic/hidden"]);
+
+  const snapshot = modelPickerSnapshot();
+  assert.equal(snapshot.visible.includes("generic/visible"), false);
+  assert.equal(snapshot.hidden.includes("generic/hidden"), false);
+  assert.equal(snapshot.visible.includes("other/retained"), true);
+  const persisted = JSON.parse(readFileSync(MODEL_PICKER_STATE_PATH, "utf8"));
+  assert.equal(persisted.seeded.includes("generic/visible"), false);
+  assert.equal(persisted.seeded.includes("generic/hidden"), false);
+  assert.equal(persisted.seeded.includes("other/retained"), true);
 });
 
 test("an explicit model selection changes only the supplied provider models", () => {

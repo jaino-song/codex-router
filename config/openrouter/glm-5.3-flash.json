@@ -30,7 +30,8 @@
       "inputModalities": [
         "text"
       ],
-      "compHash": "openrouter-glm-5-3-flash-v1"
+      "requestProfile": "ox-alpha",
+      "compHash": "openrouter-glm-5-3-flash-v2"
     }
   ]
 }

@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { writePrivateJson } from "../src/file-security.mjs";
 import { freePort } from "./port-pool.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -108,16 +109,39 @@ function waitFor(readErrors, readExit, pattern, timeoutMs = 60_000) {
   });
 }
 
-test("a gateway that dies mid-request is restarted and the router keeps serving", { timeout: 180_000 }, async () => {
-  const ports = await Promise.all(Array.from({ length: 5 }, () => freePort()));
+test("a ready stack activates its exact pending proof and survives a gateway restart", { timeout: 180_000 }, async () => {
+  const ports = await Promise.all(Array.from({ length: 6 }, () => freePort()));
   assert.equal(new Set(ports).size, ports.length);
-  const [routerPort, gatewayPort, oauthPort, apiPort, grokOauthPort] = ports;
+  const [routerPort, gatewayPort, oauthPort, apiPort, grokOauthPort, antigravityPort] = ports;
   const rootDir = mkdtempSync(path.join(os.tmpdir(), "model-router-gateway-restart-"));
   const stateDir = path.join(rootDir, "state");
   mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   const callerKey = "gateway-restart-caller-key-with-sufficient-length";
   writeFileSync(path.join(stateDir, "internal-secret"), "gateway-restart-internal-key-with-sufficient-length\n", { mode: 0o600 });
   writeFileSync(path.join(stateDir, "caller-secret"), `${callerKey}\n`, { mode: 0o600 });
+  const activationGeneration = "88888888-8888-4888-8888-888888888888";
+  const antigravityTokenPath = path.join(stateDir, "antigravity-oauth.json");
+  writePrivateJson(antigravityTokenPath, {
+    version: 3,
+    managed_by: "codex-router",
+    session_generation: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    client_id: "gateway-restart.apps.googleusercontent.com",
+    client_secret: "gateway-restart-antigravity-client-secret",
+    access_token: "gateway-restart-antigravity-access-token",
+    refresh_token: "gateway-restart-antigravity-refresh-token",
+    expires_at: Math.floor(Date.now() / 1_000) + 3600,
+    expires_in: 3600,
+    project_id: "gateway-restart-managed-project",
+    project_source: "managed",
+    probe_version: 1,
+    probe_verified_at: Date.now(),
+    probe_model: "gemini-3.1-pro",
+    probe_activation: {
+      version: 1,
+      state: "pending_activation",
+      generation: activationGeneration,
+    },
+  });
   const gatewayBin = writeFakeGateway(rootDir, path.join(rootDir, "fake-gateway.mjs"));
 
   const child = spawn(process.execPath, [path.join(root, "src", "start.mjs")], {
@@ -131,6 +155,7 @@ test("a gateway that dies mid-request is restarted and the router keeps serving"
       MODEL_ROUTER_OAUTH_PORT: String(oauthPort),
       MODEL_ROUTER_API_PORT: String(apiPort),
       MODEL_ROUTER_GROK_OAUTH_PORT: String(grokOauthPort),
+      MODEL_ROUTER_ANTIGRAVITY_OAUTH_PORT: String(antigravityPort),
       MODEL_ROUTER_LITELLM_BIN: gatewayBin,
       // Keep the backoff out of the run time; the sequencing is what matters.
       CODEX_ROUTER_GATEWAY_RESTART_BACKOFF_MS: "50",
@@ -153,6 +178,11 @@ test("a gateway that dies mid-request is restarted and the router keeps serving"
   try {
     await waitFor(() => errors, readExit, /\[codex-router\] ready \(authenticated loopback endpoint\)/);
     assert.equal((await get(`http://127.0.0.1:${routerPort}/health`)).status, 200, errors);
+    assert.deepEqual(JSON.parse(readFileSync(antigravityTokenPath, "utf8")).probe_activation, {
+      version: 1,
+      state: "active",
+      generation: activationGeneration,
+    });
 
     // Kill the gateway the way a bad upstream response did.
     await get(`http://127.0.0.1:${gatewayPort}/crash`);
@@ -174,6 +204,9 @@ test("a gateway that dies mid-request is restarted and the router keeps serving"
     assert.equal(health.status, 200, `the router stopped serving:\n${errors}`);
     assert.doesNotMatch(errors, /gateway-restart-internal-key-with-sufficient-length/);
     assert.doesNotMatch(errors, /gateway-restart-caller-key-with-sufficient-length/);
+    assert.doesNotMatch(errors, /gateway-restart-antigravity-client-secret/);
+    assert.doesNotMatch(errors, /gateway-restart-antigravity-access-token/);
+    assert.doesNotMatch(errors, /gateway-restart-antigravity-refresh-token/);
   } finally {
     if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
     await new Promise((resolve) => setTimeout(resolve, 500));

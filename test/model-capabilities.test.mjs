@@ -39,6 +39,16 @@ test("untrusted provider metadata cannot select a router request profile", () =>
   );
 });
 
+test("trusted metadata still cannot mint an unknown router request profile", () => {
+  assert.throws(
+    () => modelMetadataFromProviderRecord(
+      { id: "provider/model", requestProfile: "provider-invented" },
+      { trusted: true },
+    ),
+    /supported router profile/,
+  );
+});
+
 test("metadata precedence is user, verified, live, then conservative defaults", () => {
   const merged = mergeModelMetadata({
     providerId: "example",

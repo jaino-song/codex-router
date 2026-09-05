@@ -1,8 +1,17 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 
-import { desktopTrayBinary, trayBundleDir, trayDecision } from "../src/tray-install.mjs";
+import {
+  desktopTrayBinary,
+  trayBundleDir,
+  trayDecision,
+  traySetupError,
+} from "../src/tray-install.mjs";
+
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 test("trayDecision skips when --no-tray is passed", () => {
   assert.equal(
@@ -60,6 +69,43 @@ test("trayDecision skips silently in automatic mode", () => {
     "skip",
   );
 });
+
+test("Homebrew setup never offers or installs a desktop companion", () => {
+  for (const withTray of [false, true]) {
+    assert.equal(
+      trayDecision({
+        platform: "darwin",
+        withTray,
+        noTray: false,
+        guided: true,
+        packageManager: "homebrew",
+      }),
+      "skip",
+    );
+  }
+  assert.match(
+    traySetupError({ packageManager: "homebrew", withTray: true, noTray: false }),
+    /router and CLI only/,
+  );
+  assert.equal(
+    traySetupError({ packageManager: "homebrew", withTray: false, noTray: false }),
+    undefined,
+  );
+});
+
+test(
+  "the POSIX tray launcher refuses to build inside a Homebrew installation",
+  { skip: process.platform === "win32" },
+  () => {
+    const result = spawnSync(path.join(root, "bin", "model-router-tray"), [], {
+      encoding: "utf8",
+      env: { ...process.env, CODEX_ROUTER_PACKAGE_MANAGER: "homebrew" },
+    });
+    assert.equal(result.status, 2);
+    assert.match(result.stderr, /not packaged by Homebrew/);
+    assert.match(result.stderr, /recommended curl installer/);
+  },
+);
 
 test("trayBundleDir places the macOS bundle in the user's Applications folder", () => {
   assert.equal(

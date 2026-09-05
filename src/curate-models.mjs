@@ -2,7 +2,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { discoverProviderModels } from "./model-discovery.mjs";
-import { MODELS, PROVIDERS, USER_MODEL_WARNINGS } from "./model-registry.mjs";
+import {
+  CHECKED_IN_MODELS,
+  RUNTIME_PROVIDERS,
+  RUNTIME_PROVIDER_WARNINGS,
+  USER_MODEL_WARNINGS,
+} from "./model-registry.mjs";
 import { confirm, promptLine } from "./setup-shared.mjs";
 import { toggleSelection } from "./setup-ui.mjs";
 import {
@@ -21,18 +26,22 @@ import {
   curationProviderIds,
   curatedModelContextLength,
   curatedModelDescription,
+  curatedModelInputModalities,
   curatedModelProviderId,
   curatedModelReasoningLevels,
+  curatedModelRequestProfile,
 } from "./opencode-curation.mjs";
 import {
   applyModelOverlayPublication,
   transactModelOverlayMutation,
 } from "./model-overlay-publication.mjs";
 import {
+  forgetModelVisibility,
   migrateModelVisibility,
   MODEL_PICKER_STATE_PATH,
   setModelsVisible,
 } from "./model-picker-state.mjs";
+import { CURATABLE_REQUEST_PROFILES, curatableRequestProfile } from "./request-profiles.mjs";
 
 // Interactive curation: list the provider's live models that are not part of
 // the checked-in registry, let the user toggle the ones they want, and persist
@@ -72,6 +81,7 @@ const EFFORT_DESCRIPTIONS = {
   high: "Deep reasoning",
   xhigh: "Extended reasoning",
   max: "Maximum reasoning",
+  ultra: "Pro reasoning",
 };
 
 // Request profiles a curated model may opt into. The vendor profiles in
@@ -83,7 +93,14 @@ const AUTO_TOOL_CHOICE = "auto-tool-choice";
 const REQUEST_PROFILE_DESCRIPTIONS = {
   [AUTO_TOOL_CHOICE]:
     'reject a forced tool_choice ("required") while still calling tools under "auto"',
+  "codex-encrypted-schema":
+    "reject Codex's encrypted annotation on JSON-Schema nodes while accepting the same tool schema without it",
 };
+
+if (Object.keys(REQUEST_PROFILE_DESCRIPTIONS).some((profile) => !curatableRequestProfile(profile)) ||
+    CURATABLE_REQUEST_PROFILES.some((profile) => !REQUEST_PROFILE_DESCRIPTIONS[profile])) {
+  throw new Error("Curatable request-profile descriptions are out of sync.");
+}
 
 // Codex compacts at this fraction of the declared window.
 const AUTO_COMPACT_RATIO = 0.85;
@@ -110,7 +127,7 @@ function usage() {
   console.error(
     "Usage: curate-models.mjs PROVIDER [--models id1,id2 | interactive] " +
       "[--free-only] [--remove id1,id2] [--refresh] [--apply|--no-apply] " +
-      "[--efforts minimal,low,medium,high,xhigh] " +
+      `[--efforts ${Object.keys(EFFORT_DESCRIPTIONS).join(",")}] ` +
       `[--request-profile ${Object.keys(REQUEST_PROFILE_DESCRIPTIONS).join("|")}]`,
   );
   process.exit(2);
@@ -128,6 +145,30 @@ export function parseRequestProfile(raw) {
     );
   }
   return profile;
+}
+
+// A request profile is safe to lend to an unregistered model only when every
+// checked-in route in that provider family establishes the same non-empty
+// wire contract. One missing profile means the behavior is model-specific;
+// two different profiles mean the family fronts incompatible upstreams.
+// Protocol variants remain members of the family, but their provider ids are
+// not themselves differences: a profile uniformly repeated across Chat,
+// Messages, or Responses variants is still one provider-wide contract.
+export function uniformProviderFamilyRequestProfile(models, providerIds) {
+  const family = new Set(providerIds);
+  let inherited;
+  let observed = false;
+  for (const model of models) {
+    if (!family.has(model.provider)) continue;
+    observed = true;
+    const profile = typeof model.requestProfile === "string"
+      ? model.requestProfile.trim()
+      : "";
+    if (!profile || profile !== model.requestProfile) return undefined;
+    if (inherited === undefined) inherited = profile;
+    else if (profile !== inherited) return undefined;
+  }
+  return observed ? inherited : undefined;
 }
 
 export function planCuration({ mine, chosen, removals, interactive }) {
@@ -214,6 +255,12 @@ export function normalizeCurationModels(models, providerId) {
       : undefined;
     const upgradeEfforts =
       Boolean(efforts) && untuned && hasDefaultUserModelReasoning(routed);
+    // A missing profile is another conservative default. Unlike sizing and
+    // effort metadata, this is a wire-compatibility repair: add a documented
+    // exact-model profile even when the operator tuned other metadata, while
+    // preserving any different non-empty profile they selected themselves.
+    const documentedProfile = curatedModelRequestProfile(providerId, model.upstreamModel);
+    const upgradeProfile = Boolean(documentedProfile) && !routed.requestProfile;
     // The stock description says the entry carries conservative defaults, so
     // it stops being true the moment any of them is upgraded. Replace it with
     // the sourcing note only while it is still the untouched stock string;
@@ -226,11 +273,12 @@ export function normalizeCurationModels(models, providerId) {
       // string naming the provider it was curated under, so accept either.
       (routed.description === defaultUserModelDescription(routed.provider) ||
         routed.description === defaultUserModelDescription(model.provider));
-    const sized = upgradeSizing || upgradeEfforts
+    const sized = upgradeSizing || upgradeEfforts || upgradeProfile
       ? {
           ...routed,
           ...(upgradeSizing ? documented : {}),
           ...(upgradeEfforts ? efforts : {}),
+          ...(upgradeProfile ? { requestProfile: documentedProfile } : {}),
           ...(upgradeDescription ? { description: documentedDescription } : {}),
         }
       : routed;
@@ -263,9 +311,17 @@ export function parseEfforts(raw) {
 }
 
 if (!requestedProviderId) usage();
-const provider = PROVIDERS.get(providerId);
+const provider = RUNTIME_PROVIDERS.get(providerId);
 if (!provider) {
+  for (const warning of RUNTIME_PROVIDER_WARNINGS) console.error(warning);
   console.error(`Unknown provider: ${providerId}`);
+  process.exit(2);
+}
+if (provider.generic === true && provider.adapter === "openai-completions") {
+  console.error(
+    `${provider.displayName} exposes legacy OpenAI Completions. Codex Router can discover ` +
+      "that catalog but has no completions caller surface, so those models cannot be curated or published.",
+  );
   process.exit(2);
 }
 const flagEfforts = (() => {
@@ -320,6 +376,7 @@ function chooseInteractively(candidates, curated) {
 
 
 async function main() {
+  for (const warning of RUNTIME_PROVIDER_WARNINGS) console.error(warning);
   for (const warning of USER_MODEL_WARNINGS) console.error(warning);
   const existing = readUserModels();
   const familyProviderIds = curationProviderIds(providerId);
@@ -403,9 +460,10 @@ async function main() {
     }
   }
 
-  const inheritedProfile = MODELS.find(
-    (model) => familyProviders.has(model.provider) && model.requestProfile,
-  )?.requestProfile;
+  const inheritedProfile = uniformProviderFamilyRequestProfile(
+    CHECKED_IN_MODELS,
+    familyProviderIds,
+  );
 
   // Which models exist is decided by the provider's own /v1/models endpoint.
   // Metadata comes from that catalog, the interactive user, or the narrow
@@ -418,6 +476,21 @@ async function main() {
       ...(flagEfforts || {}),
       ...(discovery.free?.includes(id) ? { isFree: true } : {}),
     };
+    // The ChatGPT Web launcher owns these catalog rows and derives them from
+    // the signed-in account. Its clean labels and input modalities are part of
+    // the same local contract as the account-gated model ids, so preserve them
+    // instead of turning every row into a generic text-only curated model.
+    if (providerId === "chatgpt-web") {
+      const live = Array.isArray(discovery.modelMetadata)
+        ? discovery.modelMetadata.find((entry) => entry?.upstreamId === id)
+        : discovery.modelMetadata?.[id];
+      if (typeof live?.displayName === "string" && live.displayName) {
+        metadata.displayName = live.displayName;
+      }
+      if (Array.isArray(live?.inputModalities) && live.inputModalities.length) {
+        metadata.inputModalities = live.inputModalities;
+      }
+    }
     // The served catalog value wins when present. OpenCode's exact documented
     // free-model size is the fallback for its id-only Zen catalog; every other
     // silent catalog still gets the conservative generic default.
@@ -432,6 +505,14 @@ async function main() {
     const documentedEfforts = curatedModelReasoningLevels(providerId, id);
     if (!flagEfforts && documentedEfforts) {
       Object.assign(metadata, parseEfforts(documentedEfforts.join(",")) || {});
+    }
+    // Zen's /models catalog publishes ids only, so image input has to come
+    // from the same documented free-id table as the window and effort ladder.
+    // Without this, scripted `--models` curation keeps the generic text-only
+    // default even when OpenCode publishes attachment/image for the id.
+    const documentedModalities = curatedModelInputModalities(providerId, id);
+    if (documentedModalities) {
+      metadata.inputModalities = [...documentedModalities];
     }
     // A documented window or effort ladder is not a conservative default, and
     // this repository records where such a value came from in the entry's own
@@ -468,8 +549,13 @@ async function main() {
       // replaced it, so that clause no longer matches what is stored.
       if (context !== documented?.contextWindow) omitContextNote = true;
     }
-    if (confirm(`  Does ${id} accept image input?`)) {
+    const defaultImage = (metadata.inputModalities || []).includes("image");
+    if (confirm(`  Does ${id} accept image input?`, defaultImage)) {
       metadata.inputModalities = ["text", "image"];
+    } else if (documentedModalities) {
+      // Documented modalities were pre-filled above; an explicit no has to
+      // clear them or the stored entry would still advertise image paste.
+      metadata.inputModalities = ["text"];
     }
     if (!flagEfforts) {
       const ladder = metadata.reasoningLevels?.map((level) => level.effort).join(",") || "high";
@@ -488,15 +574,16 @@ async function main() {
     return Object.keys(metadata).length > 0 ? metadata : undefined;
   };
 
-  // A provider that ships registry models lends its vendor profile to anything
-  // curated beside them. The catalog-only providers ship none, so their first
-  // curated model would get nothing at all -- which is correct for almost
-  // every model and wrong for the ones whose upstream refuses a forced tool
-  // choice. That is a per-model fact (a reseller fronts many upstreams, and
-  // the restriction belongs to the model behind it), so it is asked per model
-  // rather than defaulted per provider.
+  // Only a family whose every checked-in route carries the same non-empty
+  // profile lends that provider-wide contract to curation. A mixed reseller
+  // family lends nothing: one model's wire repair must never be projected onto
+  // an unrelated upstream merely because they share an API key. Catalog-only
+  // providers likewise inherit nothing. A per-model forced-tool restriction
+  // can still be selected explicitly below.
   const requestProfileFor = (id) => {
     if (flagRequestProfile) return flagRequestProfile;
+    const documentedProfile = curatedModelRequestProfile(providerId, id);
+    if (documentedProfile) return documentedProfile;
     if (inheritedProfile) return inheritedProfile;
     if (!interactive) return undefined;
     // Defaults to no: this weakens a forced tool choice into a request the
@@ -564,6 +651,10 @@ async function main() {
       to: normalizedByUpstream.get(model.upstreamModel)?.slug,
     }))
     .filter(({ from, to }) => to && from !== to);
+  const retainedUpstreams = new Set(nextMine.map((model) => model.upstreamModel));
+  const pickerRemovals = storedMine
+    .filter((model) => !retainedUpstreams.has(model.upstreamModel))
+    .map((model) => model.slug);
 
   const wantsApply =
     !noApply && (
@@ -586,6 +677,7 @@ async function main() {
         expectedMine: storedMine,
         nextMine,
       }));
+      if (pickerRemovals.length) forgetModelVisibility(pickerRemovals);
       if (pickerMigrations.length) migrateModelVisibility(pickerMigrations);
       if (pickerSelections.length) setModelsVisible(pickerSelections, true);
     },

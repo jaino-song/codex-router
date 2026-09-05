@@ -201,6 +201,87 @@ export function nonRecursiveToolSchema(schema) {
   return cloneWithoutClosingRefs(schema, closing);
 }
 
+// Some strict upstream JSON-Schema validators reject Codex's private
+// `encrypted` annotation. It is metadata on a schema node, not a JSON-Schema
+// keyword and not the same thing as a user property whose name is
+// "encrypted". Walk only positions that JSON Schema defines as child schemas;
+// never recurse into const/default/examples/enum or arbitrary extension data.
+//
+// Copy-on-write keeps an ordinary schema byte-shape identical. The depth cap
+// makes a hostile hand-built object bounded; a node beyond it is left intact,
+// which fails closed at the strict upstream instead of broadening the schema.
+const MAX_ANNOTATION_DEPTH = 32;
+
+export function stripCodexEncryptedSchemaAnnotation(schema) {
+  const active = new WeakSet();
+
+  const visit = (node, depth) => {
+    if (!isPlainObject(node) || depth > MAX_ANNOTATION_DEPTH || active.has(node)) return node;
+    active.add(node);
+    let next = node;
+    const replace = (key, value) => {
+      if (next === node) next = { ...node };
+      next[key] = value;
+    };
+
+    if (Object.hasOwn(node, "encrypted")) {
+      const { encrypted: _annotation, ...withoutAnnotation } = node;
+      next = withoutAnnotation;
+    }
+
+    for (const keyword of [...REF_SCHEMA_MAP_KEYWORDS, "dependencies"]) {
+      const schemas = node[keyword];
+      if (!isPlainObject(schemas)) continue;
+      let changed = false;
+      const rewritten = { ...schemas };
+      for (const [name, child] of Object.entries(schemas)) {
+        if (!isPlainObject(child)) continue;
+        const repaired = visit(child, depth + 1);
+        if (repaired !== child) {
+          rewritten[name] = repaired;
+          changed = true;
+        }
+      }
+      if (changed) replace(keyword, rewritten);
+    }
+
+    for (const keyword of REF_SCHEMA_ARRAY_KEYWORDS) {
+      const schemas = node[keyword];
+      if (!Array.isArray(schemas)) continue;
+      let changed = false;
+      const rewritten = schemas.map((child) => {
+        if (!isPlainObject(child)) return child;
+        const repaired = visit(child, depth + 1);
+        if (repaired !== child) changed = true;
+        return repaired;
+      });
+      if (changed) replace(keyword, rewritten);
+    }
+
+    for (const keyword of REF_SCHEMA_CHILD_KEYWORDS) {
+      const child = node[keyword];
+      if (Array.isArray(child)) {
+        let changed = false;
+        const rewritten = child.map((entry) => {
+          if (!isPlainObject(entry)) return entry;
+          const repaired = visit(entry, depth + 1);
+          if (repaired !== entry) changed = true;
+          return repaired;
+        });
+        if (changed) replace(keyword, rewritten);
+      } else if (isPlainObject(child)) {
+        const repaired = visit(child, depth + 1);
+        if (repaired !== child) replace(keyword, repaired);
+      }
+    }
+
+    active.delete(node);
+    return next;
+  };
+
+  return visit(schema, 0);
+}
+
 // Moonshot validates every `$ref` a tool schema carries. It accepts only pure
 // pointers into `#/$defs/`, rejecting the whole request -- not the one tool --
 // over other pointers and over a `$ref` that carries sibling keywords. Codex App
@@ -239,6 +320,16 @@ export function nonRecursiveToolSchema(schema) {
 // list. Copy-on-write throughout: a schema with no foreign ref keeps identity,
 // and the client's object is never mutated.
 const DEFS_REF_PREFIX = "#/$defs/";
+const REF_OVERRIDE_ANNOTATIONS = new Set([
+  "$comment",
+  "default",
+  "deprecated",
+  "description",
+  "examples",
+  "readOnly",
+  "title",
+  "writeOnly",
+]);
 const MAX_INLINE_DEPTH = 32;
 const MAX_INLINE_EXPANSIONS = 512;
 const MAX_INLINE_BYTES = 256 * 1024;
@@ -376,6 +467,17 @@ function inlineNodeRefs(
   // keep the decorated node intact and let the provider fail closed if it
   // cannot represent that conjunction.
   if (strictDefsRef && expanded.$ref !== undefined) return node;
+  if (foreignRef) {
+    const conflicts = Object.keys(rewrittenSiblings).some((key) => (
+      !REF_OVERRIDE_ANNOTATIONS.has(key) &&
+      Object.hasOwn(expanded, key) &&
+      !isDeepStrictEqual(rewrittenSiblings[key], expanded[key])
+    ));
+    // `$ref` siblings are conjunctive. Object spread is lossless when the
+    // assertions are distinct or identical, but a different value for the
+    // same assertion would overwrite one side and can widen the schema.
+    if (conflicts) return node;
+  }
   if (strictDefsRef) {
     const conflicts = Object.keys(rewrittenSiblings).some((key) => (
       Object.hasOwn(expanded, key) && !isDeepStrictEqual(rewrittenSiblings[key], expanded[key])

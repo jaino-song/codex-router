@@ -23,16 +23,21 @@ import { kimiOAuthStatus } from "./oauth-status.mjs";
 import {
   apiProvider,
   credentialLabel,
-  credentialStatus,
   removeProviderCredential,
   writeProviderCredential,
 } from "./provider-credentials.mjs";
+import {
+  effectiveProviderCredentialStatus,
+  providerApiKeyAuthoritySnapshot,
+} from "./provider-api-key-routing.mjs";
 import { disableProvider } from "./provider-selection.mjs";
 import {
+  installFailureDetail,
   npmGlobalBinary,
   npmInstallGlobal,
   spawnEnvironment,
 } from "./npm-global-install.mjs";
+import { ensureNodeDependencies } from "./node-dependency-install.mjs";
 import { commandOnPath, spawnableCommand } from "./spawnable-command.mjs";
 
 const SIGN_IN_CLIS = Object.freeze({
@@ -99,6 +104,7 @@ export function providerOnboardingSnapshot() {
   // Protocol variants share their parent's key and selection, so onboarding
   // surfaces (tray, guided setup) offer one entry per family.
   const selectable = [...PROVIDERS.values()].filter((provider) => !provider.variantOf);
+  const poolAuthoritySnapshot = providerApiKeyAuthoritySnapshot();
   return {
     providers: selectable.map((provider) => {
       const catalogSources = providerCatalogSources(provider.id);
@@ -112,14 +118,41 @@ export function providerOnboardingSnapshot() {
             id: provider.id,
             displayName: provider.displayName,
             kind: "oauth",
-            credentialLabel: "OAuth session",
+            credentialLabel: "Operator OAuth client",
             configured,
+            signedIn: status.signedIn === true,
+            verified: status.verified === true,
             // A rejected or damaged session is not configured, but its
             // router-managed file must remain removable from every UI.
             disconnectable: status.credentialPresent,
             cliInstalled: true,
             cliRunnable: true,
-            action: configured ? "ready" : "login",
+            action: configured
+              ? "ready"
+              : status.activationPending
+                ? "blocked"
+              : status.signedIn
+                ? "probe"
+                : status.credentialPresent && status.clientReady !== true
+                  ? "blocked"
+                  : "login",
+            ...(!configured && status.signedIn && !status.activationPending
+              ? { probeNote: "A live compatibility test is required before enabling this route; it sends a small prompt and uses provider quota." }
+              : {}),
+            ...(status.activationPending
+              ? {
+                  blockedNote:
+                    "The live proof is pending router health activation. Restart the managed router service, then enable the provider to republish it.",
+                }
+              : {}),
+            ...(!status.signedIn && status.credentialPresent && status.clientReady !== true
+              ? {
+                  blockedNote: status.reconnectRequired
+                    ? "Google rejected this operator OAuth client. Disconnect it, then sign in with a valid operator-owned Google Desktop app client."
+                    : status.recoveryNote ||
+                      "An incompatible router record is preserved. Disconnect it explicitly before starting the operator-owned OAuth sign-in.",
+                }
+              : {}),
             ...(catalogSources.length ? { catalogSources } : {}),
           };
         }
@@ -148,7 +181,10 @@ export function providerOnboardingSnapshot() {
       }
       const configured = providerNeedsNoKey(provider)
         ? true
-        : credentialStatus(provider, { persistent: true }).configured;
+        : effectiveProviderCredentialStatus(provider, {
+            persistent: true,
+            poolAuthoritySnapshot,
+          }).configured;
       const entry = {
         id: provider.id,
         displayName: provider.displayName,
@@ -229,11 +265,15 @@ export function installOauthCli(providerId) {
 // CLI waits on a terminal it will never get.
 const LOGIN_TIMEOUT_MS = 10 * 60_000;
 
-export async function loginOauthProvider(providerId) {
+export async function loginOauthProvider(providerId, { signal, deadline } = {}) {
   if (providerId === "antigravity-oauth") {
+    // Prepare the checkout before opening a browser so a fresh install cannot
+    // fail only after the operator has authorized Google and returned to the
+    // callback.
+    await ensureNodeDependencies({ signal, deadline });
     const { signInAntigravity } = await import("./antigravity-oauth-onboarding.mjs");
-    await signInAntigravity();
-    if (!oauthConfigured(providerId)) {
+    await signInAntigravity({ signal, deadline });
+    if (!antigravityOAuthStatus().signedIn) {
       throw new Error("Sign-in finished without a usable Antigravity OAuth session. Please try again.");
     }
     if (providerCatalogSources(providerId).length) {
@@ -304,7 +344,7 @@ export async function removeApiCredential(providerId) {
   const provider = apiProvider(providerId);
   const removedFiles = removeProviderCredential(provider);
   if (removedFiles) disableProvider(provider.id);
-  const remaining = credentialStatus(provider, { persistent: true });
+  const remaining = effectiveProviderCredentialStatus(provider, { persistent: true });
   return {
     provider: provider.id,
     displayName: provider.displayName,

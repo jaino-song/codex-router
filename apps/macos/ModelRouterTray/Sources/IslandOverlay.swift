@@ -615,7 +615,11 @@ private struct IslandOverlayView: View {
 
   private var sourceLabel: String {
     let provider = store.selectedUsageProviderID
-    if provider == "openai" { return routerLocalized("CHATGPT • NATIVE") }
+    if provider == "openai" {
+      let label = routerLocalized("CHATGPT • NATIVE")
+      guard store.dailyFallbackDays(days: 7) > 0 else { return label }
+      return "\(label) + \(routerLocalized("LOCAL FALLBACK"))"
+    }
     if provider == "grok-oauth" { return routerLocalized("XAI • OAUTH SESSION") }
     if provider == "grok-api" { return routerLocalized("XAI • METERED API") }
     if provider.hasSuffix("-api") || ["deepseek", "chutes", "orca"].contains(provider) {
@@ -719,9 +723,11 @@ private struct IslandOverlayView: View {
   }
 
   private var tokenSourceDetail: String {
-    store.selectedUsageUsesChatGPT
-      ? routerLocalized("ChatGPT account usage")
-      : routerLocalized("Measured by this router")
+    guard store.selectedUsageUsesChatGPT else { return routerLocalized("Measured by this router") }
+    if store.dailyFallbackDays(days: 7) > 0 {
+      return routerLocalized("OpenAI account usage; missing dates use local router fallback")
+    }
+    return routerLocalized("ChatGPT account usage")
   }
 
 }
@@ -790,6 +796,15 @@ private struct IslandUsageLineChart: View {
               tint.opacity(0.78),
               style: StrokeStyle(lineWidth: 1.25, lineCap: .round, lineJoin: .round)
             )
+
+          ForEach(Array(points.enumerated()), id: \.element.id) { index, point in
+            if point.isRouterFallback, coordinates.indices.contains(index) {
+              Circle()
+                .stroke(routerYellow, style: StrokeStyle(lineWidth: 1, dash: [2, 2]))
+                .frame(width: 7, height: 7)
+                .position(coordinates[index])
+            }
+          }
         }
 
         if showsAxis {
@@ -851,7 +866,9 @@ private struct IslandUsageLineChart: View {
       }
     }
     .onAppear { animateReveal() }
-    .onChange(of: points.map(\.tokens)) { _ in animateReveal() }
+    // Compare the Equatable points value, not a freshly mapped array allocated
+    // on every body pass (which interacted poorly with store reads during layout).
+    .onChange(of: points) { _ in animateReveal() }
     .onChange(of: reduceMotion) { _ in animateReveal() }
     .accessibilityElement(children: .ignore)
     .accessibilityLabel(routerLocalized("Daily token usage line chart"))
@@ -932,7 +949,9 @@ private struct IslandUsageLineChart: View {
   private func hoverText(for point: DailyUsagePoint) -> String {
     let date = point.date.formatted(.dateTime.month(.abbreviated).day())
     let tokens = Int64(point.tokens).formatted(.number.grouping(.automatic))
-    return RouterLanguage.isSimplifiedChinese ? "\(date) · \(tokens) token" : "\(date) · \(tokens) tok"
+    let text = RouterLanguage.isSimplifiedChinese ? "\(date) · \(tokens) token" : "\(date) · \(tokens) tok"
+    guard point.isRouterFallback else { return text }
+    return "\(text) · \(routerLocalized("local fallback"))"
   }
 }
 
@@ -1073,6 +1092,7 @@ struct ProviderIcon: View {
     if providerID == "venice" { return "venice" }
     if providerID == "nousresearch" { return "nousresearch" }
     if providerID == "openrouter" { return "openrouter" }
+    if providerID == "nano-gpt" { return "nano-gpt" }
     // opencode-free plus the opencode-go API/Messages/Responses routes.
     if providerID.hasPrefix("opencode") { return "opencode-free" }
     if providerID == "kilo-free" { return "kilo-free" }
@@ -1089,7 +1109,7 @@ struct ProviderIcon: View {
   private var assetExtension: String {
     // Keyed off the asset, not the provider id, so every route sharing a mark
     // (opencode-go and friends) resolves the same file type.
-    ["github-copilot", "chutes", "opencode-free", "kilo-free"].contains(assetName ?? "") ? "svg" : "png"
+    ["github-copilot", "chutes", "opencode-free", "kilo-free", "nano-gpt"].contains(assetName ?? "") ? "svg" : "png"
   }
 
   private var providerName: String {
@@ -1108,6 +1128,7 @@ struct ProviderIcon: View {
     if providerID == "venice" { return "Venice" }
     if providerID == "nousresearch" { return "Nous Research" }
     if providerID == "openrouter" { return "OpenRouter" }
+    if providerID == "nano-gpt" { return "NanoGPT" }
     if providerID == "opencode-free" { return "OpenCode Free" }
     if providerID == "kilo-free" { return "Kilo Free" }
     // Deliberately not a vendor name: this provider is a container for
@@ -1717,7 +1738,7 @@ private struct MetricTile: View {
 
 @MainActor
 final class DesktopPanelWindowController {
-  static let panelSize = CGSize(width: 340, height: 432)
+  static let panelSize = CGSize(width: 356, height: 440)
   private static let frameName = "ModelRouterTray.desktopPanel"
   private let window: NSPanel
   private let store: RouterStore
@@ -1773,75 +1794,223 @@ final class DesktopPanelWindowController {
 
 private struct DesktopPanelView: View {
   @ObservedObject var store: RouterStore
+  @State private var range: UsageRange = .week
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 11) {
-      HStack(spacing: 10) {
-        LiveOrb(state: store.activityState, count: store.activeChatCount)
-        VStack(alignment: .leading, spacing: 2) {
-          Text(store.activityState.label)
-            .font(.system(size: 14, weight: .semibold, design: .rounded))
-          Text(store.activitySummaryLabel)
+    VStack(alignment: .leading, spacing: 0) {
+      header
+
+      Rectangle()
+        .fill(Color.white.opacity(0.07))
+        .frame(height: 0.5)
+        .padding(.vertical, 12)
+
+      HStack(alignment: .bottom, spacing: 12) {
+        VStack(alignment: .leading, spacing: 3) {
+          Text(routerLocalized("Daily token usage").uppercased())
+            .font(.system(size: 8, weight: .bold, design: .monospaced))
+            .tracking(0.9)
+            .foregroundStyle(routerMuted)
+          Text(DesktopWidgetPresentation.tokenCountLabel(store.selectedTodayTokens))
+            .font(.system(size: 30, weight: .medium, design: .rounded))
+            .tracking(-0.8)
+            .monospacedDigit()
+            .lineLimit(1)
+            .minimumScaleFactor(0.68)
+        }
+
+        Spacer(minLength: 4)
+
+        VStack(alignment: .trailing, spacing: 5) {
+          HStack(spacing: 6) {
+            ProviderIcon(providerID: store.selectedUsageProviderID, size: 14)
+            Text(store.selectedUsageProvider.shortName)
+              .font(.system(size: 10, weight: .semibold, design: .rounded))
+              .lineLimit(1)
+          }
+          Text(store.selectedUsageText ?? routerLocalized("Awaiting data"))
             .font(.system(size: 9, weight: .medium, design: .rounded))
-            .foregroundStyle(store.activityState.tint)
+            .foregroundStyle(store.selectedUsageText == nil ? routerMuted : store.activityState.tint)
             .lineLimit(1)
         }
-        Spacer()
-        Text(routerLocalized("ROUTER"))
-          .font(.system(size: 8, weight: .bold, design: .monospaced))
-          .tracking(1.1)
-          .foregroundStyle(routerMuted)
       }
+      .frame(minHeight: 59)
 
       if store.hasConcurrentActivity {
-        ActiveRequestList(store: store, limit: 3, compact: true)
+        ActiveRequestList(store: store, limit: 2, compact: true)
+          .padding(.top, 10)
+      } else {
+        activityStrip
+          .padding(.top, 10)
       }
 
-      Text(routerLocalized("QUOTAS"))
-        .font(.system(size: 8, weight: .semibold, design: .monospaced))
-        .tracking(0.8)
-        .foregroundStyle(routerMuted)
+      sectionHeading(routerLocalized("Quota resets"), trailing: quotaSummary)
+        .padding(.top, 14)
 
       if store.desktopQuotaRows.isEmpty {
         Text(routerLocalized("Connect a provider to see its quota here."))
           .font(.system(size: 10, design: .rounded))
           .foregroundStyle(routerMuted)
+          .frame(maxWidth: .infinity, minHeight: 64, alignment: .leading)
       } else {
         ScrollView(.vertical, showsIndicators: false) {
-          VStack(spacing: 8) {
+          VStack(spacing: 9) {
             ForEach(store.desktopQuotaRows) { row in
               DesktopQuotaBarRow(row: row)
             }
           }
         }
-        .frame(maxHeight: 190)
+        .frame(maxHeight: 128)
       }
 
       Spacer(minLength: 0)
 
-      HStack(alignment: .firstTextBaseline) {
-        Text(routerLocalized("DAILY TOKENS"))
-          .font(.system(size: 8, weight: .semibold, design: .monospaced))
-          .tracking(0.8)
+      HStack(alignment: .center, spacing: 8) {
+        Text(routerLocalized("Router traffic").uppercased())
+          .font(.system(size: 8, weight: .bold, design: .monospaced))
+          .tracking(0.9)
           .foregroundStyle(routerMuted)
         Spacer()
-        Text(routerLocalized("LAST 7 DAYS"))
-          .font(.system(size: 8, weight: .semibold, design: .monospaced))
-          .tracking(0.6)
-          .foregroundStyle(routerMuted)
+        compactRangePicker
       }
-      IslandUsageLineChart(points: store.dailyUsage(days: 7), tint: routerAccent)
-        .frame(height: 54)
+      .padding(.bottom, 5)
+
+      IslandUsageLineChart(points: store.dailyUsage(days: range.rawValue), tint: routerAccent)
+        .id("desktop-\(store.selectedUsageProviderID)-\(range.rawValue)")
+        .frame(height: 52)
     }
-    .padding(16)
+    .padding(17)
     .background(
-      RoundedRectangle(cornerRadius: 20, style: .continuous)
-        .fill(islandBezel.opacity(0.97))
+      ZStack {
+        RoundedRectangle(cornerRadius: 22, style: .continuous)
+          .fill(islandBezel.opacity(0.985))
+        LinearGradient(
+          colors: [routerAccent.opacity(0.11), Color.clear, routerMint.opacity(0.025)],
+          startPoint: .topLeading,
+          endPoint: .bottomTrailing
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+      }
     )
     .overlay(
-      RoundedRectangle(cornerRadius: 20, style: .continuous)
-        .stroke(Color.white.opacity(0.09), lineWidth: 0.8)
+      RoundedRectangle(cornerRadius: 22, style: .continuous)
+        .stroke(Color.white.opacity(0.11), lineWidth: 0.8)
     )
+    .accessibilityElement(children: .contain)
+    .accessibilityLabel("Codex Router usage widget")
+  }
+
+  private var header: some View {
+    HStack(spacing: 10) {
+      Image(systemName: "point.3.filled.connected.trianglepath.dotted")
+        .font(.system(size: 14, weight: .semibold))
+        .foregroundStyle(routerAccent)
+        .frame(width: 26, height: 26)
+        .background(routerAccent.opacity(0.12), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+      VStack(alignment: .leading, spacing: 1) {
+        Text("Codex Router")
+          .font(.system(size: 12, weight: .semibold, design: .rounded))
+        Text(routerLocalized("Usage and live activity"))
+          .font(.system(size: 8.5, weight: .medium, design: .rounded))
+          .foregroundStyle(routerMuted)
+      }
+
+      Spacer()
+
+      HStack(spacing: 6) {
+        Circle()
+          .fill(store.activityState.tint)
+          .frame(width: 5, height: 5)
+        Text(store.activityState.label.uppercased())
+          .font(.system(size: 8, weight: .bold, design: .monospaced))
+          .tracking(0.7)
+          .foregroundStyle(store.activityState.tint)
+      }
+    }
+  }
+
+  private var activityStrip: some View {
+    HStack(spacing: 8) {
+      LiveOrb(state: store.activityState, count: store.activeChatCount)
+        .scaleEffect(0.78)
+        .frame(width: 24, height: 24)
+      VStack(alignment: .leading, spacing: 1) {
+        Text(store.activitySummaryLabel)
+          .font(.system(size: 10, weight: .semibold, design: .rounded))
+          .foregroundStyle(store.activityState.tint)
+        Text(activityDetail)
+          .font(.system(size: 8.5, weight: .medium, design: .rounded))
+          .foregroundStyle(routerMuted)
+          .lineLimit(1)
+      }
+      Spacer()
+      if let speed = store.activeModelObservedTokensPerSecond {
+        Text(String(format: "%.1f tok/s", speed))
+          .font(.system(size: 9, weight: .semibold, design: .monospaced))
+          .foregroundStyle(routerMint)
+          .monospacedDigit()
+      }
+    }
+    .padding(.horizontal, 10)
+    .frame(height: 38)
+    .background(Color.white.opacity(0.045), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    .overlay(
+      RoundedRectangle(cornerRadius: 12, style: .continuous)
+        .stroke(Color.white.opacity(0.07), lineWidth: 0.6)
+    )
+  }
+
+  private var activityDetail: String {
+    guard let request = store.activeRequests.last else {
+      return routerLocalized("Ready for the next request")
+    }
+    return "\(store.shortName(forProvider: request.provider)) / \(store.modelLabel(for: request))"
+  }
+
+  private var quotaSummary: String {
+    let count = store.desktopQuotaRows.count
+    if count == 0 { return routerLocalized("None") }
+    return RouterLanguage.isSimplifiedChinese ? "\(count) 个窗口" : "\(count) window\(count == 1 ? "" : "s")"
+  }
+
+  private func sectionHeading(_ title: String, trailing: String) -> some View {
+    HStack(alignment: .firstTextBaseline) {
+      Text(title.uppercased())
+        .font(.system(size: 8, weight: .bold, design: .monospaced))
+        .tracking(0.9)
+        .foregroundStyle(routerMuted)
+      Spacer()
+      Text(trailing.uppercased())
+        .font(.system(size: 7.5, weight: .semibold, design: .monospaced))
+        .tracking(0.5)
+        .foregroundStyle(routerMuted)
+    }
+    .padding(.bottom, 7)
+  }
+
+  private var compactRangePicker: some View {
+    HStack(spacing: 2) {
+      ForEach([UsageRange.week, .month]) { candidate in
+        Button {
+          range = candidate
+        } label: {
+          Text(candidate.label)
+            .font(.system(size: 8, weight: .bold, design: .monospaced))
+            .foregroundStyle(range == candidate ? routerText : routerMuted)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(
+              range == candidate ? Color.white.opacity(0.09) : Color.clear,
+              in: Capsule()
+            )
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(range == candidate ? .isSelected : [])
+      }
+    }
+    .padding(2)
+    .background(Color.white.opacity(0.035), in: Capsule())
   }
 }
 
@@ -1849,24 +2018,21 @@ private struct DesktopQuotaBarRow: View {
   let row: DesktopQuotaRow
 
   private var tint: Color {
-    if row.remainingPercent <= 10 { return routerRed }
-    if row.remainingPercent <= 30 { return routerYellow }
-    return routerMint
+    switch DesktopWidgetPresentation.quotaSeverity(row.remainingPercent) {
+    case .critical: return routerRed
+    case .warning: return routerYellow
+    case .healthy: return routerMint
+    }
   }
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 3) {
+    VStack(alignment: .leading, spacing: 4) {
       HStack(spacing: 6) {
         ProviderIcon(providerID: row.providerID, size: 14)
-        Text("\(row.providerName) · \(row.label)")
+        Text(row.providerName)
           .font(.system(size: 10, weight: .medium, design: .rounded))
           .lineLimit(1)
         Spacer()
-        if let resetAt = row.resetAt {
-          Text(desktopResetLabel(resetAt))
-            .font(.system(size: 8, design: .rounded))
-            .foregroundStyle(routerMuted)
-        }
         Text("\(Int(row.remainingPercent.rounded()))% left")
           .font(.system(size: 10, weight: .semibold, design: .rounded))
           .monospacedDigit()
@@ -1881,26 +2047,54 @@ private struct DesktopQuotaBarRow: View {
         }
       }
       .frame(height: 4)
+
+      HStack(spacing: 6) {
+        Text(row.label)
+          .lineLimit(1)
+        Spacer()
+        if let resetAt = row.resetAt {
+          Text(resetCountdownLabel(Date(timeIntervalSince1970: resetAt)))
+            .monospacedDigit()
+        }
+      }
+      .font(.system(size: 8, weight: .medium, design: .rounded))
+      .foregroundStyle(routerMuted)
     }
+    .accessibilityElement(children: .ignore)
+    .accessibilityLabel(DesktopWidgetPresentation.quotaAccessibilityLabel(row))
   }
 }
 
-private func desktopResetLabel(_ epoch: TimeInterval) -> String {
-  let seconds = epoch - Date().timeIntervalSince1970
-  if seconds <= 0 { return routerLocalized("resets soon") }
-  let minutes = Int(seconds / 60)
-  if minutes < 60 {
-    return RouterLanguage.isSimplifiedChinese
-      ? "将在 \(minutes) 分钟后重置"
-      : "resets in \(minutes)m"
+enum DesktopWidgetQuotaSeverity: Equatable {
+  case healthy
+  case warning
+  case critical
+}
+
+enum DesktopWidgetPresentation {
+  nonisolated static func tokenCountLabel(_ value: Double) -> String {
+    RouterWidgetTokenCount.from(value).formatted(.number.grouping(.automatic))
   }
-  let hours = minutes / 60
-  if hours < 24 {
-    return RouterLanguage.isSimplifiedChinese
-      ? "将在 \(hours) 小时后重置"
-      : "resets in \(hours)h"
+
+  nonisolated static func quotaSeverity(_ remainingPercent: Double) -> DesktopWidgetQuotaSeverity {
+    if remainingPercent <= 10 { return .critical }
+    if remainingPercent <= 30 { return .warning }
+    return .healthy
   }
-  return RouterLanguage.isSimplifiedChinese
-    ? "将在 \(hours / 24) 天 \(hours % 24) 小时后重置"
-    : "resets in \(hours / 24)d \(hours % 24)h"
+
+  nonisolated static func quotaAccessibilityLabel(
+    _ row: DesktopQuotaRow,
+    now: Date = Date()
+  ) -> String {
+    let remaining = "\(Int(row.remainingPercent.rounded())) percent left"
+    guard let resetAt = row.resetAt else {
+      return "\(row.providerName), \(row.label), \(remaining)"
+    }
+    let reset = resetCountdownLabel(
+      Date(timeIntervalSince1970: resetAt),
+      now: now,
+      chinese: false
+    )
+    return "\(row.providerName), \(row.label), \(remaining), \(reset)"
+  }
 }

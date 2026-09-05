@@ -30,8 +30,6 @@ const OVERLAYS = {
 - Treat shaped tool output as a compact view. Repeat its named source call only when omitted detail is necessary.`,
 };
 
-export const TOKEN_MAXXING_PRESSURE_RATIO = 0.7;
-
 export function instructionOverlayExists(name) {
   return typeof name === "string" && Object.hasOwn(OVERLAYS, name);
 }
@@ -40,25 +38,4 @@ export function applyInstructionOverlay(text, name) {
   if (typeof text !== "string" || !name) return text;
   const overlay = OVERLAYS[name];
   return overlay ? `${text}\n\n${overlay}` : text;
-}
-
-export function tokenMaxxingActive({
-  enabled = false,
-  estimatedTokens,
-  autoCompact,
-  pressureRatio = TOKEN_MAXXING_PRESSURE_RATIO,
-} = {}) {
-  if (!enabled) return false;
-  if (!Number.isFinite(estimatedTokens) || estimatedTokens < 0) return false;
-  if (!Number.isFinite(autoCompact) || autoCompact <= 0) return false;
-  if (!Number.isFinite(pressureRatio) || pressureRatio <= 0 || pressureRatio > 1) return false;
-  return estimatedTokens >= Math.ceil(autoCompact * pressureRatio);
-}
-
-export function applyTokenMaxxingOverlay(text, options = {}) {
-  if (options.active !== true && !tokenMaxxingActive(options)) return text;
-  const overlay = OVERLAYS["token-maxxing"];
-  return typeof text === "string" && text
-    ? `${text}\n\n${overlay}`
-    : overlay;
 }

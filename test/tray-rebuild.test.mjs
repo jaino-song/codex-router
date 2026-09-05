@@ -37,6 +37,7 @@ function macosTransactionFixture({
   previous = true,
   failed = false,
   targetName,
+  artifactSet,
 } = {}) {
   const parent = scratch();
   const transaction = path.join(parent, ".model-router-tray-transaction");
@@ -50,13 +51,16 @@ function macosTransactionFixture({
   if (targetName !== undefined) {
     writePrivateLine(path.join(transaction, "target-name"), targetName);
   }
+  if (artifactSet !== undefined) {
+    writePrivateLine(path.join(transaction, "artifact-set"), artifactSet);
+  }
   if (live) mkdirSync(bundle, { mode: 0o755 });
   if (previous) mkdirSync(path.join(transaction, "previous"), { mode: 0o755 });
   if (failed) mkdirSync(path.join(transaction, "failed"), { mode: 0o755 });
   return { parent, transaction, bundle };
 }
 
-function installCompleteMacosTrayBundle(bundle) {
+function installCompleteMacosTrayBundle(bundle, { includeWidget = true } = {}) {
   mkdirSync(path.join(bundle, "Contents", "MacOS"), { recursive: true });
   writeFileSync(
     path.join(bundle, "Contents", "Info.plist"),
@@ -66,6 +70,32 @@ function installCompleteMacosTrayBundle(bundle) {
   const nativeBinary = path.join(bundle, "Contents", "MacOS", "ModelRouterTray");
   writeFileSync(nativeBinary, "binary", "utf8");
   chmodSync(nativeBinary, 0o755);
+  if (includeWidget) {
+    const widgetBinary = path.join(
+      bundle,
+      "Contents",
+      "PlugIns",
+      "RouterUsageWidget.appex",
+      "Contents",
+      "MacOS",
+      "RouterUsageWidget",
+    );
+    mkdirSync(path.dirname(widgetBinary), { recursive: true });
+    writeFileSync(
+      path.join(
+        bundle,
+        "Contents",
+        "PlugIns",
+        "RouterUsageWidget.appex",
+        "Contents",
+        "Info.plist",
+      ),
+      "<plist><dict><key>CFBundleIdentifier</key><string>io.github.codex-router.tray.widget</string></dict></plist>",
+      "utf8",
+    );
+    writeFileSync(widgetBinary, "widget", "utf8");
+    chmodSync(widgetBinary, 0o755);
+  }
   const embedded = path.join(
     bundle,
     "Contents",
@@ -413,6 +443,20 @@ test("each companion fingerprints its own sources", () => {
   assert.equal(traySourceFingerprint(root, "aix"), "");
 });
 
+test("the macOS tray fingerprint includes its full-Xcode resolver", () => {
+  const fakeRoot = scratch();
+  try {
+    const resolver = path.join(fakeRoot, "src", "macos-developer-tools.mjs");
+    mkdirSync(path.dirname(resolver), { recursive: true });
+    writeFileSync(resolver, "before\n", "utf8");
+    const before = traySourceFingerprint(fakeRoot, "darwin");
+    writeFileSync(resolver, "after\n", "utf8");
+    assert.notEqual(traySourceFingerprint(fakeRoot, "darwin"), before);
+  } finally {
+    rmSync(fakeRoot, { recursive: true, force: true });
+  }
+});
+
 test("one companion location: the Node and shell sides name the same directory", () => {
   // Three copies of this path drifted apart before -- paths.mjs, the build
   // script default, and trayBundleDir -- which is how a machine ends up with a
@@ -426,7 +470,9 @@ test("one companion location: the Node and shell sides name the same directory",
 test("the macOS tray is signed only after its resources are assembled", () => {
   const script = readFileSync(path.join(root, "scripts", "build-macos-tray-app.sh"), "utf8");
   const resource = script.indexOf('Add :ModelRouterSourceRoot string $repo_dir');
-  const sign = script.indexOf('/usr/bin/codesign --force --deep --sign - "$bundle_dir"');
+  const storageMode = script.indexOf('Set :ModelRouterWidgetStorageMode $widget_storage_mode');
+  const firstSign = script.indexOf('/usr/bin/codesign --force --deep --sign "$signing_identity"');
+  const sign = script.indexOf('--entitlements "$tray_dir/Resources/ModelRouterTray.entitlements"');
   const verify = script.indexOf('/usr/bin/codesign --verify --deep --strict "$bundle_dir"');
   assert.ok(resource >= 0, "the checkout link must be placed in the bundle");
   assert.match(script, /trap cleanup_electron_output EXIT/);
@@ -437,6 +483,13 @@ test("the macOS tray is signed only after its resources are assembled", () => {
   assert.match(script, /Contents\/Resources\/Control Center\.app/);
   assert.match(script, /electron-builder[\s\S]*--mac dir/);
   assert.match(script, /Control Center\.app\/Contents\/Resources\/router-root/);
+  assert.match(script, /MODEL_ROUTER_CODESIGN_IDENTITY/);
+  assert.match(script, /widget_storage_mode=local/);
+  assert.match(script, /RouterUsageWidget\.local\.entitlements/);
+  assert.match(script, /widget_storage_mode=app-group/);
+  assert.match(script, /RouterUsageWidget\.entitlements/);
+  assert.ok(storageMode > resource, "the signed storage mode must follow bundle assembly");
+  assert.ok(firstSign > storageMode, "no nested signature may precede the final plist mutation");
   assert.ok(sign > resource, "signing must happen after the final resource write");
   assert.ok(verify > sign, "the completed signature must be verified");
   assert.doesNotMatch(
@@ -528,21 +581,30 @@ test("the macOS swap recovery planner stays deterministic without filesystem sem
   );
 });
 
-test("macOS transaction target markers are fixed-enum and old journals remain identifiable", {
+test("macOS transaction target and artifact markers are fixed-enum and old journals remain identifiable", {
   skip: process.platform === "win32",
 }, async () => {
   const legacy = macosTransactionFixture({ targetName: undefined });
-  const current = macosTransactionFixture({ targetName: "codex-router" });
+  const current = macosTransactionFixture({ targetName: "codex-router", artifactSet: "widget-v1" });
   const unknown = macosTransactionFixture({ targetName: "guess-a-target" });
+  const unknownArtifacts = macosTransactionFixture({ artifactSet: "guess-artifacts" });
   try {
-    assert.equal((await inspectMacosTrayTransaction(legacy.transaction)).targetName, null);
-    assert.equal((await inspectMacosTrayTransaction(current.transaction)).targetName, "codex-router");
+    const legacyTransaction = await inspectMacosTrayTransaction(legacy.transaction);
+    assert.equal(legacyTransaction.targetName, null);
+    assert.equal(legacyTransaction.artifactSet, null);
+    const currentTransaction = await inspectMacosTrayTransaction(current.transaction);
+    assert.equal(currentTransaction.targetName, "codex-router");
+    assert.equal(currentTransaction.artifactSet, "widget-v1");
     await assert.rejects(
       inspectMacosTrayTransaction(unknown.transaction),
       /target-name contains an unknown value/,
     );
+    await assert.rejects(
+      inspectMacosTrayTransaction(unknownArtifacts.transaction),
+      /artifact-set contains an unknown value/,
+    );
   } finally {
-    for (const fixture of [legacy, current, unknown]) {
+    for (const fixture of [legacy, current, unknown, unknownArtifacts]) {
       rmSync(fixture.parent, { recursive: true, force: true });
     }
   }
@@ -587,15 +649,18 @@ test("macOS swap journals produce a deterministic crash-recovery plan", {
   }
 });
 
-test("committed macOS recovery keeps rollback until every required bundle artifact is complete", {
+test("committed macOS recovery keeps rollback until every versioned bundle artifact is complete", {
   skip: process.platform === "win32",
 }, async () => {
-  const fixture = macosTransactionFixture({ phase: "committed" });
+  const fixture = macosTransactionFixture({ phase: "committed", artifactSet: "widget-v1" });
   const artifacts = [
     "Contents/MacOS/ModelRouterTray",
+    "Contents/PlugIns/RouterUsageWidget.appex/Contents/Info.plist",
+    "Contents/PlugIns/RouterUsageWidget.appex/Contents/MacOS/RouterUsageWidget",
     "Contents/Resources/Control Center.app/Contents/MacOS/Codex Router",
     "Contents/Resources/Control Center.app/Contents/Resources/app.asar",
   ];
+  const executableArtifacts = [artifacts[0], artifacts[2], artifacts[3]];
   try {
     installCompleteMacosTrayBundle(fixture.bundle);
     const transaction = await inspectMacosTrayTransaction(fixture.transaction);
@@ -624,7 +689,7 @@ test("committed macOS recovery keeps rollback until every required bundle artifa
       writeFileSync(artifact, "complete");
     }
 
-    for (const relative of artifacts.slice(0, 2)) {
+    for (const relative of executableArtifacts) {
       const executable = path.join(fixture.bundle, relative);
       chmodSync(executable, 0o644);
       await assert.rejects(
@@ -634,7 +699,33 @@ test("committed macOS recovery keeps rollback until every required bundle artifa
       chmodSync(executable, 0o755);
     }
 
-    const archive = path.join(fixture.bundle, artifacts[2]);
+    const widgetInfo = path.join(fixture.bundle, artifacts[1]);
+    rmSync(widgetInfo);
+    assert.equal(await inspectMacosTrayCommittedBundle(fixture.bundle), false);
+    const missingInfoPlan = spawnSync(
+      process.execPath,
+      [transactionCli, "plan", fixture.transaction, fixture.bundle],
+      { encoding: "utf8" },
+    );
+    assert.notEqual(missingInfoPlan.status, 0);
+    assert.match(missingInfoPlan.stderr, /committed live bundle is incomplete/);
+    const externalInfo = path.join(fixture.parent, "external-widget-info.plist");
+    writeFileSync(externalInfo, "outside");
+    symlinkSync(externalInfo, widgetInfo);
+    await assert.rejects(
+      inspectMacosTrayCommittedBundle(fixture.bundle),
+      /RouterUsageWidget\.appex\/Contents\/Info\.plist is not a regular file/,
+    );
+    rmSync(widgetInfo);
+    writeFileSync(widgetInfo, "complete");
+    chmodSync(widgetInfo, 0o666);
+    await assert.rejects(
+      inspectMacosTrayCommittedBundle(fixture.bundle),
+      /RouterUsageWidget\.appex\/Contents\/Info\.plist has unsafe permissions 666/,
+    );
+    chmodSync(widgetInfo, 0o644);
+
+    const archive = path.join(fixture.bundle, artifacts.at(-1));
     rmSync(archive);
     assert.equal(await inspectMacosTrayCommittedBundle(fixture.bundle), false);
     const incompletePlan = spawnSync(
@@ -658,6 +749,31 @@ test("committed macOS recovery keeps rollback until every required bundle artifa
       inspectMacosTrayCommittedBundle(fixture.bundle),
       /app\.asar has unsafe permissions 666/,
     );
+  } finally {
+    rmSync(fixture.parent, { recursive: true, force: true });
+  }
+});
+
+test("a committed pre-widget journal validates the legacy artifact set after upgrade", {
+  skip: process.platform === "win32",
+}, async () => {
+  const fixture = macosTransactionFixture({ phase: "committed" });
+  try {
+    installCompleteMacosTrayBundle(fixture.bundle, { includeWidget: false });
+    const transaction = await inspectMacosTrayTransaction(fixture.transaction);
+    assert.equal(transaction.artifactSet, null);
+    assert.equal(
+      await inspectMacosTrayCommittedBundle(fixture.bundle, { requireWidget: false }),
+      true,
+    );
+    assert.equal(await inspectMacosTrayCommittedBundle(fixture.bundle), false);
+    const result = spawnSync(
+      process.execPath,
+      [path.join(root, "src", "macos-tray-transaction.mjs"), "plan", fixture.transaction, fixture.bundle],
+      { encoding: "utf8" },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, "finalize none\n");
   } finally {
     rmSync(fixture.parent, { recursive: true, force: true });
   }
@@ -759,6 +875,7 @@ test("tray updates journal every macOS swap before replacing the live app", () =
   assert.match(mac, /if \[ ! -e "\$target_name_file" \]; then[\s\S]*recovery_bundle_dir=\$legacy_user_bundle[\s\S]*recovery_service_action=restart/);
   assert.match(mac, /mkdir -m 700 "\$transaction_dir"[\s\S]*chmod 600 "\$had_previous_file"/);
   assert.match(mac, /printf '%s\\n' codex-router >"\$target_name_file"[\s\S]*chmod 600 "\$target_name_file"/);
+  assert.match(mac, /printf '%s\\n' widget-v1 >"\$artifact_set_file"[\s\S]*chmod 600 "\$artifact_set_file"/);
   assert.match(mac, /both Codex Router\.app and the legacy Model Router\.app exist; refusing an ambiguous replacement/);
   assert.match(mac, /next_phase_file="\$transaction_dir\/phase\.next"[\s\S]*write_macos_phase\(\)[\s\S]*mv "\$next_phase_file" "\$phase_file"/);
   assert.ok(
@@ -927,6 +1044,8 @@ test("the native macOS tray owns one embedded Control Center", () => {
   assert.match(detached, /task\.standardInput = FileHandle\.nullDevice/);
   assert.match(detached, /task\.standardOutput = FileHandle\.nullDevice/);
   assert.match(detached, /task\.standardError = FileHandle\.nullDevice/);
+  assert.match(detached, /removeValue\(forKey: "CODEX_ROUTER_OWNER_SIGNAL_BUDGET_MS"\)/);
+  assert.match(detached, /removeValue\(forKey: "CODEX_ROUTER_OWNER_SIGNAL_BARRIER_DIR"\)/);
   assert.match(detached, /try task\.run\(\)/);
   assert.doesNotMatch(detached, /waitUntilExit/);
 });
@@ -968,6 +1087,26 @@ test("macOS resource-only changes invalidate the native bundle fingerprint", () 
   }
 });
 
+test("macOS widget changes invalidate the native bundle fingerprint", () => {
+  for (const relative of [
+    ["scripts", "build-macos-widget.sh"],
+    ["apps", "macos", "RouterUsageWidget", "RouterUsageWidget", "RouterUsageWidget.swift"],
+    ["apps", "macos", "RouterUsageWidget", "project.yml"],
+  ]) {
+    const fakeRoot = scratch();
+    try {
+      const file = path.join(fakeRoot, ...relative);
+      mkdirSync(path.dirname(file), { recursive: true });
+      writeFileSync(file, "before\n", "utf8");
+      const before = traySourceFingerprint(fakeRoot, "darwin");
+      writeFileSync(file, "after\n", "utf8");
+      assert.notEqual(traySourceFingerprint(fakeRoot, "darwin"), before, relative.join("/"));
+    } finally {
+      rmSync(fakeRoot, { recursive: true, force: true });
+    }
+  }
+});
+
 test("Control Center fingerprints include renderer, build config, and shared icons", () => {
   for (const relative of [
     ["apps", "control-center", "index.html"],
@@ -990,7 +1129,7 @@ test("Control Center fingerprints include renderer, build config, and shared ico
   }
 });
 
-test("desktop icon generation uses the native routing mark for every shell", () => {
+test("desktop shells keep their routing mark while the Control Center sidebar stays text-only", () => {
   const script = readFileSync(path.join(root, "scripts", "build-app-icon.sh"), "utf8");
   assert.match(script, /ModelRouterTray\/Resources\/AppIcon\.svg/);
   for (const asset of ["32x32.png", "128x128.png", "128x128@2x.png", "icon.png", "icon.ico"]) {
@@ -999,7 +1138,8 @@ test("desktop icon generation uses the native routing mark for every shell", () 
   assert.match(script, /scripts\/build-ico\.mjs/);
 
   const renderer = readFileSync(path.join(root, "apps", "control-center", "src", "App.tsx"), "utf8");
-  assert.match(renderer, /assets\/32x32\.png/);
+  assert.doesNotMatch(renderer, /assets\/32x32\.png/);
+  assert.match(renderer, /<strong>Codex Router<\/strong>/);
   const builder = readFileSync(path.join(root, "apps", "control-center", "electron-builder.yml"), "utf8");
   assert.match(builder, /mac:[\s\S]*icon:\s*assets\/icon\.png/);
   assert.match(builder, /win:[\s\S]*icon:\s*assets\/icon\.ico/);
@@ -1010,6 +1150,28 @@ test("Control Center fingerprints include JavaScript model helpers and build ent
     ["apps", "control-center", "src", "model-families.mjs"],
     ["scripts", "build-electron-companion.sh"],
     ["scripts", "build-electron-companion.ps1"],
+  ]) {
+    const fakeRoot = scratch();
+    try {
+      const file = path.join(fakeRoot, ...relative);
+      mkdirSync(path.dirname(file), { recursive: true });
+      writeFileSync(file, "before\n", "utf8");
+      const before = traySourceFingerprint(fakeRoot, "linux");
+      writeFileSync(file, "after\n", "utf8");
+      assert.notEqual(traySourceFingerprint(fakeRoot, "linux"), before, relative.join("/"));
+    } finally {
+      rmSync(fakeRoot, { recursive: true, force: true });
+    }
+  }
+});
+
+test("Control Center fingerprints include every packaged security helper", () => {
+  for (const relative of [
+    ["src", "spawnable-command.mjs"],
+    ["src", "chatgpt-login-lease.mjs"],
+    ["src", "file-security.mjs"],
+    ["src", "path-security.mjs"],
+    ["src", "process-identity.mjs"],
   ]) {
     const fakeRoot = scratch();
     try {
@@ -1274,6 +1436,27 @@ test("menu bar provider marks reuse ProviderIcon instead of a second map", () =>
   assert.doesNotMatch(view, /NSImage\(contentsOfFile:/);
 });
 
+test("the macOS tray bundles NanoGPT's official provider mark", () => {
+  const icon = readFileSync(
+    path.join(root, "apps", "macos", "ModelRouterTray", "Sources", "Resources", "ProviderIcons", "nano-gpt.svg"),
+    "utf8",
+  );
+  const providerIcon = readFileSync(
+    path.join(root, "apps", "macos", "ModelRouterTray", "Sources", "IslandOverlay.swift"),
+    "utf8",
+  );
+  const sources = readFileSync(
+    path.join(root, "apps", "macos", "ModelRouterTray", "Resources", "PROVIDER-ICON-SOURCES.md"),
+    "utf8",
+  );
+
+  assert.match(icon, /aria-label="NanoGPT"/);
+  assert.match(icon, /data:image\/png;base64,/);
+  assert.match(providerIcon, /providerID == "nano-gpt" \{ return "nano-gpt" \}/);
+  assert.match(providerIcon, /providerID == "nano-gpt" \{ return "NanoGPT" \}/);
+  assert.match(sources, /https:\/\/nano-gpt\.com\/favicon\.ico/);
+});
+
 test("the status item keeps native square geometry in icon-only mode", () => {
   const source = readFileSync(
     path.join(root, "apps", "macos", "ModelRouterTray", "Sources", "ModelRouterTrayApp.swift"),
@@ -1290,6 +1473,22 @@ test("the status item keeps native square geometry in icon-only mode", () => {
     /\.frame\(width: store\.menuBarShowModelName \? Self\.reservedWidth : nil/,
   );
   assert.doesNotMatch(source, /\.frame\(minWidth: 18\)/);
+});
+
+test("the tray panel uses the status item's actual screen", () => {
+  const source = readFileSync(
+    path.join(root, "apps", "macos", "ModelRouterTray", "Sources", "ModelRouterTrayApp.swift"),
+    "utf8",
+  );
+  const repositionStart = source.indexOf("private func reposition()");
+  assert.ok(repositionStart > 0, "TrayMenuController still owns panel placement");
+  const reposition = source.slice(
+    repositionStart,
+    source.indexOf("private func installMonitors()", repositionStart),
+  );
+  assert.match(reposition, /buttonWindow\.screen\?\.visibleFrame/);
+  assert.doesNotMatch(reposition, /NSScreen\.screens\.map\(\\\.visibleFrame\)/);
+  assert.doesNotMatch(reposition, /TrayPanelPlacement\.visibleFrame/);
 });
 
 test("the active router status is baked into one SVG template image", () => {

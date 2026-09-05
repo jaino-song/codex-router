@@ -26,13 +26,15 @@ blue accent and DeepSeek's original blue mark are preserved.
 | Venice | https://venice.ai/ | https://venice.ai/apple-touch-icon.png |
 | Nous Research | https://nousresearch.com/ | https://nousresearch.com/apple-touch-icon.png |
 | OpenRouter | https://openrouter.ai/ | https://openrouter.ai/favicon/glyph.png |
+| NanoGPT | https://nano-gpt.com/ | https://nano-gpt.com/favicon.ico (same official diamond mark as https://nano-gpt.com/logo.png) |
 
 The Z.AI, Qwen, Ollama, Cline, MiniMax, and Meta AI marks were fetched on
 2026-08-15. The Venice, Nous Research, and OpenRouter marks were fetched on
 2026-08-23 and stored as the same monochrome white-on-transparent adaptation
 the other single-color marks use, because all three ship dark artwork that
 would be invisible against the Island's black bezel. The opencode-go routes reuse the OpenCode Free mark rather than
-shipping a duplicate asset. `custom` deliberately ships no mark at all: it is a
+shipping a duplicate asset. The NanoGPT mark was fetched on 2026-08-29 and is
+bundled losslessly from the official favicon. `custom` deliberately ships no mark at all: it is a
 container for whatever endpoints an operator puts in it, and its models come
 from different vendors, so any single logo would misattribute the rest.
 

@@ -8,8 +8,8 @@
       "provider": "commandcode",
       "listed": true,
       "displayName": "GLM-5.3-Flash (Command Code)",
-      "description": "GLM-5.3-Flash through the Command Code Provider API. The 1M-context route uses the model's low/high/max reasoning ladder.",
-      "priority": 102,
+      "description": "GLM-5.3-Flash through the Command Code Provider API. The model's thinking is always enabled with low/high/max reasoning ladder.",
+      "priority": 103,
       "defaultEffort": "max",
       "reasoningLevels": [
         {
@@ -18,7 +18,7 @@
         },
         {
           "effort": "high",
-          "description": "Deep reasoning with thinking enabled"
+          "description": "Deep reasoning"
         },
         {
           "effort": "max",
@@ -26,9 +26,10 @@
         }
       ],
       "contextWindow": 1000000,
-      "autoCompact": 400000,
+      "autoCompact": 900000,
       "inputModalities": [
-        "text"
+        "text",
+        "image"
       ],
       "compHash": "commandcode-glm-5-3-flash-v1"
     }

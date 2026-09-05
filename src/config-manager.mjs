@@ -20,7 +20,6 @@ import { findCodexBinary, spawnableCommand } from "./codex-binary.mjs";
 
 import {
   assertCallerSecret,
-  callerBaseUrl,
   isManagedCallerBaseUrl,
   redactCallerUrl,
 } from "./caller-auth.mjs";
@@ -28,6 +27,10 @@ import {
   privateFileIsProtected,
   protectPrivateFile,
 } from "./file-security.mjs";
+import {
+  refreshCodexCallerCapabilityContents,
+  refreshCodexCallerCapabilityState,
+} from "./caller-key-client-refresh.mjs";
 import {
   clearCodexRouterDefault,
   readCodexRouterDefault,
@@ -54,6 +57,7 @@ import {
   MERGED_CATALOG_PATH,
   PORTS,
   SIGNED_PROVIDER_MODE_PATH,
+  SOURCE_ROOT,
   loopback,
 } from "./paths.mjs";
 import { scanTomlDocument } from "./toml-structure.mjs";
@@ -107,13 +111,34 @@ const defaultRealtimeWebsocketBaseUrl = "https://api.openai.com/v1";
 function tomlValue(value) {
   return JSON.stringify(value);
 }
+
+function managedCallerAuthBlock(providerId) {
+  const headerId = /^[A-Za-z0-9_-]+$/.test(providerId)
+    ? providerId
+    : JSON.stringify(providerId);
+  return [
+    `[model_providers.${headerId}.auth]`,
+    `command = ${tomlValue(process.execPath)}`,
+    `args = [${tomlValue(path.join(SOURCE_ROOT, "src", "caller-key-auth-command.mjs"))}, ${tomlValue(CALLER_SECRET_PATH)}]`,
+    "timeout_ms = 5000",
+    "refresh_interval_ms = 0",
+  ].join("\n");
+}
 const realtimeCallBaseUrlKey = "experimental_realtime_webrtc_call_base_url";
 const realtimeWebsocketBaseUrlKey = "experimental_realtime_ws_base_url";
 const markerPairs = [
   // The legacy layout parked the managed provider table inside the root
   // block, so the root pair recognizes that header as managed too.
-  [startMarker, endMarker, "[model_providers.codex-router]"],
-  [providerStartMarker, providerEndMarker, "[model_providers.codex-router]"],
+  [
+    startMarker,
+    endMarker,
+    ["[model_providers.codex-router]", "[model_providers.codex-router.auth]"],
+  ],
+  [
+    providerStartMarker,
+    providerEndMarker,
+    ["[model_providers.codex-router]", "[model_providers.codex-router.auth]"],
+  ],
   [
     signedProviderStartMarker,
     signedProviderEndMarker,
@@ -133,8 +158,8 @@ function configuredRouterBaseUrl() {
   if (!existsSync(CALLER_SECRET_PATH)) {
     throw new Error("The local router caller key is missing; run ./bin/doctor --fix.");
   }
-  const secret = assertCallerSecret(readFileSync(CALLER_SECRET_PATH, "utf8").trim());
-  return callerBaseUrl(PORTS.router, secret);
+  assertCallerSecret(readFileSync(CALLER_SECRET_PATH, "utf8").trim());
+  return loopback(PORTS.router, "/v1");
 }
 
 function isManagedRouterBaseUrl(value) {
@@ -177,10 +202,13 @@ function foreignTableSegments(innerLines, managedHeader) {
   // the scanner throw, which aborts the rewrite before anything is written —
   // the same fail-closed posture the signed-routing path takes.
   const { headers } = scanTomlDocument(innerLines.join("\n"));
+  const managedHeaders = new Set(
+    (Array.isArray(managedHeader) ? managedHeader : [managedHeader]).filter(Boolean),
+  );
   const hoisted = [];
   for (let position = 0; position < headers.length; position += 1) {
     const start = headers[position].index;
-    if (managedHeader && innerLines[start].trim() === managedHeader) continue;
+    if (managedHeaders.has(innerLines[start].trim())) continue;
     const end =
       position + 1 < headers.length ? headers[position + 1].index : innerLines.length;
     hoisted.push(...innerLines.slice(start, end));
@@ -377,7 +405,15 @@ function withManagedMultiAgentV2(input) {
   }
   let tableEnd = featuresHeader + 1;
   while (tableEnd < lines.length && !/^\s*\[/.test(lines[tableEnd])) tableEnd += 1;
-  lines.splice(tableEnd, 0, ...managedLines, "");
+  // Keep the managed feature inside the table content and reuse the table's
+  // existing trailing separator. Inserting after those blanks and appending
+  // another one made every disable -> enable cycle grow the config by one line.
+  let insertionIndex = tableEnd;
+  while (insertionIndex > featuresHeader + 1 && !lines[insertionIndex - 1].trim()) {
+    insertionIndex -= 1;
+  }
+  const hasTableSeparator = insertionIndex < tableEnd;
+  lines.splice(insertionIndex, 0, ...managedLines, ...(hasTableSeparator ? [] : [""]));
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
@@ -583,7 +619,7 @@ function managedSignedProviderBlock(providerId, baseUrl) {
     // the provider half enabled; the catalog's supports_search_tool field is
     // the per-model gate.
     "supports_standalone_web_search = true",
-    "supports_websockets = false",
+    "supports_websockets = true",
     signedProviderEndMarker,
   ].join("\n");
 }
@@ -600,7 +636,47 @@ function managedLoginFreeProviderBlock(providerId, baseUrl) {
     'wire_api = "responses"',
     "requires_openai_auth = false",
     "supports_standalone_web_search = true",
+    "supports_websockets = true",
+    managedCallerAuthBlock(providerId),
+    signedProviderEndMarker,
+  ].join("\n");
+}
+
+// The immediately previous managed shape advertised the HTTP fallback even
+// after standalone search was added. Accept that exact signed block during an
+// update so enabling the new edge transport cannot turn router-owned state
+// into apparent user drift.
+function managedSignedProviderBlockHttpFallback(providerId, baseUrl) {
+  const headerId = /^[A-Za-z0-9_-]+$/.test(providerId)
+    ? providerId
+    : JSON.stringify(providerId);
+  return [
+    signedProviderStartMarker,
+    `[model_providers.${headerId}]`,
+    'name = "Codex Router (with ChatGPT)"',
+    `base_url = ${JSON.stringify(baseUrl)}`,
+    'wire_api = "responses"',
+    "requires_openai_auth = true",
+    "supports_standalone_web_search = true",
     "supports_websockets = false",
+    signedProviderEndMarker,
+  ].join("\n");
+}
+
+function managedLoginFreeProviderBlockHttpFallback(providerId, baseUrl) {
+  const headerId = /^[A-Za-z0-9_-]+$/.test(providerId)
+    ? providerId
+    : JSON.stringify(providerId);
+  return [
+    signedProviderStartMarker,
+    `[model_providers.${headerId}]`,
+    'name = "Codex Router (external models)"',
+    `base_url = ${JSON.stringify(baseUrl)}`,
+    'wire_api = "responses"',
+    "requires_openai_auth = false",
+    "supports_standalone_web_search = true",
+    "supports_websockets = false",
+    managedCallerAuthBlock(providerId),
     signedProviderEndMarker,
   ].join("\n");
 }
@@ -643,6 +719,7 @@ function managedLoginFreeProviderBlockLegacy(providerId, baseUrl) {
 function managedSignedProviderBlockMatches(actual, providerId, baseUrl) {
   return [
     managedSignedProviderBlock(providerId, baseUrl),
+    managedSignedProviderBlockHttpFallback(providerId, baseUrl),
     managedSignedProviderBlockLegacy(providerId, baseUrl),
   ].includes(actual);
 }
@@ -650,6 +727,7 @@ function managedSignedProviderBlockMatches(actual, providerId, baseUrl) {
 function managedLoginFreeProviderBlockMatches(actual, providerId, baseUrl) {
   return [
     managedLoginFreeProviderBlock(providerId, baseUrl),
+    managedLoginFreeProviderBlockHttpFallback(providerId, baseUrl),
     managedLoginFreeProviderBlockLegacy(providerId, baseUrl),
   ].includes(actual);
 }
@@ -747,11 +825,14 @@ function signedProviderBlockIsOwned(contents, state) {
   const blockMatches = state.loginFree
     ? managedLoginFreeProviderBlockMatches(actual, state.managedProvider, state.managedBaseUrl)
     : managedSignedProviderBlockMatches(actual, state.managedProvider, state.managedBaseUrl);
+  const providerTreeInsideManagedBlock =
+    providerRanges.length >= 1 &&
+    providerRanges[0].start === range.start + 1 &&
+    providerRanges.every(({ start }) => start > range.start && start < range.end);
   return (
     blockMatches &&
     slotIndex + 1 === range.start &&
-    providerRanges.length === 1 &&
-    providerRanges[0].start === range.start + 1
+    providerTreeInsideManagedBlock
   );
 }
 
@@ -1049,7 +1130,12 @@ function legacyManagedRouterProvider(contents) {
     fields.get("wire_api") === "responses";
   const currentShape =
     (fields.size === 3 ||
-      (fields.size === 4 && fields.get("supports_standalone_web_search") === "true")) &&
+      (fields.size === 4 &&
+        (fields.get("supports_standalone_web_search") === "true" ||
+          fields.get("requires_openai_auth") === "true")) ||
+      (fields.size === 5 &&
+        fields.get("supports_standalone_web_search") === "true" &&
+        fields.get("requires_openai_auth") === "true")) &&
     fields.get("name") === "Codex Router (external models)";
   const prototypeShape =
     (fields.size === 4 ||
@@ -1177,6 +1263,22 @@ function snapshot(contents) {
     ? providerModeStateIsOwned(contents, providerModeState)
     : false;
   const routerDefault = readCodexRouterDefault();
+  const managedRouterUrlPresent = contents.split("\n").some((line) => {
+    if (!/^\s*(?:openai_base_url|base_url)\s*=/.test(line)) return false;
+    return isManagedRouterBaseUrl(assignmentValue(line));
+  });
+  const managedRouterArtifactsPresent =
+    managedRouterUrlPresent ||
+    catalog === MERGED_CATALOG_PATH ||
+    [
+      startMarker,
+      endMarker,
+      providerStartMarker,
+      providerEndMarker,
+      signedProviderStartMarker,
+      signedProviderEndMarker,
+      signedProviderSlotPrefix,
+    ].some((marker) => contents.includes(marker));
   return {
     mode:
       isManagedRouterBaseUrl(baseUrl) && catalog === MERGED_CATALOG_PATH
@@ -1194,6 +1296,7 @@ function snapshot(contents) {
       signedActive && privateFileIsProtected(SIGNED_PROVIDER_MODE_PATH),
     ),
     signed_provider_state_present: existsSync(SIGNED_PROVIDER_MODE_PATH),
+    managed_router_artifacts_present: managedRouterArtifactsPresent,
     router_default_model: routerDefault?.model || null,
     router_default_managed: Boolean(routerDefault),
     openai_base_url: baseUrl ? redactCallerUrl(baseUrl) : null,
@@ -1219,7 +1322,7 @@ function restoreRouterDefault(contents, state = readCodexRouterDefault()) {
   )}\n`;
 }
 
-function enabledContents(contents) {
+function enabledContents(contents, { loginFreeProvider = false } = {}) {
   const { rootLines: currentRoot } = splitRoot(contents);
   const currentProvider = rootValue(currentRoot, "model_provider");
   const preparedSource = adoptNativeCatalog
@@ -1307,6 +1410,9 @@ function enabledContents(contents) {
     // selected catalog model's supports_search_tool value before exposing the
     // standalone web-search client tool.
     "supports_standalone_web_search = true",
+    ...(loginFreeProvider
+      ? ["requires_openai_auth = false", managedCallerAuthBlock(routerProviderId)]
+      : ["requires_openai_auth = true"]),
     providerEndMarker,
   ];
   return withManagedAgentConcurrency(
@@ -1373,6 +1479,7 @@ if (!new Set([
   "enable",
   "disable",
   "status",
+  "caller-capability-refresh",
   "login-free-enable",
   "login-free-disable",
   "signed-enable",
@@ -1381,7 +1488,7 @@ if (!new Set([
   "router-default-clear",
 ]).has(command)) {
   console.error(
-    "Usage: config-manager.mjs enable|disable|status|login-free-enable|login-free-disable|signed-enable|signed-disable|router-default-set MODEL|router-default-clear [--adopt-native-catalog]",
+    "Usage: config-manager.mjs enable|disable|status|caller-capability-refresh|login-free-enable|login-free-disable|signed-enable|signed-disable|router-default-set MODEL|router-default-clear [--adopt-native-catalog]",
   );
   process.exit(2);
 }
@@ -1429,6 +1536,23 @@ if (
     completeLoginFreeRefresh)
 ) {
   throw new Error("No login-free catalog refresh is pending; refusing internal refresh step.");
+}
+if (command === "caller-capability-refresh") {
+  const currentStatus = snapshot(current);
+  if (currentStatus.mode !== "router") {
+    throw new Error("Codex Router is not the active managed route; refusing caller capability refresh.");
+  }
+  const nextBase = configuredRouterBaseUrl();
+  const nextContents = refreshCodexCallerCapabilityContents(current, nextBase, { port: PORTS.router, legacyPort: LEGACY_PORTS.router });
+  const providerState = readProviderModeState();
+  const signedState = readSignedProviderModeState();
+  const nextProviderState = providerState ? refreshCodexCallerCapabilityState(providerState, nextBase, { port: PORTS.router, legacyPort: LEGACY_PORTS.router }) : undefined;
+  const nextSignedState = signedState ? refreshCodexCallerCapabilityState(signedState, nextBase, { port: PORTS.router, legacyPort: LEGACY_PORTS.router }) : undefined;
+  atomicWrite(nextContents);
+  if (nextProviderState) writeProviderModeState(nextProviderState);
+  if (nextSignedState) writeSignedProviderModeState(nextSignedState);
+  process.stdout.write(`${JSON.stringify({ refreshed: true })}\n`);
+  process.exit(0);
 }
 let next;
 let pendingProviderModeState;
@@ -1488,7 +1612,10 @@ if (command === "enable") {
     }
     // Keep the v1 state intact so login-free-disable can still restore the
     // provider and model captured by the older router.
-    next = enabledContents(resumable ? applyRefreshJournalModel(current, journal) : current);
+    next = enabledContents(
+      resumable ? applyRefreshJournalModel(current, journal) : current,
+      { loginFreeProvider: true },
+    );
     if (resumable) {
       next = `${replaceRootValueInPlace(next, "model_provider", routerProviderId)}\n`;
     }
@@ -1513,6 +1640,7 @@ if (command === "enable") {
       : current;
     const enabled = enabledContents(
       resumable ? applyRefreshJournalModel(restored, journal) : restored,
+      { loginFreeProvider: providerState.mode === "root-openai" },
     );
     if (providerState.mode === "root-openai") {
       // Current Codex Desktop builds reserve the built-in `openai` provider id,
@@ -1635,7 +1763,9 @@ if (command === "enable") {
     // A v1 install already selected codex-router. Refresh it without changing
     // the old restore record; disabling remains able to put both original
     // root assignments back exactly.
-    next = enabledContents(withLoginFreeModel(defaultRestored));
+    next = enabledContents(withLoginFreeModel(defaultRestored), {
+      loginFreeProvider: true,
+    });
     if (!active) next = `${replaceRootValue(next, "model_provider", routerProviderId)}\n`;
   } else if (state) {
     const active = providerModeStateIsOwned(current, state);
@@ -1654,7 +1784,9 @@ if (command === "enable") {
     const restored = active
       ? restoreSignedProviderTable(defaultRestored, state)
       : defaultRestored;
-    const enabled = enabledContents(withLoginFreeModel(restored));
+    const enabled = enabledContents(withLoginFreeModel(restored), {
+      loginFreeProvider: state.mode === "root-openai",
+    });
     if (state.mode === "root-openai") {
       pendingProviderModeState = switchedProviderModeState(rootLines, state);
       next = `${replaceRootValue(enabled, "model_provider", routerProviderId)}\n`;
@@ -1669,7 +1801,9 @@ if (command === "enable") {
       pendingProviderModeState = providerModeStateFromManaged(refreshed.state, state);
     }
   } else {
-    const enabled = enabledContents(withLoginFreeModel(defaultRestored));
+    const enabled = enabledContents(withLoginFreeModel(defaultRestored), {
+      loginFreeProvider: currentProvider === "openai",
+    });
     if (currentProvider === "openai") {
       pendingProviderModeState = switchedProviderModeState(rootLines);
       next = `${replaceRootValue(enabled, "model_provider", routerProviderId)}\n`;

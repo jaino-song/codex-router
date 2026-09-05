@@ -29,6 +29,7 @@ for (const name of ["DEEPSEEK_API_KEY", "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY
 const {
   addCredentialReference,
   createCredentialReference,
+  generatedCredentialId,
   migrateProviderCredentialStore,
   PROVIDER_CREDENTIAL_SCHEMA_VERSION,
   readProviderCredentialStore,
@@ -48,12 +49,29 @@ const {
 } = await import("../src/provider-credentials.mjs");
 const { PROVIDERS } = await import("../src/model-registry.mjs");
 const { privateFileIsProtected } = await import("../src/file-security.mjs");
+const { validateGenericProvider } = await import("../src/generic-provider-state.mjs");
 
 test.after(() => rmSync(root, { recursive: true, force: true }));
 
 function ref(providerId = "deepseek") {
   return { type: "provider-file", providerId, target: "codex" };
 }
+
+test("generated credential ids stay valid when raw base64url starts with dash or underscore", () => {
+  for (const [firstByte, rawPrefix] of [[0xf8, "-"], [0xfc, "_"]]) {
+    const bytes = Buffer.alloc(18);
+    bytes[0] = firstByte;
+    assert.equal(bytes.toString("base64url")[0], rawPrefix);
+    const id = generatedCredentialId(() => bytes);
+    assert.equal(id.slice(0, 7), `cred_r${rawPrefix}`);
+    assert.equal(validateGenericProvider({
+      id: `credential-id-${firstByte}`,
+      displayName: "Credential id fixture",
+      baseUrl: "https://provider.example.test/v1",
+      credentialRef: id,
+    }).credentialRef, id);
+  }
+});
 
 async function holdStateLock(filePath, milliseconds = 350) {
   const script = `
@@ -339,7 +357,7 @@ test("credential references written by every client resolve through the shared r
       resolved: credential?.value === "TEST_SHARED_PLANE_SECRET",
     }));
   `;
-  for (const client of ["codex", "dsh", "gemini"]) {
+  for (const client of ["codex", "dsh", "gemini", "cursor", "claude", "openclaw"]) {
     const result = JSON.parse(execFileSync(process.execPath, [
       "--input-type=module",
       "--eval",
@@ -359,7 +377,7 @@ test("credential references written by every client resolve through the shared r
     });
   }
   const stored = JSON.parse(readFileSync(storePath, "utf8"));
-  assert.equal(stored.credentials.length, 3);
+  assert.equal(stored.credentials.length, 6);
   assert.deepEqual(new Set(stored.credentials.map((entry) => entry.secretRef.target)), new Set(["codex"]));
 });
 

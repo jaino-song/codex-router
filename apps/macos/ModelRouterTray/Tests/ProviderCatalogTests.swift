@@ -60,14 +60,49 @@ struct ProviderCatalogTests {
       source.contains("const PROVIDER_ID = /^[a-z0-9][a-z0-9-]{0,80}$/;"),
       "PROVIDER_ID in ipc.mjs changed; update ProviderCatalogInput to match"
     )
-    #expect(source.contains("const CATALOG_MUTATION_TIMEOUT_MS = 330_000;"))
+    #expect(source.contains("const CATALOG_MUTATION_TIMEOUT_MS = 1_320_000;"))
     #expect(source.contains("{ timeoutMs: 45_000 }"))
   }
 
   @Test("the tray's script timeouts are the Electron budgets")
   func timeoutsMatchElectron() {
     #expect(RouterScriptWatchdog.discoveryTimeout == 45)
-    #expect(RouterScriptWatchdog.catalogMutationTimeout == 330)
+    #expect(RouterScriptWatchdog.catalogMutationTimeout == 1_320)
+    #expect(RouterScriptWatchdog.catalogPublicationOperationTimeout == 1_280)
+    #expect(RouterScriptWatchdog.catalogControlOperationTimeout == 1_300)
+    #expect(RouterScriptWatchdog.processTreeCleanupReserve == 10)
+    #expect(RouterScriptWatchdog.antigravityOperationTimeout == 600)
+    #expect(RouterScriptWatchdog.antigravityRunnerTimeout == 660)
+    #expect(RouterScriptWatchdog.ordinaryOperationTimeout == 840)
+    #expect(RouterScriptWatchdog.defaultControlTimeout == 900)
+    #expect(
+      RouterScriptWatchdog.controlTimeout(arguments: ["credential", "deepseek"])
+        == 1_320
+    )
+    #expect(
+      RouterScriptWatchdog.controlTimeout(
+        arguments: ["probe-provider", "antigravity-oauth", "--live", "--yes"]
+      ) == 660
+    )
+    #expect(
+      RouterScriptWatchdog.controlTimeout(arguments: ["login", "antigravity-oauth"]) == 660
+    )
+    #expect(RouterScriptWatchdog.controlTimeout(arguments: ["providers", "--json"]) == 900)
+    #expect(
+      RouterScriptWatchdog.operationTimeout(arguments: ["credential", "deepseek"])
+        == 1_300
+    )
+    #expect(
+      RouterScriptWatchdog.operationTimeout(
+        arguments: ["probe-provider", "antigravity-oauth", "--live", "--yes"]
+      ) == 600
+    )
+    #expect(
+      RouterScriptWatchdog.operationOwnerTimeout(
+        arguments: ["probe-provider", "antigravity-oauth", "--live", "--yes"]
+      ) == 610
+    )
+    #expect(RouterScriptWatchdog.operationOwnerTimeout(arguments: ["providers", "--json"]) == 850)
   }
 
   @Test("credential boundaries supersede only their in-flight catalog reads")

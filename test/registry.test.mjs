@@ -43,6 +43,7 @@ test("provider registry exposes configured API and OAuth model families", () => 
       "clinepass/deepseek-v4-flash",
       "clinepass/deepseek-v4-pro",
       "clinepass/glm-5.2",
+      "clinepass/tencent/hy4-preview",
       "clinepass/kimi-k2.6",
       "clinepass/kimi-k2.7-code",
       "clinepass/kimi-k3",
@@ -57,9 +58,11 @@ test("provider registry exposes configured API and OAuth model families", () => 
       "commandcode/fugu-ultra",
       "commandcode/gemini-3.5-flash",
       "commandcode/gemini-3.7-flash",
+      "commandcode/gemini-3.8-flash",
       "commandcode/glm-5.2-fast",
       "commandcode/glm-5.2",
       "commandcode/glm-5.3-flash",
+      "commandcode/glm-5.3",
       "commandcode/gpt-5.5",
       "commandcode/gpt-5.6-luna",
       "commandcode/gpt-5.6-sol",
@@ -67,12 +70,14 @@ test("provider registry exposes configured API and OAuth model families", () => 
       "commandcode/grok-4.5",
       "commandcode/grok-4.6",
       "commandcode/hy3-paid",
+      "commandcode/hy4-preview",
       "commandcode/inkling-small",
       "commandcode/inkling",
       "commandcode/kimi-k2.7-code-highspeed",
       "commandcode/kimi-k2.7-code",
       "commandcode/kimi-k3",
       "commandcode/laguna-s-2.1",
+      "commandcode-messages/claude-fable-5.1",
       "commandcode-messages/claude-fable-5",
       "commandcode-messages/claude-haiku-4.5",
       "commandcode-messages/claude-opus-4.8",
@@ -86,6 +91,8 @@ test("provider registry exposes configured API and OAuth model families", () => 
       "commandcode/qwen3.7-flash",
       "commandcode/qwen3.7-max",
       "commandcode/qwen3.7-plus",
+      "commandcode/qwen3.8-flash",
+      "commandcode/qwen3.8-max-0902",
       "commandcode/qwen3.8-max",
       "commandcode/step-3.7-flash",
       "custom/qwen3.8-27b-uncensored",
@@ -105,20 +112,23 @@ test("provider registry exposes configured API and OAuth model families", () => 
       "meta/muse-spark-1.2-contributor",
       "meta/muse-spark-1.2",
       "minimax-token-plan/minimax-m3",
+      "nano-gpt/tencent/hy4-preview",
+      "nousresearch/claude-fable-5.1",
       "nousresearch/claude-fable-5",
       "nousresearch/claude-opus-5",
       "nousresearch/claude-sonnet-5",
       "nousresearch/deepseek-v4-flash",
       "nousresearch/deepseek-v4-pro",
       "nousresearch/gemini-3.7-flash",
+      "nousresearch/gemini-3.8-flash",
       "nousresearch/glm-5.2",
-      "nousresearch/glm-5.3-flash",
       "nousresearch/glm-5.3",
       "nousresearch/gpt-5.6-terra",
       "nousresearch/grok-4.6",
       "nousresearch/hermes-4-405b",
       "nousresearch/hermes-4-70b",
       "nousresearch/hy3-free",
+      "nousresearch/tencent/hy4-preview",
       "nousresearch/kat-coder-pro-v2.5",
       "nousresearch/kimi-k2.7-code",
       "nousresearch/kimi-k3",
@@ -128,14 +138,19 @@ test("provider registry exposes configured API and OAuth model families", () => 
       "nousresearch/mimo-v2.5-pro",
       "nousresearch/minimax-m3",
       "nousresearch/muse-spark-1.2-contributor",
+      "nousresearch/muse-spark-1.3-contributor",
+      "nousresearch/muse-spark-1.3",
       "nousresearch/nemotron-3-ultra",
       "nousresearch/qwen3.7-max",
+      "nousresearch/qwen3.8-flash",
       "nousresearch/qwen3.8-max",
       "nousresearch/solar-pro4-free",
       "nousresearch/step-3.7-flash-free",
       "ollama-cloud/deepseek-v4-flash",
       "ollama-cloud/deepseek-v4-pro",
       "ollama-cloud/glm-5.2",
+      "ollama-cloud/glm-5.3-flash",
+      "ollama-cloud/glm-5.3",
       "ollama-cloud/kimi-k2.7-code",
       "ollama-cloud/kimi-k3",
       "ollama-cloud/minimax-m3",
@@ -148,6 +163,7 @@ test("provider registry exposes configured API and OAuth model families", () => 
       "opencode-go/glm-5.3",
       "opencode-go/glm-5",
       "opencode-go/hy3",
+      "opencode-go/hy4-preview",
       "opencode-go/kimi-k2.5",
       "opencode-go/kimi-k2.6",
       "opencode-go/kimi-k2.7-code",
@@ -162,12 +178,24 @@ test("provider registry exposes configured API and OAuth model families", () => 
       "opencode-go-messages/qwen3.6-plus",
       "opencode-go-messages/qwen3.7-max",
       "opencode-go-messages/qwen3.7-plus",
+      "opencode-go-messages/qwen3.8-flash",
       "opencode-go-messages/qwen3.8-max",
       "opencode-go-responses/gpt-5.6-luna",
       "opencode-go-responses/grok-4.5",
       "opencode-go-responses/grok-4.6",
       "opencode-go-responses/muse-spark-1.2-contributor",
+      "opencode-go-responses/muse-spark-1.3-contributor",
+      "openrouter/claude-fable-5.1",
+      "openrouter/gemini-3.8-flash",
       "openrouter/glm-5.3-flash",
+      "openrouter/glm-5.3",
+      "openrouter/grok-4.6",
+      "openrouter/tencent/hy4-preview",
+      "openrouter/muse-spark-1.2-contributor",
+      "openrouter/muse-spark-1.2",
+      "openrouter/muse-spark-1.3-contributor",
+      "openrouter/muse-spark-1.3",
+      "openrouter/qwen3.8-flash",
       "qwen-plan/deepseek-v4-flash-0731",
       "qwen-plan/deepseek-v4-pro-0813",
       "qwen-plan/deepseek-v4-pro",
@@ -175,13 +203,17 @@ test("provider registry exposes configured API and OAuth model families", () => 
       "qwen-plan/qwen3.6-flash",
       "qwen-plan/qwen3.7-max",
       "qwen-plan/qwen3.7-plus",
+      "qwen-plan/qwen3.8-flash",
       "qwen-plan/qwen3.8-max-preview",
       "qwen-plan/qwen3.8-max",
-      "venice/glm-5.3-flash",
+      "venice/claude-fable-5.1",
+      "venice/gemini-3.8-flash",
+      "venice/glm-5.3",
       "xiaomi-mimo/mimo-v2.5-pro",
       "xiaomi-mimo/mimo-v2.5",
       "zai-api/glm-4.7",
       "zai-api/glm-5.2",
+      "zai-api/glm-5.3-flash",
       "zai-api/glm-5.3",
       "zai-coding/glm-5-turbo",
       "zai-coding/glm-5.2",
@@ -324,22 +356,74 @@ test("provider registry exposes configured API and OAuth model families", () => 
   assert.deepEqual(nanoGpt.credential.environment, ["NANOGPT_API_KEY"]);
   assert.equal(nanoGpt.credential.file, "nano-gpt-api-key.secret");
   assert.deepEqual(nanoGpt.credential.keychainServices, ["codex-router-nano-gpt"]);
-  assert.equal(LISTED_MODELS.some(({ provider }) => provider === "nano-gpt"), false);
+  assert.deepEqual(
+    LISTED_MODELS.filter(({ provider }) => provider === "nano-gpt").map(({ slug }) => slug),
+    ["nano-gpt/tencent/hy4-preview"],
+  );
+  const hy4Routes = [
+    "clinepass/tencent/hy4-preview",
+    "commandcode/hy4-preview",
+    "nano-gpt/tencent/hy4-preview",
+    "nousresearch/tencent/hy4-preview",
+    "opencode-go/hy4-preview",
+    "openrouter/tencent/hy4-preview",
+  ].map((slug) => MODEL_BY_SLUG.get(slug));
+  assert.deepEqual(hy4Routes.map(({ upstreamModel }) => upstreamModel), [
+    "tencent/hy4-preview",
+    "tencent/hy4-preview",
+    "tencent/hy4-preview",
+    "tencent/hy4-preview",
+    "hy4-preview",
+    "tencent/hy4-preview",
+  ]);
+  assert.deepEqual(hy4Routes.map(({ contextWindow }) => contextWindow), [
+    1_048_576,
+    1_048_576,
+    1_048_576,
+    1_048_576,
+    1_024_000,
+    1_048_576,
+  ]);
+  assert.deepEqual(hy4Routes.map(({ autoCompact }) => autoCompact), [
+    940_000,
+    940_000,
+    940_000,
+    940_000,
+    920_000,
+    940_000,
+  ]);
+  for (const model of hy4Routes) {
+    assert.equal(model.defaultEffort, "high", model.slug);
+    assert.deepEqual(model.inputModalities, ["text"], model.slug);
+    assert.notEqual(model.isFree, true, model.slug);
+  }
+  assert.deepEqual(hy4Routes.map(({ reasoningLevels }) => reasoningLevels.map(({ effort }) => effort)), [
+    ["high"],
+    ["high"],
+    ["minimal", "low", "high"],
+    ["minimal", "low", "high"],
+    ["minimal", "high"],
+    ["minimal", "low", "high"],
+  ]);
+  assert.deepEqual(hy4Routes.map(({ requestProfile }) => requestProfile), [
+    "clinepass",
+    undefined,
+    "hy4-reasoning",
+    "hy4-reasoning",
+    "hy4-reasoning",
+    "hy4-reasoning",
+  ]);
   const venice = PROVIDERS.get("venice");
   assert.equal(venice.baseUrl, "https://api.venice.ai/api/v1");
   assert.equal(venice.baseUrlEnv, "VENICE_API_BASE_URL");
   assert.deepEqual(venice.credential.environment, ["VENICE_API_KEY"]);
   assert.equal(venice.credential.file, "venice-api-key.secret");
   assert.deepEqual(venice.credential.keychainServices, ["codex-router-venice"]);
-  // Venice arrived as catalog-only, and stayed that way until Ox Alpha was
-  // checked in for it. When Ox Alpha was withdrawn, GLM-5.3 Flash replaced it.
-  // Venice ships exactly that one entry -- the picker is not empty once a key
-  // is stored, and everything else on Venice still has to be curated -- so this
-  // asserts the entry rather than merely that something is listed, which would
-  // also pass if a curation bug leaked extra models in.
+  // Only the directly certified full GLM-5.3 route ships checked in. Venice's
+  // other catalog entries remain available for explicit operator curation.
   assert.deepEqual(
     LISTED_MODELS.filter(({ provider }) => provider === "venice").map(({ slug }) => slug),
-    ["venice/glm-5.3-flash"],
+    ["venice/claude-fable-5.1", "venice/gemini-3.8-flash", "venice/glm-5.3"],
   );
   const opencodeFree = PROVIDERS.get("opencode-free");
   const opencodeFreeResponses = PROVIDERS.get("opencode-free-responses");
@@ -355,8 +439,10 @@ test("provider registry exposes configured API and OAuth model families", () => 
   assert.equal(opencodeFreeResponses.anonymousModelPolicy, "explicit-models");
   assert.deepEqual(opencodeFreeResponses.anonymousModels, [
     "muse-spark-1.2-contributor-free",
+    "muse-spark-1.3-contributor-free",
   ]);
   assert.equal(anonymousModelAllowed(opencodeFreeResponses, "muse-spark-1.2-contributor-free"), true);
+  assert.equal(anonymousModelAllowed(opencodeFreeResponses, "muse-spark-1.3-contributor-free"), true);
   assert.equal(anonymousModelAllowed(opencodeFreeResponses, "x-preview-f-free"), false);
   assert.equal(anonymousModelAllowed(opencodeFreeResponses, "big-pickle"), false);
   assert.equal(anonymousModelAllowed(opencodeFreeResponses, "arbitrary-free"), false);
@@ -435,6 +521,7 @@ test("provider registry exposes configured API and OAuth model families", () => 
       "cline-pass/deepseek-v4-flash",
       "cline-pass/deepseek-v4-pro",
       "cline-pass/glm-5.2",
+      "tencent/hy4-preview",
       "cline-pass/kimi-k2.6",
       "cline-pass/kimi-k2.7-code",
       "cline-pass/kimi-k3",
@@ -465,6 +552,7 @@ test("provider registry exposes configured API and OAuth model families", () => 
     "cline-pass/deepseek-v4-flash": [1_048_576, 900_000],
     "cline-pass/deepseek-v4-pro": [1_048_576, 900_000],
     "cline-pass/glm-5.2": [1_048_576, 900_000],
+    "tencent/hy4-preview": [1_048_576, 940_000],
     "cline-pass/kimi-k2.6": [262_144, 235_000],
     "cline-pass/kimi-k2.7-code": [262_144, 235_000],
     "cline-pass/kimi-k3": [1_048_576, 900_000],
@@ -574,6 +662,7 @@ test("provider registry exposes configured API and OAuth model families", () => 
     "minimax-token-plan/minimax-m3",
     "qwen-plan/qwen3.6-flash",
     "qwen-plan/qwen3.7-max",
+    "qwen-plan/qwen3.8-flash",
     "qwen-plan/qwen3.8-max",
     "qwen-plan/qwen3.8-max-preview",
     "xiaomi-mimo/mimo-v2.5",
@@ -736,6 +825,50 @@ test("GLM-5.3-Flash replaces OpenCode Go's withdrawn Ox Alpha route", () => {
   assert.equal(MODEL_BY_SLUG.get("opencode-go/ox-alpha"), model);
 });
 
+test("OpenCode Go routes retain upstream windows instead of the generic fallback", () => {
+  const expected = new Map([
+    ["opencode-go/mimo-v2.5", [1_000_000, 850_000, "opencode-go-mimo-v2-5-v2"]],
+    ["opencode-go/mimo-v2.5-pro", [1_000_000, 850_000, "opencode-go-mimo-v2-5-pro-v2"]],
+    ["opencode-go/hy3", [262_144, 223_000, "opencode-go-hy3-v2"]],
+    ["opencode-go-messages/minimax-m2.5", [204_800, 174_000, "opencode-go-messages-minimax-m2-5-v2"]],
+    ["opencode-go-messages/minimax-m2.7", [204_800, 174_000, "opencode-go-messages-minimax-m2-7-v2"]],
+  ]);
+
+  for (const [slug, [contextWindow, autoCompact, compHash]] of expected) {
+    const model = MODEL_BY_SLUG.get(slug);
+    assert.equal(model?.contextWindow, contextWindow, slug);
+    assert.equal(model?.autoCompact, autoCompact, slug);
+    assert.equal(model?.compHash, compHash, slug);
+    assert.ok(autoCompact < contextWindow, slug);
+  }
+  assert.match(
+    MODEL_BY_SLUG.get("opencode-go-messages/minimax-m2.7")?.upgradeTo?.markdown,
+    /from 200K to 1M tokens/,
+  );
+});
+
+test("GLM-5.3-Flash on Ollama Cloud uses the :cloud tag and shared profile", () => {
+  const model = MODEL_BY_SLUG.get("ollama-cloud/glm-5.3-flash");
+  assert.equal(model?.upstreamModel, "glm-5.3-flash:cloud");
+  assert.equal(model?.requestProfile, "ollama-cloud-glm-5-3-flash");
+  assert.equal(model?.contextWindow, 1_000_000);
+  assert.equal(model?.autoCompact, 400_000);
+  assert.deepEqual(model?.reasoningLevels.map((level) => level.effort), ["low", "high", "max"]);
+  assert.equal(model?.defaultEffort, "max");
+  assert.deepEqual(model?.inputModalities, ["text", "image"]);
+});
+
+test("GLM-5.3 on Ollama Cloud uses the :cloud tag and shared profile", () => {
+  const model = MODEL_BY_SLUG.get("ollama-cloud/glm-5.3");
+  assert.equal(model?.upstreamModel, "glm-5.3:cloud");
+  assert.equal(model?.requestProfile, "ollama-cloud-glm-5-3");
+  assert.equal(model?.contextWindow, 1_000_000);
+  assert.equal(model?.autoCompact, 880_000);
+  assert.deepEqual(model?.reasoningLevels.map((level) => level.effort), ["low", "high", "max"]);
+  assert.equal(model?.defaultEffort, "max");
+  assert.deepEqual(model?.inputModalities, ["text"]);
+});
+
 test("four additional OpenCode Go Chat routes retain their documented limits and conservative controls", () => {
   const expected = {
     "opencode-go/glm-5": {
@@ -878,7 +1011,7 @@ test("resellers of one upstream model share a default effort when their ladders 
 test("Ollama Cloud models advertise only levels the forwarder maps to Ollama", () => {
   const accepted = new Set(["minimal", "low", "medium", "high", "max"]);
   for (const model of MODELS) {
-    if (model.requestProfile !== "ollama-cloud") continue;
+    if (!model.requestProfile?.startsWith("ollama-cloud")) continue;
     for (const level of model.reasoningLevels || []) {
       assert.ok(
         accepted.has(level.effort),
@@ -1207,6 +1340,120 @@ test("isFree is a boolean model tag", async () => {
   try {
     assert.match(load("yes").stderr, /invalid isFree flag/);
     assert.equal(load(true).status, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("toolSchemaRecursion accepts only \"flatten\"", async () => {
+  const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const nodePath = (await import("node:path")).default;
+  const { spawnSync } = await import("node:child_process");
+  const dir = mkdtempSync(nodePath.join(tmpdir(), "registry-schema-recursion-test-"));
+  const load = (toolSchemaRecursion) => {
+    const registry = readRegistryDocument("config");
+    registry.models = [
+      { ...registry.models[0], toolSchemaRecursion },
+      ...registry.models.slice(1),
+    ];
+    const registryPath = nodePath.join(dir, "providers.json");
+    writeFileSync(registryPath, JSON.stringify(registry));
+    return spawnSync(
+      process.execPath,
+      ["-e", "import('./src/model-registry.mjs').catch((e)=>{console.error(e.message);process.exit(1);})"],
+      { encoding: "utf8", env: { ...process.env, MODEL_ROUTER_REGISTRY: registryPath } },
+    );
+  };
+  try {
+    // The field names an executable behavior, so an unrecognized verb has to
+    // fail the load rather than be ignored into a silently unrepaired route.
+    assert.match(load("sometimes").stderr, /may only set toolSchemaRecursion to "flatten"/);
+    assert.match(load(true).stderr, /may only set toolSchemaRecursion to "flatten"/);
+    assert.equal(load("flatten").status, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("every Muse Spark route on opencode flattens recursive tool schemas", () => {
+  // Meta's Console upstream refuses a $ref cycle on the free and the Go route
+  // alike -- both were measured returning the same 400 -- so a route added to
+  // one surface without the field would lose whole turns to a bare rejection.
+  const muse = MODELS.filter(
+    (model) =>
+      model.provider.startsWith("opencode") && /muse-spark/u.test(model.upstreamModel),
+  );
+  assert.ok(muse.length >= 2, "expected checked-in Muse Spark routes on opencode");
+  for (const model of muse) {
+    assert.equal(
+      model.toolSchemaRecursion,
+      "flatten",
+      `${model.slug} must flatten recursive tool schemas`,
+    );
+  }
+});
+
+test("curated OpenCode Free Muse overlay upgrades text-only image modalities", async () => {
+  // An entry curated before modalities were documented keeps ["text"]. The
+  // registry overlay must widen it on load the same way it applies isFree and
+  // toolSchemaRecursion, or every installed machine would need a re-curate
+  // before Codex accepts image paste.
+  const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const nodePath = (await import("node:path")).default;
+  const { spawnSync } = await import("node:child_process");
+  const dir = mkdtempSync(nodePath.join(tmpdir(), "registry-muse-modalities-"));
+  const userModelsPath = nodePath.join(dir, "user-models.json");
+  const museId = "muse-spark-1.3-contributor-free";
+  writeFileSync(
+    userModelsPath,
+    JSON.stringify({
+      version: 1,
+      models: [
+        {
+          slug: `opencode-free-responses/${museId}`,
+          gatewayModel: "opencode-free-responses-muse-spark-1-3-contributor-free",
+          upstreamModel: museId,
+          provider: "opencode-free-responses",
+          listed: true,
+          displayName: "Muse Spark 1.3 Contributor (OpenCode Free)",
+          description: "text-only curated before modalities were documented",
+          priority: 148,
+          defaultEffort: "high",
+          reasoningLevels: [{ effort: "high", description: "Deep reasoning" }],
+          contextWindow: 1_048_576,
+          autoCompact: 900_000,
+          inputModalities: ["text"],
+          isFree: true,
+          requestProfile: "auto-tool-choice",
+          compHash: "opencode-free-responses-muse-spark-1-3-contributor-free-user-v1",
+        },
+      ],
+    }),
+  );
+  try {
+    const result = spawnSync(
+      process.execPath,
+      [
+        "-e",
+        `
+          const { MODEL_BY_SLUG } = await import('./src/model-registry.mjs');
+          const model = MODEL_BY_SLUG.get('opencode-free-responses/${museId}');
+          if (!model) { console.error('missing'); process.exit(2); }
+          console.log(JSON.stringify(model.inputModalities));
+        `,
+      ],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          MODEL_ROUTER_USER_MODELS: userModelsPath,
+        },
+      },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout.trim()), ["text", "image"]);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -1624,4 +1871,32 @@ test("opencode's DeepSeek models never receive a forced tool_choice", () => {
     "opencode-go/glm-5.3-flash",
   );
   assert.equal(MODEL_BY_SLUG.get("opencode-go/grok-4.5"), goGrok);
+});
+
+test("Muse Spark 1.2 routes normalize forced tool choices model-by-model", () => {
+  // Live probes on 2026-09-01 proved that Muse Spark 1.2 calls tools under
+  // `auto` but rejects `required` on both Command Code and Console Go. The
+  // restriction follows the upstream model, so every checked-in route for the
+  // regular or Contributor model carries the same narrow compatibility repair.
+  for (const slug of [
+    "commandcode/muse-spark-1.2",
+    "meta/muse-spark-1.2",
+    "meta/muse-spark-1.2-contributor",
+    "nousresearch/muse-spark-1.2-contributor",
+    "opencode-go-responses/muse-spark-1.2-contributor",
+    "openrouter/muse-spark-1.2",
+    "openrouter/muse-spark-1.2-contributor",
+  ]) {
+    assert.equal(MODEL_BY_SLUG.get(slug)?.requestProfile, "auto-tool-choice", slug);
+  }
+
+  // The repair is not a Command Code, Meta, Nous, or Console Go default.
+  for (const slug of [
+    "commandcode/gpt-5.6-sol",
+    "meta/muse-spark-1.1",
+    "nousresearch/glm-5.3",
+    "opencode-go-responses/gpt-5.6-luna",
+  ]) {
+    assert.equal(MODEL_BY_SLUG.get(slug)?.requestProfile, undefined, slug);
+  }
 });

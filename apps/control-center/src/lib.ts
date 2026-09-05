@@ -1,5 +1,8 @@
 import type { UsageBucket, UsageMetric } from "./types";
 
+export type AccountBucketSource = "account" | "router-fallback";
+export type AccountDisplayBucket = UsageBucket & { displaySource: AccountBucketSource };
+
 export function compactNumber(value: number | null | undefined): string {
   const number = Math.max(0, Number(value) || 0);
   if (number < 1_000) return Math.round(number).toLocaleString("en-US");
@@ -84,6 +87,23 @@ export function bucketRange(buckets: UsageBucket[] = [], days: number): UsageBuc
       ? { ...existing, startDate: key, tokens: Number(existing.tokens) || 0 }
       : { startDate: key, tokens: 0 };
   });
+}
+
+// OpenAI's account stream is authoritative whenever it contains a date. The
+// local OpenAI provider stream is a narrower, router-only meter, so it may fill
+// an absent account date but must never replace or augment an account bucket.
+export function accountBucketsWithRouterFallback(
+  accountBuckets: UsageBucket[] = [],
+  routerBuckets: UsageBucket[] = [],
+): AccountDisplayBucket[] {
+  const merged = new Map<string, AccountDisplayBucket>();
+  for (const bucket of routerBuckets) {
+    merged.set(bucket.startDate, { ...bucket, displaySource: "router-fallback" });
+  }
+  for (const bucket of accountBuckets) {
+    merged.set(bucket.startDate, { ...bucket, displaySource: "account" });
+  }
+  return [...merged.values()].sort((left, right) => left.startDate.localeCompare(right.startDate));
 }
 
 export function classNames(...values: Array<string | false | null | undefined>): string {

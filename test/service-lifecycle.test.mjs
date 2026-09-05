@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+
+import { withServiceOperationLock } from "../src/service-operation-lock.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -50,7 +52,7 @@ test("start and stop act on the same layer", { skip: process.platform === "win32
 test("the foreground supervisor is reachable, but only on purpose", { skip: process.platform === "win32" }, () => {
   withNodeShim(({ env, readLog }) => {
     execFileSync(path.join(root, "bin", "start"), ["--foreground"], { env, encoding: "utf8" });
-    assert.match(readLog(), /src\/start\.mjs$/);
+    assert.match(readLog(), /src\/foreground-start\.mjs$/);
   });
 
   // An unrecognized argument is refused rather than quietly falling through to
@@ -61,6 +63,73 @@ test("the foreground supervisor is reachable, but only on purpose", { skip: proc
     assert.match(result.stderr, /Usage: start \[--foreground\]/);
     assert.equal(readLog(), "");
   });
+});
+
+test("foreground supervisor holds service lifecycle ownership", () => {
+  const startScript = readFileSync(path.join(root, "bin", "start"), "utf8");
+  const supervisor = readFileSync(path.join(root, "src", "start.mjs"), "utf8");
+  const launcher = readFileSync(path.join(root, "src", "foreground-start.mjs"), "utf8");
+  assert.match(startScript, /src\/foreground-start\.mjs/);
+  assert.match(launcher, /withServiceOperationLock/);
+  assert.match(launcher, /import\("\.\/start\.mjs"\)/);
+  assert.doesNotMatch(supervisor, /withServiceOperationLock/);
+});
+
+test("foreground supervisor waits for existing lifecycle ownership before booting", async () => {
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "codex-router-foreground-lock-"));
+  let child;
+  let stderr = "";
+  try {
+    await withServiceOperationLock(async () => {
+      child = spawn(process.execPath, [path.join(root, "src", "foreground-start.mjs")], {
+        cwd: root,
+        env: {
+          ...process.env,
+          MODEL_ROUTER_TARGET: "codex",
+          MODEL_ROUTER_STATE_DIR: stateDir,
+          MODEL_ROUTER_LITELLM_BIN: path.join(stateDir, "no-such-litellm"),
+        },
+        stdio: ["ignore", "ignore", "pipe"],
+      });
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk) => { stderr += chunk; });
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      assert.equal(child.exitCode, null, "foreground supervisor must wait while lifecycle ownership is held");
+    }, { stateDir, waitMs: 0, retryMs: 20, staleMs: 5_000 });
+
+    const code = await new Promise((resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", resolve);
+    });
+    assert.equal(code, 1);
+    assert.match(stderr, /LiteLLM is not installed/i);
+  } finally {
+    if (child?.exitCode === null) child.kill();
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("Windows start dispatches managed and foreground modes without bypassing lifecycle ownership", { skip: process.platform !== "win32" }, () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), "codex-router-windows-start-"));
+  const log = path.join(directory, "node.log");
+  const shim = path.join(directory, "node.cmd");
+  writeFileSync(shim, `@echo off\r\necho %*>>${JSON.stringify(log)}\r\nexit /b 0\r\n`);
+  writeFileSync(log, "");
+  const env = { ...process.env, PATH: `${directory}${path.delimiter}${process.env.PATH}` };
+  try {
+    execFileSync("powershell.exe", ["-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path.join(root, "codex-router.ps1"), "start"], { env, encoding: "utf8" });
+    let lines = readFileSync(log, "utf8").trim().split(/\r?\n/);
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /src\\service\.mjs start$/i);
+
+    writeFileSync(log, "");
+    execFileSync("powershell.exe", ["-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path.join(root, "codex-router.ps1"), "start", "--foreground"], { env, encoding: "utf8" });
+    lines = readFileSync(log, "utf8").trim().split(/\r?\n/);
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /src\\foreground-start\.mjs$/i);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("a supervisor started with no proxy environment adopts the installed one", () => {

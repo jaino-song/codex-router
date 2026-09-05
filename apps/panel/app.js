@@ -114,6 +114,7 @@ function startPanel() {
     chartTooltip: document.getElementById("chart-tooltip"),
     quotaCards: document.getElementById("quota-cards"),
     usageOverview: document.getElementById("usage-overview"),
+    usageSourceNote: document.getElementById("usage-source-note"),
     statusSummary: document.getElementById("status-summary"),
     serviceHealth: document.getElementById("service-health"),
     activeRequests: document.getElementById("active-requests"),
@@ -404,7 +405,8 @@ function startPanel() {
     const model = active?.model || activity.model;
     const provider = active?.provider || activity.provider;
     const label = model ? String(model).split("/").at(-1) : t("status.noModelObserved");
-    const observed = observedModelSpeed(state.providerUsage, provider, model);
+    const isGenerating = activity.state === "generating" || (activity.active && activity.active.length > 0);
+    const observed = !isGenerating ? observedModelSpeed(state.providerUsage, provider, model) : null;
     elements.speedModel.textContent = label;
     elements.modelSpeed.textContent = observed ? `${observed.speed.toFixed(1)} tok/s` : t("status.noSpeed");
     elements.modelSpeed.classList.toggle("is-measured", Boolean(observed));
@@ -441,12 +443,19 @@ function startPanel() {
   function renderUsage() {
     const source = sourceOptions(state).find((option) => option.id === state.selectedSource);
     const series = dailySeries(source?.buckets || [], state.usageRange);
+    const fallbackDays = series.filter((point) => point.displaySource === "router-fallback").length;
     elements.today.textContent = source ? compactTokens(todayTokens(source)) : "—";
     elements.week.textContent = source
       ? compactTokens(series.reduce((total, point) => total + point.tokens, 0))
       : "\u2014";
     elements.usageRange.value = String(state.usageRange);
     elements.usageRangeLabel.textContent = `${state.usageRange} days`;
+    if (elements.usageSourceNote) {
+      elements.usageSourceNote.hidden = fallbackDays <= 0;
+      elements.usageSourceNote.textContent = fallbackDays > 0
+        ? t(fallbackDays === 1 ? "usage.localFallbackNoticeOne" : "usage.localFallbackNotice", { count: fallbackDays })
+        : "";
+    }
     renderChart(series, elements);
   }
 
@@ -2098,12 +2107,15 @@ function startIsland() {
     const geometry = chartGeometry(series, 368, 42, 3);
     elements.line.setAttribute("d", geometry.line);
     elements.area.setAttribute("d", geometry.area);
+    const fallbackDays = series.filter((point) => point.displaySource === "router-fallback").length;
     elements.root.setAttribute(
       "aria-label",
       t("island.ariaLabel", {
         state: labels[activityState] || t("status.idle"),
         details: source
-          ? t("island.tokensToday", { count: exactTokens(todayTokens(source)) })
+          ? `${t("island.tokensToday", { count: exactTokens(todayTokens(source)) })}${fallbackDays > 0
+            ? ` ${t(fallbackDays === 1 ? "usage.localFallbackDatesOne" : "usage.localFallbackDates", { count: fallbackDays })}`
+            : ""}`
           : t("usage.noUsageData"),
       }),
     );
@@ -2169,7 +2181,7 @@ function renderChart(series, elements) {
   elements.chartPoints.replaceChildren();
   geometry.points.forEach((point, index) => {
     const dot = svgElement("circle", {
-      class: "chart-point",
+      class: `chart-point${series[index].displaySource === "router-fallback" ? " router-fallback" : ""}`,
       cx: point.x,
       cy: point.y,
       r: 3.2,
@@ -2181,13 +2193,17 @@ function renderChart(series, elements) {
       width: 36,
       height: 112,
     });
+    hit.setAttribute(
+      "aria-label",
+      `${series[index].longLabel}: ${t("usage.tooltipTokens", { count: exactTokens(series[index].tokens) })}${series[index].displaySource === "router-fallback" ? ` · ${t("usage.localFallbackPoint")}` : ""}`,
+    );
     const show = () => {
       elements.chartPoints.querySelectorAll(".chart-point").forEach((item) => item.classList.remove("is-active"));
       dot.classList.add("is-active");
       elements.chartTooltip.querySelector("span").textContent = series[index].longLabel;
       elements.chartTooltip.querySelector("strong").textContent = t("usage.tooltipTokens", {
         count: exactTokens(series[index].tokens),
-      });
+      }) + (series[index].displaySource === "router-fallback" ? ` · ${t("usage.localFallbackShort")}` : "");
       elements.chartTooltip.style.left = `${(point.x / 328) * 100}%`;
       elements.chartTooltip.style.top = `${point.y}px`;
       elements.chartTooltip.hidden = false;

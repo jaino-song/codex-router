@@ -41,6 +41,16 @@ test("userModelEntry fills conservative picker metadata", () => {
 });
 
 
+test("OpenCode Free Muse Spark curation uses the official picker label", () => {
+  const entry = userModelEntry({
+    providerId: "opencode-free-responses",
+    upstreamId: "muse-spark-1.3-contributor-free",
+    priority: 100,
+    metadata: { isFree: true },
+  });
+  assert.equal(entry.displayName, "Muse Spark 1.3 Contributor (OpenCode Free)");
+});
+
 test("curation metadata can set sizing and the effort ladder", () => {
   const entry = userModelEntry({
     providerId: "deepseek",
@@ -57,6 +67,7 @@ test("curation metadata can set sizing and the effort ladder", () => {
       ],
       defaultEffort: "medium",
       serviceTiers: [{ id: "priority", name: "Fast" }],
+      supportsSearchHistory: true,
       requiresTrailingUserTurn: true,
       isFree: true,
     },
@@ -66,6 +77,7 @@ test("curation metadata can set sizing and the effort ladder", () => {
   assert.equal(entry.reasoningLevels.length, 3);
   assert.equal(entry.defaultEffort, "medium");
   assert.deepEqual(entry.serviceTiers, [{ id: "priority", name: "Fast" }]);
+  assert.equal(entry.supportsSearchHistory, true);
   assert.equal(entry.requiresTrailingUserTurn, true);
   assert.equal(entry.isFree, true);
 });
@@ -82,6 +94,20 @@ test("curation metadata can expose provider-verified reasoning summaries", () =>
   });
   assert.equal(entry.supportsReasoningSummaries, true);
   assert.equal(entry.defaultReasoningSummary, "auto");
+});
+
+test("curation metadata preserves only explicit endpoint capabilities", () => {
+  const entry = userModelEntry({
+    providerId: "openrouter",
+    upstreamId: "vendor/embedding-model",
+    priority: 100,
+    metadata: {
+      supportedEndpoints: ["/embeddings"],
+      endpoint: "/audio/speech",
+    },
+  });
+  assert.deepEqual(entry.supportedEndpoints, ["/embeddings"]);
+  assert.equal(entry.endpoint, undefined);
 });
 
 test("curation metadata cannot replace identity or routing fields", () => {
@@ -170,6 +196,44 @@ test("registry merges valid user models and skips collisions", async () => {
     },
     // Unknown provider must be skipped, not fatal.
     userModelEntry({ providerId: "no-such-provider", upstreamId: "x-model", priority: 102 }),
+    // Endpoint-only models stay out of conversational pickers. A listed model
+    // that omits its provider's chat route would otherwise advertise a turn
+    // that the forwarder must refuse.
+    {
+      ...userModelEntry({
+        providerId: "openrouter",
+        upstreamId: "vendor/embedding-only-listed",
+        priority: 116,
+        metadata: { supportedEndpoints: ["/embeddings"] },
+      }),
+      listed: true,
+    },
+    {
+      ...userModelEntry({
+        providerId: "openrouter",
+        upstreamId: "vendor/embedding-only",
+        priority: 117,
+        metadata: { supportedEndpoints: ["/embeddings"] },
+      }),
+      listed: false,
+    },
+    {
+      ...userModelEntry({
+        providerId: "openrouter",
+        upstreamId: "vendor/bad-endpoint",
+        priority: 118,
+      }),
+      supportedEndpoints: ["/audio/speech"],
+    },
+    {
+      ...userModelEntry({
+        providerId: "anthropic-api",
+        upstreamId: "vendor/embedding-only",
+        priority: 119,
+        metadata: { supportedEndpoints: ["/embeddings"] },
+      }),
+      listed: false,
+    },
     // Announcement copy must be a non-empty string; a blank one is skipped.
     {
       ...userModelEntry({ providerId: "deepseek", upstreamId: "deepseek-blank-nux", priority: 103 }),
@@ -180,6 +244,10 @@ test("registry merges valid user models and skips collisions", async () => {
     {
       ...userModelEntry({ providerId: "deepseek", upstreamId: "deepseek-bad-search", priority: 106 }),
       searchTool: { mode: "emulated" },
+    },
+    {
+      ...userModelEntry({ providerId: "deepseek", upstreamId: "deepseek-bad-search-history", priority: 120 }),
+      supportsSearchHistory: "yes",
     },
     // Standalone search is Codex-side execution; it remains an explicit
     // per-model opt-in rather than a provider-wide default.
@@ -231,6 +299,10 @@ test("registry merges valid user models and skips collisions", async () => {
   const registry = await import("../src/model-registry.mjs");
   const slugs = registry.MODELS.map((model) => model.slug);
   assert.ok(slugs.includes("deepseek/deepseek-user-test"));
+  assert.equal(slugs.includes("openrouter/vendor/embedding-only-listed"), false);
+  assert.equal(slugs.includes("openrouter/vendor/embedding-only"), true);
+  assert.equal(slugs.includes("openrouter/vendor/bad-endpoint"), false);
+  assert.equal(slugs.includes("anthropic-api/vendor/embedding-only"), false);
   assert.equal(slugs.filter((slug) => slug === "deepseek/deepseek-v4-pro").length, 1);
   assert.equal(slugs.includes("opencode-free/ox-alpha"), false);
   assert.equal(slugs.filter((slug) => slug === "opencode-free/x-preview-f-free").length, 1);
@@ -265,6 +337,7 @@ test("registry merges valid user models and skips collisions", async () => {
   assert.ok(!slugs.includes("no-such-provider/x-model"));
   assert.ok(!slugs.includes("deepseek/deepseek-blank-nux"));
   assert.ok(!slugs.includes("deepseek/deepseek-bad-search"));
+  assert.ok(!slugs.includes("deepseek/deepseek-bad-search-history"));
   assert.ok(slugs.includes("deepseek/deepseek-standalone-search"));
   assert.ok(!slugs.includes("deepseek/deepseek-bad-detail"));
   assert.ok(!slugs.includes("deepseek/deepseek-bad-trailing-turn"));

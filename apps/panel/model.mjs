@@ -38,12 +38,13 @@ export function localDateKey(date) {
 
 export function dailySeries(buckets = [], days = 7, today = new Date()) {
   const indexed = new Map(
-    buckets.map((bucket) => [String(bucket.startDate), Number(bucket.tokens) || 0]),
+    buckets.map((bucket) => [String(bucket.startDate), bucket]),
   );
   const anchor = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 12);
   return Array.from({ length: days }, (_, index) => {
     const date = new Date(anchor.getTime() - (days - index - 1) * DAY_MS);
     const key = localDateKey(date);
+    const bucket = indexed.get(key);
     return {
       key,
       label: new Intl.DateTimeFormat(getLocale(), { weekday: "short" }).format(date),
@@ -51,7 +52,8 @@ export function dailySeries(buckets = [], days = 7, today = new Date()) {
         month: "short",
         day: "numeric",
       }).format(date),
-      tokens: indexed.get(key) ?? 0,
+      tokens: Number(bucket?.tokens) || 0,
+      ...(bucket?.displaySource ? { displaySource: bucket.displaySource } : {}),
     };
   });
 }
@@ -115,6 +117,22 @@ export function metricRemainingPercent(metric = {}) {
   return used === null ? null : 100 - used;
 }
 
+// OpenAI's account stream is authoritative whenever it contains a date. The
+// local OpenAI provider stream is a narrower, router-only meter, so it may fill
+// an absent account date but must never replace or augment an account bucket.
+export function accountBucketsWithRouterFallback(accountBuckets = [], routerBuckets = []) {
+  const merged = new Map();
+  for (const bucket of routerBuckets) {
+    if (bucket?.startDate == null) continue;
+    merged.set(String(bucket.startDate), { ...bucket, displaySource: "router-fallback" });
+  }
+  for (const bucket of accountBuckets) {
+    if (bucket?.startDate == null) continue;
+    merged.set(String(bucket.startDate), { ...bucket, displaySource: "account" });
+  }
+  return [...merged.values()].sort((left, right) => String(left.startDate).localeCompare(String(right.startDate)));
+}
+
 export function buildQuotaCards({ account, providerUsage, providerSetup } = {}) {
   const cards = [];
   const seen = new Set();
@@ -158,11 +176,15 @@ export function buildQuotaCards({ account, providerUsage, providerSetup } = {}) 
 export function sourceOptions({ account, providerUsage, providerSetup } = {}) {
   const options = [];
   if (account?.dailyUsageBuckets) {
+    const localOpenAiBuckets = providerUsage?.providers?.find((provider) => provider.id === "openai")?.dailyUsageBuckets || [];
+    const buckets = accountBucketsWithRouterFallback(account.dailyUsageBuckets, localOpenAiBuckets);
+    const fallbackDays = buckets.filter((bucket) => bucket.displaySource === "router-fallback").length;
     options.push({
       id: "openai",
-      name: "ChatGPT",
-      buckets: account.dailyUsageBuckets,
+      name: fallbackDays > 0 ? t("usage.chatgptWithFallback") : "ChatGPT",
+      buckets,
       kind: "account",
+      fallbackDays,
     });
   }
   const configured = new Set(

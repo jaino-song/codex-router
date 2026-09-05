@@ -17,9 +17,8 @@ the referenced project and its current contracts before implementing a proposal.
 ## 1. Verified current baseline
 
 The current router already provides a shared local service for Codex, with
-optional publication to DeepSeek Harness and Gemini CLI. These are the only
-supported client targets on `main`; no OpenCode or Cursor client target is
-shipped. It preserves the native GPT catalog and login, and keeps the native
+optional publication to DeepSeek Harness, Gemini CLI, and Cursor. OpenCode is
+not shipped as a client target. It preserves the native GPT catalog and login, and keeps the native
 default model, reasoning metadata, and speed controls client-owned by default.
 A routed default is available only through an explicit router-owned opt-in. It
 routes the checked-in provider registry and explicitly curated local models
@@ -164,7 +163,8 @@ The Codex route remains the priority. Optional future forwarding may cover:
 | `/v1/models` | P0 | Discovery and health only; never erase user models. |
 | `/v1/responses` and `/v1/chat/completions` | P0 | Main model-routing contracts. |
 | `/v1/messages` | P0 | Only for providers with a verified Messages contract. |
-| Legacy completions, embeddings, media, moderation, files, batches | P1/P2 | Advertise only when the provider and caller contract support them. |
+| Embeddings | Shipped focused slice | Explicit per-model declaration, caller capability, bounded JSON, cancellation, and no retry. |
+| Legacy completions, media, moderation, files, batches | P1/P2 | Advertise only when the provider and caller contract support them. |
 
 Non-chat endpoints must not be advertised as chat models. Multipart limits,
 idempotency, cancellation, request IDs, and non-idempotent retry boundaries are
@@ -216,11 +216,11 @@ commit. Diagnostics must show the actual target without exposing credentials.
 Acceptance evidence: failover, weighted selection, all-targets-unhealthy,
 capability mismatch, sticky session, and native catalog tests.
 
-## 7. Proposed gap E: web-search sidecar
+## 7. Implemented gap E: web-search sidecar
 
-The current router preserves native standalone search and provider-specific
-hosted search. A future sidecar may be offered only as an explicit opt-in for a
-model that cannot consume the native search tool.
+The router preserves native standalone search and provider-specific hosted
+search. It also offers a concrete Perplexity Search adapter only as an explicit
+per-model opt-in for a model that does not already own either capability.
 
 Requirements:
 
@@ -233,7 +233,10 @@ Requirements:
 - capability-driven selection, never a model-name special case.
 
 Acceptance evidence: success, timeout, cancellation, cache hit, malformed
-result, native-search bypass, redaction, and request accounting.
+result, native-search bypass, redaction, and request accounting. The focused
+evidence lives in `test/search-sidecar.test.mjs`,
+`test/search-sidecar-control.test.mjs`, `test/routing.test.mjs`,
+`test/generic-providers.test.mjs`, and `test/usage-events.test.mjs`.
 
 ## 8. Proposed gap F: sub-agent policy
 

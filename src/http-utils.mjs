@@ -317,7 +317,15 @@ export const MAX_BODY_BYTES = Number(
     (TARGET === "codex"
       ? process.env.CODEX_ROUTER_MAX_BODY_BYTES || process.env.KIMI_PROXY_MAX_BODY_BYTES
       : undefined) ||
-    64 * 1024 * 1024,
+    128 * 1024 * 1024,
+);
+
+export const MAX_BUFFERED_RESPONSE_BYTES = Number(
+  process.env.MODEL_ROUTER_MAX_BUFFERED_RESPONSE_BYTES ||
+    (TARGET === "codex"
+      ? process.env.CODEX_ROUTER_MAX_BUFFERED_RESPONSE_BYTES
+      : undefined) ||
+    8 * 1024 * 1024,
 );
 
 export const HOP_BY_HOP_HEADERS = new Set([
@@ -501,19 +509,148 @@ export function reportListenFailure(server, { label, host, port }) {
   return server;
 }
 
-export async function readRequestBody(request) {
+function abortReason(signal) {
+  if (signal?.reason instanceof Error) return signal.reason;
+  const error = new Error("The operation was aborted.");
+  error.name = "AbortError";
+  return error;
+}
+
+function readWithAbort(reader, signal) {
+  if (!signal) return reader.read();
+  if (signal.aborted) return Promise.reject(abortReason(signal));
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      void reader.cancel().catch(() => {});
+      cleanup();
+      reject(abortReason(signal));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    reader.read().then(
+      (result) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(result);
+      },
+      (error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      },
+    );
+  });
+}
+
+// The decompressed size a Zstandard frame header declares, or undefined when
+// the frame omits it (streaming encoders may) or the bytes are not a zstd frame
+// at all. Only the header is read; nothing is decoded, so this is safe to run
+// on an untrusted body before any native decompressor sees it.
+//
+// Layout, RFC 8878 §3.1.1: the magic number 0xFD2FB528 (little-endian), then
+// a Frame_Header_Descriptor byte whose top two bits size the content-size
+// field (0, 2, 4, or 8 bytes -- with 0 meaning a 1-byte field only when the
+// Single_Segment bit, bit 5, is set), and whose low two bits size the
+// Dictionary_ID (0, 1, 2, or 4 bytes). A Window_Descriptor byte sits between
+// them unless Single_Segment is set. The 2-byte size form stores the value
+// minus 256.
+export function zstdFrameContentSize(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 6) return undefined;
+  if (buffer.readUInt32LE(0) !== 0xfd2fb528) return undefined;
+  const descriptor = buffer[4];
+  const singleSegment = (descriptor & 0x20) !== 0;
+  const sizeFlag = descriptor >> 6;
+  const sizeBytes = sizeFlag === 0 ? (singleSegment ? 1 : 0) : [0, 2, 4, 8][sizeFlag];
+  if (sizeBytes === 0) return undefined;
+  const dictionaryBytes = [0, 1, 2, 4][descriptor & 0x03];
+  const offset = 5 + (singleSegment ? 0 : 1) + dictionaryBytes;
+  if (buffer.length < offset + sizeBytes) return undefined;
+  if (sizeBytes === 1) return buffer[offset];
+  if (sizeBytes === 2) return buffer.readUInt16LE(offset) + 256;
+  if (sizeBytes === 4) return buffer.readUInt32LE(offset);
+  const declared = buffer.readBigUInt64LE(offset);
+  return declared > BigInt(Number.MAX_SAFE_INTEGER)
+    ? Number.MAX_SAFE_INTEGER
+    : Number(declared);
+}
+
+export async function readRequestBody(
+  request,
+  { maxBytes = MAX_BODY_BYTES, signal } = {},
+) {
   const chunks = [];
   let total = 0;
-  for await (const chunk of request) {
-    total += chunk.length;
-    if (total > MAX_BODY_BYTES) {
-      const error = new Error(`Request body exceeds ${MAX_BODY_BYTES} bytes.`);
-      error.status = 413;
-      throw error;
+  let overflow;
+  const limit = Number.isFinite(maxBytes) && maxBytes > 0 ? Math.floor(maxBytes) : MAX_BODY_BYTES;
+  const onAbort = () => request?.destroy?.(abortReason(signal));
+  signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    for await (const chunk of request) {
+      if (overflow) continue;
+      total += chunk.length;
+      if (total > limit) {
+        // Stop retaining caller-controlled bytes immediately, but keep consuming
+        // the stream so the response can stay keep-alive and the next request
+        // cannot be parsed out of the rejected body's tail.
+        overflow = new Error(`Request body exceeds ${limit} bytes.`);
+        overflow.status = 413;
+        continue;
+      }
+      chunks.push(chunk);
     }
-    chunks.push(chunk);
+    if (overflow) throw overflow;
+    if (signal?.aborted) throw abortReason(signal);
+    return Buffer.concat(chunks);
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
   }
-  return Buffer.concat(chunks);
+}
+
+// Read an upstream body with the limit applied while bytes arrive. The
+// built-in Response helpers buffer first, which lets a provider-controlled
+// error or relay response consume unbounded memory before the caller can
+// reject it. Cancellation releases the upstream stream as soon as the limit
+// is crossed.
+export async function readResponseBody(
+  upstream,
+  { maxBytes = MAX_BUFFERED_RESPONSE_BYTES, signal } = {},
+) {
+  if (!upstream?.body) return Buffer.alloc(0);
+  const reader = upstream.body.getReader();
+  const chunks = [];
+  let total = 0;
+  const limit = Number.isFinite(maxBytes) && maxBytes > 0
+    ? Math.floor(maxBytes)
+    : MAX_BUFFERED_RESPONSE_BYTES;
+  try {
+    while (true) {
+      const result = await readWithAbort(reader, signal);
+      if (result.done) break;
+      const chunk = result.value instanceof Uint8Array
+        ? result.value
+        : new Uint8Array(result.value || []);
+      total += chunk.byteLength;
+      if (total > limit) {
+        await reader.cancel().catch(() => {});
+        const error = new Error(`Upstream response exceeds ${limit} bytes.`);
+        error.status = 502;
+        error.code = "ERR_UPSTREAM_RESPONSE_TOO_LARGE";
+        throw error;
+      }
+      chunks.push(Buffer.from(chunk));
+    }
+  } catch (error) {
+    await reader.cancel().catch(() => {});
+    throw error;
+  } finally {
+    reader.releaseLock?.();
+  }
+  return Buffer.concat(chunks, total);
 }
 
 export function writeJson(response, status, payload) {

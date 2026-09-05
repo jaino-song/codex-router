@@ -127,6 +127,27 @@ struct LocalizationTests {
     }
   }
 
+  @Test(
+    "daily-usage fallback provenance is translated in every explicit locale",
+    arguments: [TrayLanguage.chinese, .arabic, .hindi, .japanese, .korean]
+  )
+  func dailyUsageFallbackIsLocalized(language: TrayLanguage) {
+    let original = RouterLanguage.selection
+    defer { RouterLanguage.setSelection(original) }
+    RouterLanguage.setSelection(language)
+    for english in [
+      "LOCAL FALLBACK",
+      "local fallback",
+      "1 local fallback date",
+      "%d local fallback dates",
+      "OpenAI account usage; missing dates use local router fallback",
+      "OpenAI supplied no account bucket for these dates; local router traffic fills the gap. These are not global account totals.",
+    ] {
+      #expect(routerLocalized(english) != english, "\(language.rawValue) did not translate \(english)")
+    }
+    #expect(routerFormat("%d local fallback dates", 2).contains("2"))
+  }
+
   @Test("interpolated strings keep their format specifiers")
   func formatSpecifiersSurvive() {
     let original = RouterLanguage.selection

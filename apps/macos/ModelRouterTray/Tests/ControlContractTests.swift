@@ -159,6 +159,37 @@ struct ControlContractTests {
     #expect(forwarded["EMPTY_ALIAS"] == nil)
   }
 
+  @Test("widget URLs map only to fixed Control Center destinations")
+  func validatesWidgetDestinations() {
+    let usage = ControlCenterNavigationRequest(
+      url: URL(string: "codex-router://control-center/usage?source=deepseek")!
+    )
+    #expect(usage?.destination == .usage)
+    #expect(usage?.sourceID == "deepseek")
+    #expect(usage?.arguments == [
+      "--router-destination", "usage", "--router-source", "deepseek",
+    ])
+    #expect(usage?.url.absoluteString == "codex-router://control-center/usage?source=deepseek")
+    let reset = ControlCenterNavigationRequest(
+      url: URL(string: "codex-router://control-center/usage-resets?source=openai")!
+    )
+    #expect(reset?.destination == .usageResets)
+    #expect(reset?.sourceID == "openai")
+    for unsafe in [
+      "https://control-center/usage",
+      "codex-router://other/usage",
+      "codex-router://control-center/settings",
+      "codex-router://control-center/usage?source=deep_seek",
+      "codex-router://control-center/usage?source=openai&source=deepseek",
+      "codex-router://control-center/usage?next=settings",
+      "codex-router://control-center//usage",
+      "codex-router://user@control-center/usage",
+      "codex-router://control-center/usage#reset",
+    ] {
+      #expect(ControlCenterNavigationRequest(url: URL(string: unsafe)!) == nil)
+    }
+  }
+
   @Test("the private install-owner manifest resolves and unsafe copies do not")
   func validatesInstallManifest() throws {
     let state = FileManager.default.temporaryDirectory

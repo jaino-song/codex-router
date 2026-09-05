@@ -19,9 +19,10 @@ Models still need a verified protocol route, tools, streaming, request profile,
 and installer-safe registry entry before this repository exposes them in Codex.
 
 For OpenRouter and Nous Research, effort fields are normalized from each
-provider's `reasoning` object. For Venice, they come from `model_spec`;
-`stealth-ox-alpha` additionally preserves Venice's advertised values beside the
-effective `low`/`high`/`max` ladder already established by repository live
-probes. MiniMax's id-only catalog is supplemented only by its official model
-selection table. OpenCode Free uses the exact free-route metadata already
-sourced in `src/opencode-curation.mjs`; unknown values remain unknown.
+provider's `reasoning` object. For Venice, the normalized effort values and
+default come directly from `model_spec`. Catalog metadata is evidence for
+explicit operator curation, not wire-compatibility certification or authority
+to add a checked-in preset. MiniMax's id-only catalog is supplemented only by
+its official model selection table. OpenCode Free uses the exact free-route
+metadata already sourced in `src/opencode-curation.mjs`; unknown values remain
+unknown.

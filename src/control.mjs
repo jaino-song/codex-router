@@ -12,12 +12,18 @@ import {
 } from "./model-overlay-publication.mjs";
 import { withModelOverlayLock } from "./model-overlay-lock.mjs";
 import { withNativeContextVariants } from "./native-context-variants.mjs";
+import { discoveryDisabled } from "./discovery-mode.mjs";
 // The publish marker lives under the shared state directory, which does not
 // vary by target, so reading it here does not disturb the per-target probes
 // below that re-import paths with their own MODEL_ROUTER_TARGET.
 import {
   DSH_CATALOG_PATH,
+  CLAUDE_CATALOG_PATH,
+  CURSOR_CATALOG_PATH,
   GEMINI_CATALOG_PATH,
+  OPENCLAW_CATALOG_PATH,
+  PROVIDER_API_KEY_POOL_PATH,
+  PROVIDER_CREDENTIAL_STORE_PATH,
   PROVIDER_SELECTION_PATH,
 } from "./paths.mjs";
 // Same reasoning: presence is a property of the shared plane, not of a target,
@@ -26,10 +32,32 @@ import { presenceSnapshot } from "./presence-state.mjs";
 import { harnessSnapshotWithWeb } from "./dsh-install.mjs";
 import { USER_MODELS_PATH } from "./user-models.mjs";
 import { refreshTargetPickerIfInstalled } from "./target-integration.mjs";
+import { activateAntigravityProbe } from "./antigravity-probe-activation.mjs";
 import {
   chatGptSessionStatus,
   setChatGptSessionSharingFromControl,
 } from "./chatgpt-session-control.mjs";
+import {
+  boundedOperationChild,
+  detachedOperationEnvironment,
+  operationDeadlineFromEnvironment,
+  remainingOperationMs,
+  runOperationProcessTree,
+} from "./process-tree.mjs";
+import { inheritedProxyEnvironment } from "./proxy-environment.mjs";
+import { installStableFetchTransport } from "./fetch-transport.mjs";
+
+// The tray launches this control process from the desktop session, which can
+// be silent about the proxy even when installation explicitly recorded one.
+// Restore that decision before any dynamically imported network client builds
+// its dispatcher. This keeps OAuth login and the provider-usage refresh that
+// follows it on the same path instead of reconnecting successfully and then
+// immediately reporting a direct-connect timeout.
+const restoredProxyEnvironment = inheritedProxyEnvironment();
+for (const [name, value] of Object.entries(restoredProxyEnvironment)) {
+  process.env[name] = value;
+}
+installStableFetchTransport();
 
 // Cross-target control plane for a tray/UI (e.g. the planned pane fork). It
 // reads which registry models are enabled per target and toggles them. Toggling
@@ -45,12 +73,65 @@ const REPO_ROOT = path.resolve(path.dirname(SELF), "..");
 // uninstall, so its presence is exactly the question being asked.
 const DSH_PUBLISHED = DSH_CATALOG_PATH;
 const GEMINI_PUBLISHED = GEMINI_CATALOG_PATH;
+const CURSOR_PUBLISHED = CURSOR_CATALOG_PATH;
+const CLAUDE_PUBLISHED = CLAUDE_CATALOG_PATH;
+const OPENCLAW_PUBLISHED = OPENCLAW_CATALOG_PATH;
 const TARGETS = [
   "codex",
   ...(existsSync(DSH_PUBLISHED) ? ["dsh"] : []),
   ...(existsSync(GEMINI_PUBLISHED) ? ["gemini"] : []),
+  ...(existsSync(CURSOR_PUBLISHED) ? ["cursor"] : []),
+  ...(existsSync(CLAUDE_PUBLISHED) ? ["claude"] : []),
+  ...(existsSync(OPENCLAW_PUBLISHED) ? ["openclaw"] : []),
 ];
 const args = process.argv.slice(2);
+const boundedAntigravityOperation =
+  (args[0] === "login" && args[1] === "antigravity-oauth") ||
+  (args[0] === "probe-provider" && args[1] === "antigravity-oauth");
+const restartBearingOverlayOperation = new Set([
+  "set-apply",
+  "credential",
+  "auth-mode",
+  "subagents",
+  "picker",
+  "vision-bridge",
+  "local-models",
+  "signed-routing",
+]).has(args[0]);
+const selfReplacingControl =
+  args[0] === "maintenance" ||
+  (args[0] === "tray" && ["refresh", "rebuild"].includes(args[1]));
+// Restart-bearing overlay transactions may use two complete 640-second
+// forward/rollback epochs. The control owner retains another ten seconds to
+// retire the inner process tree before a desktop watchdog may intervene.
+const maximumControlOperationMs = boundedAntigravityOperation
+  ? 610_000
+  : restartBearingOverlayOperation
+    ? 1_310_000
+    : 850_000;
+if (!selfReplacingControl && !boundedOperationChild(process.env, {
+  maximumMs: maximumControlOperationMs,
+})) {
+  // Every ordinary control invocation enters one separately terminable tree.
+  // Its owner gets ten seconds beyond the cooperative child budget so it can
+  // escalate a full process-group termination. Catalog desktop watchdogs keep
+  // another ten seconds outside this boundary; shorter ordinary operations
+  // retain the larger margin chosen by their UI runner.
+  const deadline = operationDeadlineFromEnvironment(process.env, {
+    timeoutMs: maximumControlOperationMs,
+    maximumMs: maximumControlOperationMs,
+  });
+  const result = await runOperationProcessTree(process.execPath, [SELF, ...args], {
+    cwd: REPO_ROOT,
+    env: process.env,
+    childEnvironment: {
+      CODEX_ROUTER_OPERATION_CHILD: "1",
+    },
+    deadline,
+    stdio: "inherit",
+  });
+  process.exit(result.status ?? 1);
+}
 
 function targetIsActive(target) {
   // One service serves every client, so "is this target active" cannot be the
@@ -60,6 +141,9 @@ function targetIsActive(target) {
   // Same question for Gemini CLI: whether this router published its `.env`
   // block. The CLI itself is not a resident process there is anything to poll.
   if (target === "gemini") return existsSync(GEMINI_PUBLISHED);
+  if (target === "cursor") return existsSync(CURSOR_PUBLISHED);
+  if (target === "claude") return existsSync(CLAUDE_PUBLISHED);
+  if (target === "openclaw") return existsSync(OPENCLAW_PUBLISHED);
   const result = spawnSync(process.execPath, [path.join(REPO_ROOT, "src", "service.mjs"), "status"], {
     env: { ...process.env, MODEL_ROUTER_TARGET: target },
     encoding: "utf8",
@@ -562,6 +646,12 @@ function refreshActiveTarget(target) {
         ? [process.execPath, [path.join(REPO_ROOT, "src", "dsh-config-manager.mjs"), "install"]]
         : target === "gemini"
           ? [process.execPath, [path.join(REPO_ROOT, "src", "gemini-config-manager.mjs"), "install"]]
+          : target === "cursor"
+            ? [process.execPath, [path.join(REPO_ROOT, "src", "cursor-config-manager.mjs"), "install"]]
+          : target === "claude"
+            ? [process.execPath, [path.join(REPO_ROOT, "src", "claude-code-config-manager.mjs"), "install"]]
+          : target === "openclaw"
+            ? [process.execPath, [path.join(REPO_ROOT, "src", "openclaw-config-manager.mjs"), "install"]]
           : undefined;
   if (!command) return;
   const result = spawnSync(command[0], command[1], {
@@ -646,8 +736,27 @@ async function runSetApply(provider, desired) {
 }
 
 async function printAccountUsage() {
+  if (discoveryDisabled()) {
+    throw new Error(
+      "ChatGPT account profiles are unavailable while credential discovery is disabled.",
+    );
+  }
   const { readCodexAccountUsage } = await import("./codex-account-usage.mjs");
-  process.stdout.write(`${JSON.stringify(await readCodexAccountUsage(), null, 2)}\n`);
+  const {
+    ensureChatGPTProfileAccounts,
+    selectedChatGPTUsageProfile,
+  } = await import("./chatgpt-profile-switch.mjs");
+  await ensureChatGPTProfileAccounts();
+  const profile = selectedChatGPTUsageProfile();
+  const usage = profile.home
+    ? await readCodexAccountUsage({ codexHome: profile.home })
+    : await readCodexAccountUsage();
+  process.stdout.write(`${JSON.stringify({
+    ...usage,
+    accountSelection: profile.selection,
+    accountEmail: profile.email || null,
+    profilePending: profile.pending === true,
+  }, null, 2)}\n`);
 }
 
 async function printProviderUsage() {
@@ -661,8 +770,12 @@ async function printProviderOnboarding() {
 }
 
 async function handleGenericProviders(...commandArgs) {
-  const { runGenericProviderCli } = await import("./generic-providers.mjs");
-  await runGenericProviderCli(commandArgs, { output: process.stdout });
+  // The control center and the provider CLI must cross the same publication
+  // boundary. Calling the descriptor CRUD layer directly here can leave a
+  // running route and every installed client's picker on the pre-mutation
+  // registry until some unrelated later apply.
+  const { runGenericCommand } = await import("./providers.mjs");
+  await runGenericCommand(commandArgs);
 }
 
 async function installProviderCli(providerId) {
@@ -673,7 +786,88 @@ async function installProviderCli(providerId) {
 
 async function loginProvider(providerId) {
   const { loginOauthProvider, providerOnboardingSnapshot } = await import("./provider-onboarding.mjs");
-  await loginOauthProvider(providerId);
+  const deadline = operationDeadlineFromEnvironment(process.env, {
+    timeoutMs: 10 * 60_000,
+    maximumMs: 10 * 60_000,
+  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    const error = new Error("Provider sign-in exceeded its absolute deadline.");
+    error.code = "router_operation_timeout";
+    controller.abort(error);
+  }, remainingOperationMs(deadline));
+  timer.unref?.();
+  try {
+    await loginOauthProvider(providerId, { signal: controller.signal, deadline });
+  } finally {
+    clearTimeout(timer);
+  }
+  if (providerId === "antigravity-oauth") {
+    // A re-login intentionally clears the previous live proof. Republish now
+    // so installed clients cannot keep advertising the route while it is in
+    // that fail-closed state; the provider selection itself is preserved.
+    await withModelOverlayLock(() => refreshTargetPickerIfInstalled());
+  }
+  process.stdout.write(`${JSON.stringify(providerOnboardingSnapshot())}\n`);
+}
+
+async function probeProvider(providerId, flags) {
+  if (providerId !== "antigravity-oauth") {
+    throw new Error("Only antigravity-oauth has a router-managed live compatibility probe.");
+  }
+  const allowed = new Set(["--live", "--yes", "--provision-project"]);
+  const unknown = flags.find((flag) => !allowed.has(flag));
+  if (unknown) {
+    throw new Error(
+      `Unknown Antigravity probe option: ${unknown}. ` +
+        "Usage: control probe-provider antigravity-oauth --live --yes [--provision-project]",
+    );
+  }
+  const { probeAntigravity } = await import("./antigravity-oauth-probe.mjs");
+  const { forgetProviderCatalogFamilyCache } = await import("./provider-catalogs.mjs");
+  const deadline = operationDeadlineFromEnvironment(process.env, {
+    timeoutMs: 10 * 60_000,
+    maximumMs: 10 * 60_000,
+  });
+  const operationTimeoutMs = remainingOperationMs(deadline);
+  const controller = new AbortController();
+  const deadlineTimer = setTimeout(() => {
+    const error = new Error(
+      "Antigravity probe activation timed out before the live request, service readiness, and publication completed.",
+    );
+    error.code = "antigravity_activation_timeout";
+    controller.abort(error);
+  }, operationTimeoutMs);
+  deadlineTimer.unref?.();
+  const remainingLockWaitMs = (operationDeadline) =>
+    Math.max(0, Math.min(120_000, operationDeadline - Date.now()));
+  const refreshInstalledClients = ({
+    signal = controller.signal,
+    deadline: operationDeadline = deadline,
+  } = {}) => withModelOverlayLock(async () => {
+    signal?.throwIfAborted();
+    await forgetProviderCatalogFamilyCache(providerId);
+    signal?.throwIfAborted();
+    return refreshTargetPickerIfInstalled({ signal, deadline: operationDeadline });
+  }, { waitMs: remainingLockWaitMs(operationDeadline) });
+  try {
+    await activateAntigravityProbe({
+      probe: probeAntigravity,
+      probeOptions: {
+        live: flags.includes("--live"),
+        confirmed: flags.includes("--yes"),
+        allowOnboard: flags.includes("--provision-project"),
+      },
+      withdraw: refreshInstalledClients,
+      restart: restartRouterForLocalRoutes,
+      publish: refreshInstalledClients,
+      signal: controller.signal,
+      deadline,
+    });
+  } finally {
+    clearTimeout(deadlineTimer);
+  }
+  const { providerOnboardingSnapshot } = await import("./provider-onboarding.mjs");
   process.stdout.write(`${JSON.stringify(providerOnboardingSnapshot())}\n`);
 }
 
@@ -717,7 +911,7 @@ async function saveProviderCredential(providerId) {
     const { enableProvider } = await import("./provider-selection.mjs");
     enableProvider(providerId);
     const { refreshTargetPickerIfInstalled } = await import("./target-integration.mjs");
-    refreshTargetPickerIfInstalled();
+    await refreshTargetPickerIfInstalled();
   });
   process.stdout.write(`${JSON.stringify(providerOnboardingSnapshot())}\n`);
 }
@@ -736,14 +930,113 @@ async function deleteProviderCredential(providerId) {
       if (result.removedFiles) catalog.forget(providerCatalogFamilyCacheIds(providerId));
       return result;
     });
-    if (removal.removedFiles) {
+    if (removal.removedFiles || providerId === "antigravity-oauth") {
       const { refreshTargetPickerIfInstalled } = await import("./target-integration.mjs");
-      refreshTargetPickerIfInstalled();
+      await refreshTargetPickerIfInstalled();
     }
   });
   process.stdout.write(
     `${JSON.stringify({ ...providerOnboardingSnapshot(), removal })}\n`,
   );
+}
+
+async function handleProviderKeyPool(providerId, action, value) {
+  const {
+    addEnvironmentCredentialToPool,
+    addStoredCredentialToPool,
+    deleteStoredCredentialPool,
+    removeStoredCredentialFromPool,
+    setStoredCredentialPoolPolicy,
+    setStoredCredentialPoolState,
+    storedCredentialPoolUsesServiceEnvironment,
+    storedCredentialRequiresServiceEnvironment,
+    storedCredentialPoolStatus,
+  } = await import("./provider-api-key-control.mjs");
+  if (!action || action === "status") {
+    // Status is deliberately lock-free and read-only. It must remain usable
+    // while a catalog publication is slow or recovering an abandoned owner.
+    process.stdout.write(`${JSON.stringify(storedCredentialPoolStatus(providerId), null, 2)}\n`);
+    return;
+  }
+  let mutation;
+  if (action === "add" && value) {
+    mutation = () => addStoredCredentialToPool(providerId, value);
+  } else if (action === "add-env" && value) {
+    mutation = () => addEnvironmentCredentialToPool(providerId, value);
+  } else if (action === "remove" && value) {
+    mutation = () => removeStoredCredentialFromPool(providerId, value);
+  } else if (action === "delete" && !value) {
+    mutation = () => deleteStoredCredentialPool(providerId);
+  } else if ((action === "pause" || action === "resume") && value) {
+    mutation = () => setStoredCredentialPoolState(providerId, value, action === "pause");
+  } else if (action === "policy" && value) {
+    mutation = () => setStoredCredentialPoolPolicy(providerId, value);
+  } else {
+    throw new Error("Usage: control key-pool <provider> status|add|add-env|remove|delete|pause|resume|policy [credential-id|environment-name|strategy]");
+  }
+  const addition = action === "add" || action === "add-env";
+  const removal = action === "remove" || action === "delete";
+  let environmentBacked = false;
+  let serviceEnvironmentStatus;
+  let result;
+  // Pool readiness decides whether this provider's models are routable. Treat
+  // its two metadata files, the gateway, and every installed client as one
+  // publication: a failed rebuild restores the exact previous pool/store and
+  // republishes that state rather than leaving a half-adopted credential.
+  const transact = (lock = true) => transactModelOverlayMutation({
+    files: [PROVIDER_API_KEY_POOL_PATH, PROVIDER_CREDENTIAL_STORE_PATH],
+    mutate: async () => { result = await mutation(); },
+    lock,
+  });
+  if (addition || removal) {
+    // Classify against the same pool/store generation the transaction will
+    // change. In particular, a concurrent pause/remove must not turn an opaque
+    // remove id from environment-backed into apparently ordinary metadata.
+    await withModelOverlayLock(async () => {
+      environmentBacked = action === "add-env" || (
+        action === "add" && storedCredentialRequiresServiceEnvironment(providerId, value)
+      ) || (
+        removal && storedCredentialPoolUsesServiceEnvironment(providerId, {
+          ...(action === "remove" ? { credentialId: value } : {}),
+        })
+      );
+      if (!environmentBacked) {
+        await transact(false);
+        return;
+      }
+
+      // Keep lock ordering consistent with model-overlay operations that
+      // restart the service: publication ownership first, service ownership
+      // second. The service lock stays held through publication, serializing
+      // both a new variable and removal of a retired one with service renders.
+      const { withServiceOperationLock } = await import("./service-operation-lock.mjs");
+      await withServiceOperationLock(async () => {
+        const {
+          environmentPoolMutationServiceStatus,
+          routerServiceStatus,
+        } = await import("./router-restart.mjs");
+        serviceEnvironmentStatus = addition
+          ? await environmentPoolMutationServiceStatus()
+          : await routerServiceStatus();
+        await transact(false);
+      });
+    });
+  } else {
+    await transact();
+  }
+  process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  if (environmentBacked) {
+    if (removal) {
+      const { environmentPoolRemovalReminder } = await import("./router-restart.mjs");
+      process.stderr.write(environmentPoolRemovalReminder(serviceEnvironmentStatus));
+    } else {
+      process.stderr.write(
+        serviceEnvironmentStatus.serviceReinstallRequired
+          ? "Environment-backed pool entry staged. Rerun the installer from this same environment; a service restart alone will not persist the variable.\n"
+          : "Environment-backed pool entry registered. Start the foreground router from this environment, or install the managed service from it.\n",
+      );
+    }
+  }
 }
 
 async function setLoginFreeMode(desired) {
@@ -1018,7 +1311,7 @@ function runDoctor(args) {
   process.stdout.write(`${JSON.stringify({ ok: true })}\n`);
 }
 
-function refreshModelSettingsCatalog() {
+async function refreshModelSettingsCatalog() {
   // The router owns the model policy.  Rebuilding only merged-models.json
   // leaves a published DSH route with the previous picker state (and makes
   // Gemini look different again at its next process start).  The target
@@ -1035,14 +1328,16 @@ function refreshModelSettingsCatalog() {
   }
 }
 
-async function restartRouterForLocalRoutes() {
+async function restartRouterForLocalRoutes({ signal, deadline } = {}) {
   // User-model routes live in files the running router only reads at startup,
   // so a local model toggle needs the same service reload curated-model apply
   // performs. Foreground/dev routers have no service and are skipped.
   const { restartRouterServiceIfInstalled } = await import("./router-restart.mjs");
-  const restarted = restartRouterServiceIfInstalled();
+  signal?.throwIfAborted();
+  const restarted = await restartRouterServiceIfInstalled({ signal, deadline });
+  signal?.throwIfAborted();
   if (restarted) {
-    process.stderr.write("Router service restarted so local routes are live.\n");
+    process.stderr.write("Router service restarted so routes with fresh process state are live.\n");
   }
   return restarted;
 }
@@ -1205,7 +1500,7 @@ async function handleSubagents(action, value, flag, rest = []) {
         spawnDetachedVerification(slugs);
       }
     }
-    refreshModelSettingsCatalog();
+    await refreshModelSettingsCatalog();
     process.stdout.write(`${JSON.stringify(policyState)}\n`);
     return;
   }
@@ -1243,7 +1538,7 @@ async function handleSubagents(action, value, flag, rest = []) {
       ? targets
       : subagentSettingsSnapshot().enabled;
     const verified = await verifySubagentCandidates(sweep, { force: targets.length > 0 });
-    refreshModelSettingsCatalog();
+    await refreshModelSettingsCatalog();
     process.stdout.write(`${JSON.stringify({ verified })}\n`);
     return;
   } else if (action === "certify") {
@@ -1362,7 +1657,7 @@ async function handleSubagents(action, value, flag, rest = []) {
     // One republish for the whole fan-out, and only when something was
     // promoted: publication rewrites the merged catalog and the agents
     // directory, which is far too much work to repeat per failed route.
-    if (promoted) refreshModelSettingsCatalog();
+    if (promoted) await refreshModelSettingsCatalog();
     process.stdout.write(`${JSON.stringify({ results })}\n`);
     return;
   } else if (action === "set") {
@@ -1439,7 +1734,7 @@ async function handleSubagents(action, value, flag, rest = []) {
         "policy status|provider <provider-id> <on|off>|model <model-slug> <on|off>|family <name> <on|off>",
     );
   }
-  refreshModelSettingsCatalog();
+  await refreshModelSettingsCatalog();
   process.stdout.write(`${JSON.stringify(subagentSettingsSnapshot())}\n`);
 }
 
@@ -1782,7 +2077,12 @@ async function handleVisionBridge(action, value, extra) {
         // windowsHide matters more here than anywhere else: a detached child
         // gets its own console on Windows, and this one lives for the length of
         // a multi-gigabyte pull. The local-model worker below already hides.
-        { detached: true, stdio: "ignore", windowsHide: true },
+        {
+          detached: true,
+          env: detachedOperationEnvironment(),
+          stdio: "ignore",
+          windowsHide: true,
+        },
       );
       child.unref();
       const workerState = readVisionDownload({ persist: false });
@@ -2161,9 +2461,20 @@ async function handleLocalModels(action, value, ...rest) {
     }
     const cancelled = () => readLocalDownload()?.status === "cancelled";
     try {
-      const { fetchRegistryCapabilities, detectMachine, fitAdvisory, rateDiskFit, rateModelFit } =
-        await import("./local-models.mjs");
-      const advertised = await fetchRegistryCapabilities(tag);
+      const {
+        EXPLORE_LOCAL_MODELS,
+        fetchRegistryCapabilities,
+        detectMachine,
+        fitAdvisory,
+        rateDiskFit,
+        rateModelFit,
+      } = await import("./local-models.mjs");
+      // Hugging Face namespaced tags are pulled directly by Ollama and do not
+      // have a registry.ollama.ai manifest. Their checked-in catalog size is
+      // still authoritative enough for the safety gate: without this fallback
+      // a 93-467 GB GLM download could bypass the explicit --force consent.
+      const advertised = await fetchRegistryCapabilities(tag)
+        || EXPLORE_LOCAL_MODELS.find((entry) => entry.tag === tag);
       if (cancelled()) return;
       // A missing tool template costs nothing to discover afterwards; gigabytes
       // that cannot run cost the download and the disk. So the tool note stays
@@ -2197,6 +2508,7 @@ async function handleLocalModels(action, value, ...rest) {
       writePhase("Starting model download");
       const child = spawn(process.execPath, [path.join(REPO_ROOT, "src", "local-download.mjs"), tag], {
         detached: true,
+        env: detachedOperationEnvironment(),
         stdio: "ignore",
         windowsHide: true,
       });
@@ -2341,7 +2653,12 @@ async function handleLocalModels(action, value, ...rest) {
         const child = spawn(
           process.execPath,
           [path.join(REPO_ROOT, "src", "local-uninstall.mjs"), tag],
-          { detached: true, stdio: "ignore", windowsHide: true },
+          {
+            detached: true,
+            env: detachedOperationEnvironment(),
+            stdio: "ignore",
+            windowsHide: true,
+          },
         );
         child.unref();
         writeLocalDownload({
@@ -2531,7 +2848,7 @@ async function handlePicker(action, value, flag) {
     // The write above is the router's durable source of truth. Publish it to
     // Codex, DSH, and Gemini while the same model-overlay lock is held so a
     // second command cannot race a client snapshot between the two steps.
-    refreshModelSettingsCatalog();
+    await refreshModelSettingsCatalog();
   });
   process.stdout.write(`${JSON.stringify(modelPickerSnapshot())}\n`);
 }
@@ -2719,6 +3036,58 @@ async function handleHarness(action) {
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }
 
+// Publish the shared router plane into one concrete coding client. The Control
+// Center exposes this as a fixed client-row setup surface; no executable, cwd,
+// or arbitrary argv crosses the renderer boundary. DeepSeek Harness retains
+// its install-if-missing path, while Codex and Cursor use the same transactional
+// enable entrypoint operators run from the terminal. OpenClaw's enable path
+// installs the official CLI when missing before it publishes the provider.
+async function handleClientSetup(target, publicUrl, hostname) {
+  if (!["codex", "dsh", "cursor", "claude", "openclaw"].includes(target)) {
+    throw new Error("Usage: control client-setup codex|dsh|cursor|claude|openclaw [--hostname PUBLIC_HOSTNAME|--public-url HTTPS_ORIGIN]");
+  }
+  if (target === "dsh") {
+    if (publicUrl || hostname) throw new Error("--hostname and --public-url apply to Cursor only.");
+    const { setupHarness } = await import("./dsh-install.mjs");
+    process.stdout.write(`${JSON.stringify(await setupHarness())}\n`);
+    return;
+  }
+  if (target === "cursor" && !publicUrl && !hostname) {
+    const { installCursorAgentIntegration } = await import("./cursor-config-manager.mjs");
+    process.stdout.write(`${JSON.stringify({
+      target,
+      configured: true,
+      surface: "agent",
+      ...installCursorAgentIntegration(),
+    })}\n`);
+    return;
+  }
+  if (target !== "cursor" && (publicUrl || hostname)) {
+    throw new Error(
+      "--hostname and --public-url apply to Cursor only.",
+    );
+  }
+  if (publicUrl && hostname) throw new Error("Use either --hostname or --public-url, not both.");
+  const { currentCheckoutInstaller } = await import("./update.mjs");
+  const enable = currentCheckoutInstaller(process.platform, target, { posixScript: "enable" });
+  const environment = { ...process.env, MODEL_ROUTER_TARGET: target };
+  if (publicUrl) environment.MODEL_ROUTER_CURSOR_PUBLIC_BASE_URL = publicUrl;
+  if (hostname) environment.MODEL_ROUTER_CURSOR_TUNNEL_HOSTNAME = hostname;
+  const result = spawnSync(enable.command, enable.args, {
+    cwd: REPO_ROOT,
+    env: environment,
+    encoding: "utf8",
+    windowsHide: true,
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(
+      String(result.stderr || result.stdout || `${target} setup failed`).trim(),
+    );
+  }
+  process.stdout.write(`${JSON.stringify({ target, configured: true })}\n`);
+}
+
 async function handleClientExport() {
   const values = args.slice(1);
   let secretEnv;
@@ -2760,6 +3129,176 @@ async function handleChatGptSession(action) {
   );
 }
 
+function decodeChatGPTLoginLease(value) {
+  if (typeof value !== "string" || value.length < 8 || value.length > 2_048 || !/^[A-Za-z0-9_-]+$/.test(value)) {
+    throw new Error("The ChatGPT login completion lease is invalid.");
+  }
+  let lease;
+  try {
+    lease = JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
+  } catch (error) {
+    throw new Error("The ChatGPT login completion lease is invalid.", { cause: error });
+  }
+  if (
+    !lease
+    || typeof lease !== "object"
+    || Array.isArray(lease)
+    || ![2, 3].includes(lease.version)
+    || typeof lease.leaseId !== "string"
+    || !/^[0-9a-f-]{36}$/i.test(lease.leaseId)
+    || !Number.isSafeInteger(lease.pid)
+    || lease.pid < 1
+    || typeof lease.processIdentity !== "string"
+    || !lease.processIdentity
+    || !Number.isFinite(lease.createdAt)
+    || (lease.version === 3 && !["reserved", "running"].includes(lease.phase))
+    || (lease.version === 3 && lease.authDigestBefore !== null && !/^[0-9a-f]{64}$/.test(lease.authDigestBefore))
+  ) {
+    throw new Error("The ChatGPT login completion lease is invalid.");
+  }
+  return lease;
+}
+
+async function handleChatGptAccountSwitch(action, value, completionLease) {
+  // Keep this boundary ahead of both dynamic imports. The Control Center polls
+  // `status` automatically, and --no-discovery promises that even a background
+  // read cannot inspect auth files, create first-run pool state, or migrate the
+  // current Codex login into an isolated account home.
+  if (discoveryDisabled()) {
+    throw new Error(
+      "ChatGPT account profiles are unavailable while credential discovery is disabled.",
+    );
+  }
+  const {
+    chatGPTSubscriptionAccountHome,
+    chatGPTSubscriptionAccountPoolSnapshot,
+    createChatGPTSubscriptionAccount,
+    readChatGPTAccountPoolState,
+    refreshBoundedChatGPTSubscriptionAccounts,
+    withChatGPTAccountPoolLock,
+  } = await import("./chatgpt-account-pool.mjs");
+  const {
+    chatGPTProfileSwitchSnapshot,
+    discardCompletedChatGPTProfileLogin,
+    ensureChatGPTProfileAccounts,
+    finalizeChatGPTProfileLogin,
+    recoverCompletedChatGPTProfileLogins,
+    reconcileChatGPTProfileSwitch,
+    reconcileChatGPTProfileSwitchIfReady,
+    removeChatGPTProfileAccount,
+    selectChatGPTProfileAccount,
+  } = await import("./chatgpt-profile-switch.mjs");
+
+  if (!action || action === "status") {
+    // This is the single production reconcile poll, owned by the Control
+    // Center account view. It is read-only for settled state; after Codex has
+    // closed it completes an explicit pending handoff or durable crash phase.
+    const recovery = await recoverCompletedChatGPTProfileLogins();
+    await reconcileChatGPTProfileSwitchIfReady();
+    await ensureChatGPTProfileAccounts();
+    const beforeRefresh = chatGPTSubscriptionAccountPoolSnapshot();
+    await refreshBoundedChatGPTSubscriptionAccounts(beforeRefresh);
+    const safe = chatGPTSubscriptionAccountPoolSnapshot();
+    const profile = chatGPTProfileSwitchSnapshot();
+    const loginAttempts = {};
+    for (const failure of recovery.failures) {
+      const account = safe.accounts?.[failure.accountId];
+      if (!account) continue;
+      account.subscription = {
+        ...(account.subscription || {}),
+        loginInProgress: false,
+        attentionRequired: true,
+      };
+      const removable = profile.active !== failure.accountId && profile.desired !== failure.accountId;
+      loginAttempts[failure.accountId] = {
+        status: "failed",
+        retryable: failure.code !== "finalization-failed",
+        removable,
+        error: failure.code === "identity-conflict"
+          ? removable
+            ? "This saved login conflicts with another account identity. Retry sign-in with the intended account or remove it."
+            : "This active login conflicts with its saved account identity. Retry sign-in with the intended account; switch away before removing it."
+          : failure.code === "invalid-auth"
+            ? removable
+              ? "The saved login is incomplete or invalid. Retry sign-in or remove this account."
+              : "The active saved login is incomplete or invalid. Retry sign-in; switch away before removing it."
+            : "The saved login could not be finalized safely. Resolve the profile error, then refresh.",
+      };
+    }
+    for (const [accountId, account] of Object.entries(safe.accounts || {})) {
+      if (account.subscription?.attentionRequired !== true || loginAttempts[accountId]) continue;
+      loginAttempts[accountId] = {
+        status: "failed",
+        retryable: false,
+        removable: false,
+        error: "A previous sign-in may still be running. Verify that no Codex login process remains before manually clearing its saved ownership.",
+      };
+    }
+    const { attachBoundedChatGPTAccountUsage } = await import("./codex-account-usage.mjs");
+    await attachBoundedChatGPTAccountUsage(safe, {
+      accountHome: (accountId) => chatGPTSubscriptionAccountHome(accountId),
+    });
+    process.stdout.write(`${JSON.stringify({
+      ...safe,
+      ...(Object.keys(loginAttempts).length ? { loginAttempts } : {}),
+      profile,
+      sessions: { count: Object.keys(safe.sessions || {}).length },
+    })}\n`);
+    return;
+  }
+  if (action === "add") {
+    const account = await withChatGPTAccountPoolLock(
+      () => createChatGPTSubscriptionAccount({ label: value }),
+    );
+    process.stdout.write(`${JSON.stringify({ account, loginRequired: true })}\n`);
+    return;
+  }
+  if (action === "home") {
+    const state = readChatGPTAccountPoolState();
+    if (!value || !/^acct_[A-Za-z0-9_-]{8,80}$/.test(value)) throw new Error("Account id is invalid.");
+    if (!state.accounts[value]) throw new Error("Account id is not registered.");
+    process.stdout.write(`${JSON.stringify({ accountId: value, home: chatGPTSubscriptionAccountHome(value) })}\n`);
+    return;
+  }
+  if (action === "login-finalize") {
+    if (!value || !/^acct_[A-Za-z0-9_-]{8,80}$/.test(value)) throw new Error("Account id is invalid.");
+    process.stdout.write(`${JSON.stringify(await finalizeChatGPTProfileLogin(value, {
+      expectedLoginLease: decodeChatGPTLoginLease(completionLease),
+    }))}\n`);
+    return;
+  }
+  if (action === "login-reset") {
+    if (!value || !/^acct_[A-Za-z0-9_-]{8,80}$/.test(value)) throw new Error("Account id is invalid.");
+    process.stdout.write(`${JSON.stringify({ reset: await discardCompletedChatGPTProfileLogin(value) })}\n`);
+    return;
+  }
+  if (action === "remove") {
+    const result = await removeChatGPTProfileAccount(value);
+    process.stdout.write(`${JSON.stringify(result.removed)}\n`);
+    return;
+  }
+  if (action === "select") {
+    const selection = String(value || "").trim();
+    if (!/^acct_[A-Za-z0-9_-]{8,80}$/.test(selection)) {
+      throw new Error("Select a registered ChatGPT account id.");
+    }
+    const { pool, profile } = await selectChatGPTProfileAccount(selection);
+    process.stdout.write(`${JSON.stringify({ ...pool, profile })}\n`);
+    return;
+  }
+  if (action === "profile") {
+    if (value === "reconcile") {
+      process.stdout.write(`${JSON.stringify(await reconcileChatGPTProfileSwitch())}\n`);
+      return;
+    }
+    if (!value || value === "status") {
+      process.stdout.write(`${JSON.stringify(chatGPTProfileSwitchSnapshot())}\n`);
+      return;
+    }
+  }
+  throw new Error("Usage: control chatgpt-account-pool status|add [label]|home <acct_id>|login-finalize <acct_id> <lease>|remove <acct_id>|select <acct_id>|profile status|profile reconcile");
+}
+
 // The public `/health` leaf intentionally contains only the router summary and
 // a closed set of degraded dependency names. Desktop surfaces need the richer
 // local service view, but should not be handed the forwarders' credential
@@ -2799,6 +3338,11 @@ if (args.includes("--probe")) {
 } else if (args[0] === "login") {
   if (!args[1]) throw new Error("Usage: control login <oauth-provider>");
   await loginProvider(args[1]);
+} else if (args[0] === "probe-provider") {
+  if (!args[1]) {
+    throw new Error("Usage: control probe-provider antigravity-oauth --live --yes [--provision-project]");
+  }
+  await probeProvider(args[1], args.slice(2));
 } else if (args[0] === "catalog-cache") {
   if (args[1] !== "invalidate" || !args[2]) {
     throw new Error("Usage: control catalog-cache invalidate <provider>");
@@ -2811,6 +3355,9 @@ if (args.includes("--probe")) {
   } else {
     await saveProviderCredential(args[1]);
   }
+} else if (args[0] === "key-pool") {
+  if (!args[1]) throw new Error("Usage: control key-pool <provider> status|add|add-env|remove|delete|pause|resume|policy [credential-id|environment-name|strategy]");
+  await handleProviderKeyPool(args[1], args[2], args[3]);
 } else if (args[0] === "auth-mode") {
   await setLoginFreeMode(args[1]);
 } else if (args[0] === "signed-routing") {
@@ -2839,6 +3386,13 @@ if (args.includes("--probe")) {
   handleTray(args[1]);
 } else if (args[0] === "harness") {
   await handleHarness(args[1]);
+} else if (args[0] === "client-setup") {
+  const publicUrl = optionValue("--public-url");
+  const hostname = optionValue("--hostname");
+  if ((publicUrl && hostname) || ((publicUrl || hostname) && args.length !== 4) || (!publicUrl && !hostname && args.length !== 2)) {
+    throw new Error("Usage: control client-setup codex|dsh|cursor|claude|openclaw [--hostname PUBLIC_HOSTNAME|--public-url HTTPS_ORIGIN]");
+  }
+  await handleClientSetup(args[1], publicUrl, hostname);
 } else if (args[0] === "client-export") {
   await handleClientExport();
 } else if (args[0] === "presence") {
@@ -2846,6 +3400,8 @@ if (args.includes("--probe")) {
 } else if (args[0] === "chatgpt-session") {
   if (args.length > 2) throw new Error("Usage: control chatgpt-session status|enable|disable");
   await handleChatGptSession(args[1]);
+} else if (args[0] === "chatgpt-account-pool") {
+  await handleChatGptAccountSwitch(args[1], args[2], args[3]);
 } else if (args[0] === "health") {
   await printHealth();
 } else if (args[0] === "maintenance") {

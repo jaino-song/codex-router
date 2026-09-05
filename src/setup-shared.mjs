@@ -19,7 +19,7 @@ import { kimiOAuthStatus } from "./oauth-status.mjs";
 import { grokOAuthStatus } from "./grok-oauth-status.mjs";
 import { antigravityOAuthStatus } from "./antigravity-oauth-status.mjs";
 import { SOURCE_ROOT } from "./paths.mjs";
-import { credentialStatus } from "./provider-credentials.mjs";
+import { effectiveProviderCredentialStatus } from "./provider-api-key-routing.mjs";
 import { providerOnboardingSnapshot } from "./provider-onboarding.mjs";
 import { defaultProviderIds, validateProviderIds } from "./provider-selection.mjs";
 import { commandOnPath, spawnableCommand } from "./spawnable-command.mjs";
@@ -127,7 +127,7 @@ export function providerConfigured(provider) {
   }
   return providerNeedsNoKey(provider)
     ? true
-    : credentialStatus(provider, { persistent: true }).configured;
+    : effectiveProviderCredentialStatus(provider, { persistent: true }).configured;
 }
 
 // Per-provider hint for a selected-but-unconfigured OAuth provider.

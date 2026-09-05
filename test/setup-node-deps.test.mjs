@@ -113,6 +113,68 @@ sys.stdout.buffer.write(output)
 raise SystemExit(os.waitstatus_to_exitcode(status))
 `;
 
+const ANTIGRAVITY_GUIDED_HELPER = String.raw`
+import errno
+import os
+import select
+import sys
+
+node, setup, checkout, home, state_dir = sys.argv[1:]
+env = os.environ.copy()
+env.update({
+    "HOME": home,
+    "CODEX_HOME": home,
+    "CODEX_ROUTER_STATE_DIR": state_dir,
+    "MODEL_ROUTER_STATE_DIR": state_dir,
+    "MODEL_ROUTER_TARGET": "codex",
+})
+pid, master = os.forkpty()
+if pid == 0:
+    os.chdir(checkout)
+    os.execve(node, [
+        node,
+        setup,
+        "--guided",
+        "--providers",
+        "antigravity-oauth",
+        "--selection-only",
+    ], env)
+
+output = bytearray()
+models_cleared = False
+models_confirmed = False
+login_confirmed = False
+while True:
+    ready, _, _ = select.select([master], [], [], 20)
+    if not ready:
+        os.kill(pid, 9)
+        raise SystemExit("timed out waiting for Antigravity guided setup")
+    try:
+        chunk = os.read(master, 4096)
+    except OSError as error:
+        if error.errno == errno.EIO:
+            break
+        raise
+    if not chunk:
+        break
+    output.extend(chunk)
+    prompts = output.count(b"Toggle model numbers")
+    if not models_cleared and prompts >= 1:
+        os.write(master, b"n\n")
+        models_cleared = True
+    elif models_cleared and not models_confirmed and prompts >= 2:
+        os.write(master, b"\n")
+        models_confirmed = True
+    if not login_confirmed and b"Open a browser to sign in to Google Antigravity OAuth now?" in output:
+        os.write(master, b"y\n")
+        login_confirmed = True
+
+_, status = os.waitpid(pid, 0)
+os.close(master)
+sys.stdout.buffer.write(output)
+raise SystemExit(os.waitstatus_to_exitcode(status))
+`;
+
 // A stub that stands in for a working `npm ci`: it records the arguments and
 // materializes the dependency tree the run needs.
 const NPM_STUB_SUCCEEDS = `#!/bin/sh
@@ -205,6 +267,86 @@ test(
       assert.doesNotMatch(result.stdout, /Kimi K3/);
       assert.equal(existsSync(path.join(checkout, "node_modules", ".package-lock.json")), true);
     });
+  },
+);
+
+test(
+  "guided Antigravity prepares dependencies before browser auth and withdraws an unverified selection",
+  { skip: process.platform === "win32" || !PYTHON_AVAILABLE },
+  () => {
+    const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-antigravity-deps-"));
+    const checkout = path.join(testRoot, "checkout");
+    const fakeBin = path.join(testRoot, "bin");
+    const stateDir = path.join(testRoot, "state");
+    const npmLog = path.join(testRoot, "npm.log");
+    try {
+      mkdirSync(checkout, { recursive: true });
+      cpSync(path.join(root, "src"), path.join(checkout, "src"), { recursive: true });
+      cpSync(path.join(root, "config"), path.join(checkout, "config"), { recursive: true });
+      copyFileSync(path.join(root, "package.json"), path.join(checkout, "package.json"));
+      copyFileSync(path.join(root, "package-lock.json"), path.join(checkout, "package-lock.json"));
+
+      mkdirSync(fakeBin, { recursive: true });
+      writeFileSync(path.join(fakeBin, "npm"), NPM_STUB_SUCCEEDS, { mode: 0o755 });
+      const browserCommand = process.platform === "darwin" ? "open" : "xdg-open";
+      writeFileSync(path.join(fakeBin, browserCommand), "#!/bin/sh\nexit 7\n", { mode: 0o755 });
+      mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+      writeFileSync(
+        path.join(stateDir, "antigravity-oauth.json"),
+        `${JSON.stringify({
+          version: 3,
+          managed_by: "codex-router",
+          session_generation: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          client_id: "operator-owned.apps.googleusercontent.com",
+          client_secret: "test-client-secret",
+          access_token: "signed-in-unverified",
+          refresh_token: "refresh",
+          expires_at: 2_000_000_000,
+          expires_in: 3600,
+        })}\n`,
+        { mode: 0o600 },
+      );
+
+      const result = spawnSync(
+        "python3",
+        [
+          "-c",
+          ANTIGRAVITY_GUIDED_HELPER,
+          process.execPath,
+          path.join(checkout, "src", "setup.mjs"),
+          checkout,
+          testRoot,
+          stateDir,
+        ],
+        {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            PATH: `${fakeBin}:${process.env.PATH || "/usr/local/bin:/usr/bin:/bin"}`,
+            CODEX_ROUTER_NPM_LOG: npmLog,
+            CODEX_ROUTER_TEST_NODE_MODULES: path.join(root, "node_modules"),
+          },
+          timeout: 30_000,
+        },
+      );
+
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+      assert.equal(readFileSync(npmLog, "utf8"), "ci --omit=dev\n");
+      assert.match(result.stdout, /could not open the browser automatically/);
+      assert.match(result.stdout, /Antigravity remains unselected/);
+      assert.match(result.stdout, /"providers":\s*\[\s*\]/);
+      assert.deepEqual(
+        JSON.parse(readFileSync(path.join(stateDir, "enabled-providers.json"), "utf8")).providers,
+        [],
+      );
+      const credential = JSON.parse(
+        readFileSync(path.join(stateDir, "antigravity-oauth.json"), "utf8"),
+      );
+      assert.equal(credential.access_token, "signed-in-unverified");
+      assert.equal(credential.probe_version, undefined);
+    } finally {
+      rmSync(testRoot, { recursive: true, force: true });
+    }
   },
 );
 

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { EventEmitter } from "node:events";
-import { realpathSync, symlinkSync } from "node:fs";
+import { EventEmitter, once } from "node:events";
+import { existsSync, realpathSync, symlinkSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -11,11 +11,13 @@ import {
   assertMutationCompatibility,
   detachedControlRuntime,
   discoverSourceRoot,
+  safeFailure,
   runControlDetached,
   runControl,
   runControlJson,
   runtimeEnvironment,
   standardSourceRoots,
+  windowsJobProcessInvocation,
 } from "../apps/control-center/electron/command-runner.mjs";
 import {
   groupModelFamilies,
@@ -42,6 +44,269 @@ import {
   shouldQuitOnLastWindowClosed,
   writeLifecycleState,
 } from "../apps/control-center/electron/lifecycle-state.mjs";
+import {
+  openBrowserCommand,
+  projectChatGPTSubscriptionLoginAttempts,
+} from "../apps/control-center/electron/ipc.mjs";
+import {
+  controlCenterDestination,
+  controlCenterNavigationURL,
+  NAVIGATION_ARGUMENT,
+  NAVIGATION_SOURCE_ARGUMENT,
+} from "../apps/control-center/electron/navigation.mjs";
+
+import { LANGUAGE_OPTIONS } from "../apps/control-center/src/i18n.ts";
+
+test("ChatGPT browser login reports a terminal retry after child close without auth", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "router-browser-login-"));
+  const windows = process.platform === "win32";
+  const executable = path.join(directory, windows ? "codex-test.cmd" : "codex-test");
+  const openedUrls = [];
+  let exited = false;
+  const accountId = "acct_example_123456";
+  const attempts = new Map([[accountId, { status: "pending", deadlineAt: Date.now() + 60_000 }]]);
+  try {
+    await writeFile(
+      executable,
+      windows
+        ? "@echo off\r\necho https://auth.openai.com/oauth/authorize?state=test\r\n"
+        : "#!/usr/bin/env node\nprocess.stdout.write('https://auth.openai.com/oauth/authorize?state=test')\n",
+    );
+    if (!windows) await chmod(executable, 0o755);
+    const result = await openBrowserCommand(executable, [], process.cwd(), {
+      environment: { PATH: windows ? process.env.PATH || "" : "/usr/bin:/bin:/usr/sbin:/sbin" },
+      openExternal: async (url) => { openedUrls.push(url); },
+      onExit: (outcome) => {
+        exited = true;
+        attempts.set(accountId, { ...attempts.get(accountId), ...outcome, status: "finished" });
+      },
+    });
+    assert.deepEqual(result, { opened: true, surface: "browser" });
+    assert.deepEqual(openedUrls, ["https://auth.openai.com/oauth/authorize?state=test"]);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(exited, true);
+    const projected = projectChatGPTSubscriptionLoginAttempts({
+      accounts: { [accountId]: { subscription: { usable: false } } },
+    }, attempts);
+    assert.deepEqual(projected.loginAttempts?.[accountId], {
+      status: "failed",
+      error: "Codex login closed before this account became usable.",
+      retryable: true,
+    });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a usable OAuth profile closes the pending attempt after core finalization", () => {
+  const accountId = "acct_example_123456";
+  const attempts = new Map([[accountId, {
+    status: "pending",
+    deadlineAt: Date.now() + 60_000,
+  }]]);
+  const pool = { accounts: { [accountId]: { subscription: { usable: true } } } };
+  const finished = projectChatGPTSubscriptionLoginAttempts(pool, attempts);
+  assert.equal("loginAttempts" in finished, false);
+  assert.equal(attempts.has(accountId), false);
+});
+
+test("core login recovery failures survive the Control Center projection", () => {
+  const accountId = "acct_example_123456";
+  const coreFailure = {
+    status: "failed",
+    error: "The saved login is incomplete or invalid. Retry sign-in or remove this account.",
+    retryable: true,
+  };
+  const projected = projectChatGPTSubscriptionLoginAttempts({
+    accounts: { [accountId]: { subscription: { usable: false, attentionRequired: true } } },
+    loginAttempts: { [accountId]: coreFailure },
+  }, new Map());
+  assert.deepEqual(projected.loginAttempts?.[accountId], coreFailure);
+
+  const nonRetryable = projectChatGPTSubscriptionLoginAttempts({
+    accounts: { [accountId]: { subscription: { usable: false, attentionRequired: true } } },
+    loginAttempts: { [accountId]: { status: "failed", error: "Profile repair required.", retryable: false } },
+  }, new Map());
+  assert.equal(nonRetryable.loginAttempts?.[accountId]?.retryable, false);
+
+  const localAttempts = new Map([[accountId, {
+    status: "finished",
+    code: 1,
+    deadlineAt: Date.now() - 1,
+  }]]);
+  const collision = projectChatGPTSubscriptionLoginAttempts({
+    accounts: { [accountId]: { subscription: { usable: false, attentionRequired: true } } },
+    loginAttempts: {
+      [accountId]: {
+        status: "failed",
+        error: "The active account must be retried before removal.",
+        retryable: true,
+        removable: false,
+      },
+    },
+  }, localAttempts);
+  assert.deepEqual(collision.loginAttempts?.[accountId], {
+    status: "failed",
+    error: "The active account must be retried before removal.",
+    retryable: true,
+    removable: false,
+  });
+});
+
+test("browser opener settlement survives the Codex child exiting first", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "router-browser-exit-race-"));
+  const script = path.join(directory, "codex-login-fixture.mjs");
+  try {
+    await writeFile(
+      script,
+      "process.stdout.write('https://auth.openai.com/oauth/authorize?state=exit-race');\n",
+    );
+
+    for (const expected of ["reject", "resolve"]) {
+      let settleOpener;
+      let markOpenerCalled;
+      let markChildExited;
+      let exitCount = 0;
+      const openerCalled = new Promise((resolve) => { markOpenerCalled = resolve; });
+      const childExited = new Promise((resolve) => { markChildExited = resolve; });
+      const opener = new Promise((resolve, reject) => {
+        settleOpener = expected === "reject"
+          ? () => reject(new Error("delayed browser refusal"))
+          : resolve;
+      });
+      const opened = openBrowserCommand(process.execPath, [script], process.cwd(), {
+        environment: { PATH: process.env.PATH || "" },
+        openExternal: async () => {
+          markOpenerCalled();
+          return opener;
+        },
+        onExit: () => {
+          exitCount += 1;
+          markChildExited();
+        },
+      });
+      await openerCalled;
+      await childExited;
+      settleOpener();
+      const bounded = Promise.race([
+        opened,
+        new Promise((_, reject) => setTimeout(() => reject(new Error("browser opener remained pending")), 700)),
+      ]);
+      if (expected === "reject") {
+        await assert.rejects(bounded, /Could not open the default browser: delayed browser refusal/);
+      } else {
+        assert.deepEqual(await bounded, { opened: true, surface: "browser" });
+      }
+      assert.equal(exitCount, 1, "child exit notification must remain exactly once");
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("ChatGPT browser login has a bounded post-handoff completion deadline", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "router-browser-deadline-"));
+  const script = path.join(directory, "codex-login-fixture.mjs");
+  const pidPath = path.join(directory, "login.pid");
+  let outcome;
+  try {
+    await writeFile(script, `
+      import { writeFileSync } from "node:fs";
+      writeFileSync(${JSON.stringify(pidPath)}, String(process.pid));
+      process.stdout.write("https://auth.openai.com/oauth/authorize?state=deadline");
+      setInterval(() => {}, 1_000);
+    `);
+    const opened = await openBrowserCommand(process.execPath, [script], process.cwd(), {
+      environment: { PATH: process.env.PATH || "" },
+      openExternal: async () => {},
+      completionTimeoutMs: 40,
+      onExit: (value) => { outcome = value; },
+    });
+    assert.deepEqual(opened, { opened: true, surface: "browser" });
+    const deadline = Date.now() + 2_000;
+    while (!outcome && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.match(outcome?.error || "", /browser sign-in deadline/);
+    const pid = Number(await readFile(pidPath, "utf8"));
+    assert.throws(() => process.kill(pid, 0), /ESRCH|no such process|not found/i);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a rejected browser handoff terminates the detached Codex login", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "router-browser-reject-"));
+  const script = path.join(directory, "codex-login-fixture.mjs");
+  const pidPath = path.join(directory, "login.pid");
+  let exited = false;
+  try {
+    await writeFile(script, `
+      import { writeFileSync } from "node:fs";
+      writeFileSync(${JSON.stringify(pidPath)}, String(process.pid));
+      process.stdout.write("https://auth.openai.com/oauth/authorize?state=rejected");
+      setInterval(() => {}, 1_000);
+    `);
+    await assert.rejects(
+      openBrowserCommand(process.execPath, [script], process.cwd(), {
+        environment: { PATH: process.env.PATH || "" },
+        openExternal: async () => { throw new Error("browser unavailable"); },
+        onExit: () => { exited = true; },
+      }),
+      /Could not open the default browser: browser unavailable/,
+    );
+    assert.equal(exited, true, "the in-flight account login must be released on handoff failure");
+    const pid = Number(await readFile(pidPath, "utf8"));
+    assert.ok(Number.isInteger(pid) && pid > 0);
+    assert.throws(() => process.kill(pid, 0), /ESRCH|no such process|not found/i);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("Control Center navigation accepts only one fixed widget destination", () => {
+  assert.deepEqual(controlCenterDestination(["electron", ".", NAVIGATION_ARGUMENT, "usage"]), {
+    destination: "usage",
+    sourceId: undefined,
+  });
+  assert.deepEqual(
+    controlCenterDestination(["electron", ".", NAVIGATION_ARGUMENT, "usage-resets"]),
+    { destination: "usage-resets", sourceId: undefined },
+  );
+  assert.deepEqual(
+    controlCenterDestination([
+      "electron", ".", NAVIGATION_ARGUMENT, "usage", NAVIGATION_SOURCE_ARGUMENT, "deepseek",
+    ]),
+    { destination: "usage", sourceId: "deepseek" },
+  );
+  assert.equal(controlCenterDestination(["electron", ".", NAVIGATION_ARGUMENT, "settings"]), undefined);
+  assert.equal(controlCenterDestination(["electron", ".", NAVIGATION_ARGUMENT]), undefined);
+  assert.equal(controlCenterDestination([
+    "electron", ".", NAVIGATION_ARGUMENT, "usage", NAVIGATION_SOURCE_ARGUMENT, "deep_seek",
+  ]), undefined);
+  assert.equal(controlCenterDestination([
+    "electron", ".", NAVIGATION_ARGUMENT, "usage", NAVIGATION_ARGUMENT, "usage-resets",
+  ]), undefined);
+});
+
+test("Control Center navigation URLs are exact and source bounded", () => {
+  assert.deepEqual(controlCenterNavigationURL(
+    "codex-router://control-center/usage-resets?source=openai",
+  ), { destination: "usage-resets", sourceId: "openai" });
+  assert.deepEqual(controlCenterNavigationURL(
+    "codex-router://control-center/usage",
+  ), { destination: "usage", sourceId: undefined });
+  for (const value of [
+    "https://control-center/usage",
+    "codex-router://other/usage",
+    "codex-router://control-center//usage",
+    "codex-router://control-center/settings",
+    "codex-router://control-center/usage?source=deep_seek",
+    "codex-router://control-center/usage?source=openai&source=deepseek",
+    "codex-router://control-center/usage?next=settings",
+    "codex-router://control-center/usage#reset",
+  ]) assert.equal(controlCenterNavigationURL(value), undefined, value);
+});
 
 test("Control Center groups provider routes under one model family", () => {
   const families = groupModelFamilies([
@@ -306,7 +571,8 @@ test("Electron lifecycle state is durable, queryable, and fail-closed", async ()
 });
 
 test("a windowless desktop process survives only while a real tray owner exists", () => {
-  assert.equal(shouldQuitOnLastWindowClosed({ platform: "darwin", nativeTrayOwnedByHost: true }), true);
+  // Embedded macOS keeps the Electron process so Dock / Command-Tab can return.
+  assert.equal(shouldQuitOnLastWindowClosed({ platform: "darwin", nativeTrayOwnedByHost: true }), false);
   assert.equal(shouldQuitOnLastWindowClosed({ platform: "darwin", nativeTrayOwnedByHost: false, trayAvailable: false }), false);
   assert.equal(shouldQuitOnLastWindowClosed({ platform: "win32", nativeTrayOwnedByHost: false, trayAvailable: true }), false);
   assert.equal(shouldQuitOnLastWindowClosed({ platform: "win32", nativeTrayOwnedByHost: false, trayAvailable: false }), true);
@@ -390,14 +656,76 @@ async function makeProcessTreeControlRoot() {
       'import { spawn } from "node:child_process";',
       'import { writeFileSync } from "node:fs";',
       'const [pidFile, mode] = process.argv.slice(2);',
-      'const descendant = spawn(process.execPath, ["-e", "process.on(\\"SIGTERM\\", () => {}); setInterval(() => {}, 1000)"], { stdio: "ignore" });',
-      'writeFileSync(pidFile, String(descendant.pid));',
-      'if (mode === "overflow") process.stdout.write("x".repeat(4096));',
+      'const marker = `${pidFile}.survived`;',
+      'const worker = `const { writeFileSync } = require("node:fs"); process.on("SIGTERM", () => {}); process.on("SIGINT", () => {}); setTimeout(() => writeFileSync(${JSON.stringify(marker)}, "unsafe"), 900); process.send?.("ready"); process.disconnect?.(); setInterval(() => {}, 1000)`;',
+      // Hold the command's stdout/stderr pipes open after its leader exits, so
+      // the runner has to act on `exit` rather than waiting forever for `close`.
+      'const descendant = spawn(process.execPath, ["-e", worker], { stdio: ["ignore", "inherit", "inherit", "ipc"] });',
+      'descendant.once("message", () => {',
+      '  writeFileSync(pidFile, String(descendant.pid));',
+      '  if (mode === "success") process.exit(0);',
+      '  if (mode === "failure") process.exit(7);',
+      '  if (mode === "overflow") process.stdout.write("x".repeat(4096));',
+      '});',
       'process.on("SIGTERM", () => {});',
+      'process.on("SIGINT", () => {});',
       'setInterval(() => {}, 1000);',
       '',
     ].join("\n"),
     { mode: 0o700 },
+  );
+  await writeFile(
+    path.join(root, "src", "windows-process-tree.ps1"),
+    await readFile(new URL("../src/windows-process-tree.ps1", import.meta.url), "utf8"),
+    { mode: 0o600 },
+  );
+  await writeFile(path.join(root, "bin", "control"), "#!/bin/sh\n", { mode: 0o700 });
+  if (process.platform !== "win32") await chmod(path.join(root, "bin", "control"), 0o700);
+  return root;
+}
+
+async function makeBarrierControlRoot() {
+  const root = await mkdtemp(path.join(os.tmpdir(), "router-control-barrier-"));
+  await mkdir(path.join(root, "src"), { recursive: true });
+  await mkdir(path.join(root, "bin"), { recursive: true });
+  const processTreeModule = new URL("../src/process-tree.mjs", import.meta.url).href;
+  await writeFile(
+    path.join(root, "src", "control.mjs"),
+    [
+      'import { writeFileSync } from "node:fs";',
+      `import { runDuringOwnerSignalCleanup, runProcessTree, withOwnerSignalExitBarrier } from ${JSON.stringify(processTreeModule)};`,
+      "const [readyPath, completedPath, mode, rollbackText, barrierText, depthText = '0'] = process.argv.slice(2);",
+      "const rollbackMs = Number.parseInt(rollbackText, 10);",
+      "const barrierMs = Number.parseInt(barrierText, 10);",
+      "const depth = Number.parseInt(depthText, 10);",
+      "if (depth > 0) {",
+      "  await runProcessTree(process.execPath, [process.argv[1], readyPath, completedPath, mode, rollbackText, barrierText, String(depth - 1)], {",
+      "    childMayOwnProcessTrees: true,",
+      "    deadline: Date.now() + 10_000,",
+      "    env: { ...process.env, CODEX_ROUTER_OPERATION_CHILD: '1' },",
+      "  });",
+      "} else await withOwnerSignalExitBarrier(async (ownerSignal) => {",
+      "  writeFileSync(readyPath, String(process.pid));",
+      "  await new Promise((resolve) => {",
+      "    const hold = setInterval(() => {}, 1000);",
+      "    const finish = () => { clearInterval(hold); resolve(); };",
+      '    ownerSignal.addEventListener("abort", finish, { once: true });',
+      "    if (ownerSignal.aborted) finish();",
+      "  });",
+      "  await runDuringOwnerSignalCleanup(async () => {",
+      '    if (mode === "stuck") await new Promise(() => {});',
+      "    await new Promise((resolve) => setTimeout(resolve, rollbackMs));",
+      '    writeFileSync(completedPath, "restored");',
+      "  });",
+      "}, { timeoutMs: barrierMs });",
+      "",
+    ].join("\n"),
+    { mode: 0o700 },
+  );
+  await writeFile(
+    path.join(root, "src", "windows-process-tree.ps1"),
+    await readFile(new URL("../src/windows-process-tree.ps1", import.meta.url), "utf8"),
+    { mode: 0o600 },
   );
   await writeFile(path.join(root, "bin", "control"), "#!/bin/sh\n", { mode: 0o700 });
   if (process.platform !== "win32") await chmod(path.join(root, "bin", "control"), 0o700);
@@ -533,7 +861,16 @@ test("non-Windows detached refresh keeps the packaged Node-mode launch", { skip:
 });
 
 test("detached control resolves only after spawn and rejects a pre-spawn error", async () => {
-  const runtime = { executable: "/test/node", environment: {} };
+  const runtime = {
+    executable: "/test/node",
+    environment: {
+      CODEX_ROUTER_OPERATION_CHILD: "1",
+      CODEX_ROUTER_OPERATION_TIMEOUT_MS: "10",
+      CODEX_ROUTER_OPERATION_DEADLINE_MS: "20",
+      CODEX_ROUTER_OWNER_SIGNAL_BUDGET_MS: "9000",
+      CODEX_ROUTER_OWNER_SIGNAL_BARRIER_DIR: "/tmp/stale-owner-signal-barrier",
+    },
+  };
   const sourceRoot = path.dirname(fileURLToPath(new URL("../package.json", import.meta.url)));
   const failedChild = new EventEmitter();
   failedChild.unref = () => assert.fail("a failed child must not be unreferenced as launched");
@@ -551,16 +888,51 @@ test("detached control resolves only after spawn and rejects a pre-spawn error",
   launchedChild.pid = 4242;
   let unreferenced = false;
   launchedChild.unref = () => { unreferenced = true; };
+  let launchedOptions;
   const launched = runControlDetached(["tray", "restart"], {
     sourceRoot,
     runtime,
-    spawnImpl: () => {
+    spawnImpl: (_command, _args, options) => {
+      launchedOptions = options;
       queueMicrotask(() => launchedChild.emit("spawn"));
       return launchedChild;
     },
   });
   assert.equal(await launched, 4242);
   assert.equal(unreferenced, true);
+  assert.equal(launchedOptions.env.CODEX_ROUTER_OPERATION_CHILD, undefined);
+  assert.equal(launchedOptions.env.CODEX_ROUTER_OPERATION_TIMEOUT_MS, undefined);
+  assert.equal(launchedOptions.env.CODEX_ROUTER_OPERATION_DEADLINE_MS, undefined);
+  assert.equal(launchedOptions.env.CODEX_ROUTER_OWNER_SIGNAL_BUDGET_MS, undefined);
+  assert.equal(launchedOptions.env.CODEX_ROUTER_OWNER_SIGNAL_BARRIER_DIR, undefined);
+});
+
+test("manual OAuth-record recovery remains actionable after UI redaction", () => {
+  const message =
+    "The incompatible Antigravity OAuth record path is a nonempty directory. " +
+    "Review and remove its contents and the directory manually, then disconnect again.";
+  assert.equal(safeFailure(message), message);
+});
+
+test("Electron starts a fresh bounded control epoch inside its process-tree owner", async () => {
+  const source = await readFile(
+    new URL("../apps/control-center/electron/command-runner.mjs", import.meta.url),
+    "utf8",
+  );
+  const entrypoint = source.slice(
+    source.indexOf("function runEntrypoint("),
+    source.indexOf("export function runControlDetached("),
+  );
+  assert.match(entrypoint, /delete runtimeBaseline\.CODEX_ROUTER_OPERATION_DEADLINE_MS/);
+  assert.match(entrypoint, /delete runtimeBaseline\.CODEX_ROUTER_OPERATION_TIMEOUT_MS/);
+  assert.match(entrypoint, /delete runtimeBaseline\.CODEX_ROUTER_OPERATION_CHILD/);
+  assert.match(entrypoint, /delete runtimeBaseline\[OWNER_SIGNAL_BUDGET_ENV\]/);
+  assert.match(entrypoint, /delete runtimeBaseline\[OWNER_SIGNAL_BARRIER_DIR_ENV\]/);
+  assert.match(entrypoint, /childEnvironment\.CODEX_ROUTER_OPERATION_CHILD = "1"/);
+  assert.match(entrypoint, /childEnvironment\[OWNER_SIGNAL_BUDGET_ENV\] = String\(childSignalBudget\)/);
+  assert.match(entrypoint, /CODEX_ROUTER_OPERATION_DEADLINE_MS = String\(innerDeadline\)/);
+  assert.match(entrypoint, /terminateProcessTree\(child, \{/);
+  assert.match(entrypoint, /setTimeout\([\s\S]*boundedTimeoutMs\)/);
 });
 
 test("control center resolves a trusted router source root", async () => {
@@ -679,6 +1051,11 @@ test("trusted install provenance overrides contradictory package-manager environ
       "process.stdout.write(JSON.stringify({ packageManager: process.env.CODEX_ROUTER_PACKAGE_MANAGER ?? null }));\n",
       { mode: 0o700 },
     );
+    await writeFile(
+      path.join(owner, "src", "windows-process-tree.ps1"),
+      await readFile(new URL("../src/windows-process-tree.ps1", import.meta.url), "utf8"),
+      { mode: 0o600 },
+    );
     await writeFile(path.join(owner, "bin", "control"), "#!/bin/sh\n", { mode: 0o700 });
     process.env.CODEX_ROUTER_SOURCE_ROOT = owner;
     delete process.env.MODEL_ROUTER_SOURCE_ROOT;
@@ -707,6 +1084,7 @@ test("electron boundary does not enable node integration or shell argv", async (
   assert.match(preload, /require\("electron"\)/);
   assert.doesNotMatch(preload, /executeJavaScript|node:child_process|node:fs|node:path/);
   const main = await readFile(new URL("../apps/control-center/electron/main.mjs", import.meta.url), "utf8");
+  const ipc = await readFile(new URL("../apps/control-center/electron/ipc.mjs", import.meta.url), "utf8");
   assert.match(main, /contextIsolation:\s*true/);
   assert.match(main, /nodeIntegration:\s*false/);
   assert.match(main, /sandbox:\s*true/);
@@ -720,8 +1098,17 @@ test("electron boundary does not enable node integration or shell argv", async (
   assert.match(main, /app\.dock\?\.setIcon\(appIconPath\(\)\)/);
   assert.match(main, /function showDockForVisibleWindow\(\)[\s\S]*app\.dock\.setIcon\(appIconPath\(\)\)[\s\S]*app\.dock\.show\(\)/);
   assert.match(main, /function hideDockForHiddenWindow\(\)[\s\S]*app\.dock\.hide\(\)/);
-  assert.match(main, /function revealWindow\(\)[\s\S]{0,420}showDockForVisibleWindow\(\)[\s\S]{0,120}mainWindow\.show\(\)/);
-  assert.match(main, /createdWindow\.on\("hide"[\s\S]{0,180}hideDockForHiddenWindow\(\)/);
+  assert.match(main, /function revealWindow\(\)[\s\S]{0,700}showDockForVisibleWindow\(\)[\s\S]{0,120}mainWindow\.show\(\)/);
+  assert.match(
+    main,
+    /createdWindow\.on\("close"[\s\S]{0,500}nativeTrayOwnedByHost \|\| trayIsAvailable\(\)[\s\S]{0,120}event\.preventDefault\(\)[\s\S]{0,80}createdWindow\.hide\(\)/,
+  );
+  // Suppressing destroy without a recoverable owner strands Win/Linux when
+  // tray construction failed; the gate above is what keeps window-all-closed reachable.
+  assert.match(main, /if \(!\(nativeTrayOwnedByHost \|\| trayIsAvailable\(\)\)\) return;/);
+  assert.match(main, /let isQuitting = false/);
+  assert.match(main, /app\.on\("will-quit"[\s\S]{0,220}hideDockForHiddenWindow\(\)/);
+  assert.doesNotMatch(main, /createdWindow\.on\("hide"[\s\S]{0,180}hideDockForHiddenWindow\(\)/);
   assert.match(main, /setWindowOpenHandler\(\(\) => \(\{ action: "deny" \}\)\)/);
   assert.match(main, /if \(app\.isPackaged \|\| !requested\)/);
   assert.match(main, /\["127\.0\.0\.1", "localhost", "\[::1\]"\]\.includes\(parsed\.hostname\)/);
@@ -729,6 +1116,10 @@ test("electron boundary does not enable node integration or shell argv", async (
   assert.match(main, /setPermissionCheckHandler\(\(\) => false\)/);
   assert.match(main, /setPermissionRequestHandler\([\s\S]*callback\(false\)/);
   assert.match(main, /requestSingleInstanceLock\(\)/);
+  // main.mjs now exits helper invocations with process.exit(0): app.quit()
+  // before ready can stay alive in packaged Electron with no primary GUI,
+  // which blocked the transactional bundle swap.
+  assert.match(main, /\(!primaryInstance \|\| quitForUpdateInvocation\)\) process\.exit\(0\)/);
   assert.match(main, /app\.on\("second-instance"/);
   assert.match(main, /else openRequests\.requestOpen\(\)/);
   assert.match(main, /new Tray\(/);
@@ -750,9 +1141,11 @@ test("electron boundary does not enable node integration or shell argv", async (
   assert.match(main, /rendererReady\.didFailLoad/);
   assert.match(main, /app\.exit\(1\)/);
   assert.match(main, /commandLine\.includes\("--quit-for-update"\)/);
+  assert.match(main, /\(!primaryInstance \|\| quitForUpdateInvocation\)\) process\.exit\(0\)/);
   assert.match(main, /shouldQuitOnLastWindowClosed\([\s\S]{0,120}app\.quit\(\)/);
   assert.match(main, /LIFECYCLE_QUERY_ARGUMENT/);
   assert.match(main, /queryLifecycleState\(lifecycleFile\)/);
+  assert.match(main, /writeFileSync\(1, `\$\{JSON\.stringify\(queryLifecycleState\(lifecycleFile\)\)\}\\n`\)/);
   assert.match(main, /createdWindow\.on\("hide"[\s\S]{0,140}windowVisible = false/);
   assert.match(main, /app\.on\("will-quit"[\s\S]{0,160}applicationReady = false/);
   assert.match(main, /app\.on\("before-quit"/);
@@ -762,6 +1155,20 @@ test("electron boundary does not enable node integration or shell argv", async (
   assert.doesNotMatch(main, /script-src[^;]*'unsafe-inline'/);
   const builder = await readFile(new URL("../apps/control-center/electron-builder.yml", import.meta.url), "utf8");
   assert.match(builder, /extraResources:[\s\S]*icon\.png/);
+  assert.match(builder, /from:\s*\.\.\/\.\.\/src\/spawnable-command\.mjs[\s\S]*to:\s*src\/spawnable-command\.mjs/);
+  assert.match(builder, /from:\s*\.\.\/\.\.\/src\/chatgpt-login-lease\.mjs[\s\S]*to:\s*src\/chatgpt-login-lease\.mjs/);
+  assert.match(builder, /from:\s*\.\.\/\.\.\/src\/path-security\.mjs[\s\S]*to:\s*src\/path-security\.mjs/);
+  const packageImport = "file:///tmp/x.app/Contents/Resources/app.asar/electron/ipc.mjs";
+  assert.equal(
+    new URL("../../src/spawnable-command.mjs", packageImport).pathname,
+    "/tmp/x.app/Contents/Resources/src/spawnable-command.mjs",
+  );
+  const devImport = "file:///tmp/repo/apps/control-center/electron/ipc.mjs";
+  assert.equal(
+    new URL("../../../src/spawnable-command.mjs", devImport).pathname,
+    "/tmp/repo/src/spawnable-command.mjs",
+  );
+  assert.match(builder, /extraResources:[\s\S]*from: \.\.\/\.\.\/src[\s\S]*to: router-src/);
   assert.match(builder, /runAsNode:\s*true/);
   assert.match(builder, /enableEmbeddedAsarIntegrityValidation:\s*true/);
   assert.match(builder, /onlyLoadAppFromAsar:\s*true/);
@@ -808,6 +1215,10 @@ test("background usage polling is conservative while manual refresh stays immedi
   assert.doesNotMatch(source, /usageTimer = window\.setInterval\(\(\) => void refreshUsage\(\), 30_000\)/);
   assert.match(source, /Promise\.allSettled\(\[refreshCore\(\), refreshUsage\(\)\]\)/);
   assert.match(source, /Promise\.allSettled\(\[[\s\S]*api\.getSnapshot\(\)[\s\S]*api\.getHealth\(\)/);
+  assert.match(source, /settleRead\("snapshot", api\.getSnapshot\(\), setSnapshot\)/);
+  assert.match(source, /settleRead\("providers", api\.getProviders\(\), setProviders\)/);
+  assert.match(source, /settleRead\("providerUsage", api\.getProviderUsage\(\), setProviderUsage\)/);
+  assert.doesNotMatch(source, /loading \? <LoadingState \/> : page/);
   assert.match(source, /downloadPollInFlight\.current/);
   assert.match(source, /healthPollInFlight\.current/);
   assert.match(source, /document\.visibilityState !== "visible"/);
@@ -817,10 +1228,43 @@ test("background usage polling is conservative while manual refresh stays immedi
   assert.doesNotMatch(source, /downloadTimer = window\.setInterval\([\s\S]{0,160}refreshCore/);
 });
 
+test("provider usage reads outlive optional account refreshes", async () => {
+  const source = await readFile(new URL("../apps/control-center/electron/ipc.mjs", import.meta.url), "utf8");
+  assert.match(source, /const PROVIDER_USAGE_TIMEOUT_MS = 120_000/);
+  assert.match(
+    source,
+    /handle\("getProviderUsage"[\s\S]{0,180}\["provider-usage"\][\s\S]{0,120}PROVIDER_USAGE_TIMEOUT_MS/,
+  );
+  assert.match(
+    source,
+    /providerUsage: await runJson\([\s\S]{0,120}\["provider-usage"\][\s\S]{0,120}PROVIDER_USAGE_TIMEOUT_MS/,
+  );
+  assert.doesNotMatch(source, /\["provider-usage"\], \{ timeoutMs: 20_000 \}/);
+});
+
+test("dashboard presents traffic statistics before route and service controls", async () => {
+  const source = await readFile(new URL("../apps/control-center/src/pages/DashboardPage.tsx", import.meta.url), "utf8");
+  const positions = {
+    summary: source.indexOf('className="db-summary-grid"'),
+    traffic: source.indexOf('className="db-traffic-grid"'),
+    activity: source.indexOf("<TokenActivity"),
+    breakdown: source.indexOf('className="db-panel-grid db-dashboard-details"'),
+    events: source.indexOf('className="panel-section db-events-panel"'),
+    routes: source.indexOf("<RouteDashboardPanel"),
+    health: source.indexOf("<ServiceHealthPanel"),
+  };
+  assert.ok(Object.values(positions).every((position) => position >= 0), "every dashboard section should be present");
+  assert.deepEqual(
+    Object.entries(positions).sort((left, right) => left[1] - right[1]).map(([name]) => name),
+    ["summary", "traffic", "activity", "breakdown", "events", "routes", "health"],
+  );
+});
+
 test("preload exposes only the named control operations", async () => {
   const source = await readFile(new URL("../apps/control-center/electron/preload.cjs", import.meta.url), "utf8");
   for (const method of [
     "getSnapshot",
+    "getChatGptAccountPool",
     "getHarnesses",
     "getContextSessions",
     "minimizeWindow",
@@ -842,7 +1286,9 @@ test("preload exposes only the named control operations", async () => {
     "setDefaultModel",
     "repairInstall",
     "launchHarness",
-    "installHarness",
+    "setupHarness",
+    "prepareCursorTunnel",
+    "connectCursor",
     "openHarnessSession",
     "openExternal",
   ]) {
@@ -878,6 +1324,7 @@ test("preload constructs exact positional IPC payloads", async () => {
     },
   });
   const cases = [
+    ["getChatGptAccountPool", [], null],
     ["discoverProviderModels", ["provider"], { providerId: "provider", refresh: false }],
     ["discoverProviderModels", ["provider", { refresh: true }], { providerId: "provider", refresh: true }],
     ["setProviderEnabled", ["provider", false], { providerId: "provider", enabled: false }],
@@ -909,11 +1356,17 @@ test("preload constructs exact positional IPC payloads", async () => {
     ["setToolResultRetentionTtl", [7], { days: 7 }],
     ["setDefaultModel", ["model"], { slug: "model" }],
     ["setSignedRouting", [false], { enabled: false }],
+    ["addChatGptSubscriptionAccount", ["Work"], { label: "Work" }],
+    ["loginChatGptSubscriptionAccount", ["acct_example_123456"], { accountId: "acct_example_123456" }],
+    ["removeChatGptSubscriptionAccount", ["acct_example_123456"], { accountId: "acct_example_123456" }],
+    ["setChatGptAccountSelection", ["acct_example_123456"], { selection: "acct_example_123456" }],
     ["setPresence", ["always"], { mode: "always" }],
     ["controlService", ["start"], { action: "start" }],
     ["controlTray", ["status"], { action: "status" }],
     ["launchHarness", ["codex", "app"], { harnessId: "codex", surface: "app" }],
-    ["installHarness", ["deepcode"], { harnessId: "deepcode" }],
+    ["setupHarness", ["cursor", "cursor-router.example.com"], { harnessId: "cursor", hostname: "cursor-router.example.com" }],
+    ["prepareCursorTunnel", [], null],
+    ["connectCursor", ["cursor-router.example.com"], { hostname: "cursor-router.example.com" }],
     ["openHarnessSession", ["codex", "session", "terminal", "model"], { harnessId: "codex", sessionId: "session", surface: "terminal", model: "model" }],
     ["openExternal", ["https://example.com"], { url: "https://example.com" }],
   ];
@@ -1037,6 +1490,13 @@ test("settings keeps model choice out and exposes durable app preferences", asyn
   assert.match(settings, /setVisionBridgeEnabled\(/);
   assert.match(settings, /setVisionBridgeEngine\(/);
   assert.match(settings, /setVisionBridgeEffort\(/);
+  assert.match(settings, /ChatGPT accounts/);
+  assert.match(settings, /subscription-account-row/);
+  assert.match(settings, /No saved ChatGPT accounts/);
+  assert.match(settings, /addChatGptSubscriptionAccount\(/);
+  assert.match(settings, /loginChatGptSubscriptionAccount\(/);
+  assert.match(settings, /removeChatGptSubscriptionAccount\(/);
+  assert.doesNotMatch(settings, /access_token|refresh_token/);
   assert.doesNotMatch(settings, /runMaintenance/);
   assert.doesNotMatch(settings, /setLoginFree/);
   // Repair used to be terminal-only. It is an in-app button now, but it still
@@ -1062,7 +1522,7 @@ test("settings keeps model choice out and exposes durable app preferences", asyn
     "settings.maintenance.confirm.body",
   ]) {
     const occurrences = i18n.split(`"${key}"`).length - 1;
-    assert.equal(occurrences, 6, `${key} must be translated in all six locales`);
+    assert.equal(occurrences, LANGUAGE_OPTIONS.length, `${key} must be translated in every locale`);
   }
   // Sharing is an authorization to spend the user's subscription, so its
   // confirmation and live state cannot silently fall back to English.
@@ -1085,14 +1545,14 @@ test("settings keeps model choice out and exposes durable app preferences", asyn
     "settings.chatgptSession.action.disable",
   ]) {
     const occurrences = i18n.split(`"${key}"`).length - 1;
-    assert.equal(occurrences, 6, `${key} must be translated in all six locales`);
+    assert.equal(occurrences, LANGUAGE_OPTIONS.length, `${key} must be translated in every locale`);
   }
   for (const key of [
     "settings.desktop.unavailable.title",
     "settings.desktop.unavailable.body",
   ]) {
     const occurrences = i18n.split(`"${key}"`).length - 1;
-    assert.equal(occurrences, 6, `${key} must be translated in all six locales`);
+    assert.equal(occurrences, LANGUAGE_OPTIONS.length, `${key} must be translated in every locale`);
     assert.ok(settings.includes(`t("${key}")`), `${key} must be rendered through the translator`);
   }
   assert.doesNotMatch(settings, /["`]Sharing (?:enabled|disabled|status unavailable)/);
@@ -1192,6 +1652,11 @@ test("the model directory combines provider setup with de-duplicated model-famil
   assert.doesNotMatch(models, /<select[\s\S]{0,200}subagent thinking effort/);
   assert.match(models, /<dt>Model id<\/dt>/);
   assert.match(providerModelsCss, /\.pm-model-details\s*\{/);
+  assert.match(models, /<dd className="pm-model-details-controls">/);
+  assert.match(
+    providerModelsCss,
+    /\.pm-model-details dd\.pm-model-details-controls\s*\{[^}]*overflow:\s*visible/,
+  );
 
   // Adding republishes the whole catalog to every installed client and is the
   // slowest thing this page starts. Placeholder rows carrying the chosen slugs
@@ -1295,7 +1760,7 @@ test("the model directory combines provider setup with de-duplicated model-famil
   }
   assert.match(branding, /"lmstudio": "lmstudio"/);
   assert.match(branding, /ornith[^\n]+BRANDS\.deepreinforce/);
-  assert.match(branding, /hy3[^\n]+BRANDS\.tencent/);
+  assert.match(branding, /hy\(\?:3\|4\)[^\n]+BRANDS\.tencent/);
   assert.match(branding, /laguna[^\n]+BRANDS\.poolside/);
   assert.match(branding, /export function brandForLocalModel/);
   const sources = await readFile(new URL("../apps/control-center/src/assets/providers/SOURCES.md", import.meta.url), "utf8");
@@ -1307,6 +1772,8 @@ test("the model directory combines provider setup with de-duplicated model-famil
   assert.doesNotMatch(sources, /avatars\.githubusercontent\.com/);
   assert.match(branding, /cognition:[^\n]+name: "Devin"/);
   assert.match(branding, /deepreinforce:[^\n]+name: "Ornith"/);
+  assert.match(branding, /nanogpt:[^\n]+name: "NanoGPT"/);
+  assert.match(branding, /tencent:[^\n]+name: "Tencent"/);
   const local = await readFile(new URL("../apps/control-center/src/pages/LocalPage.tsx", import.meta.url), "utf8");
   assert.match(local, /brandForLocalModel/);
   assert.match(local, /<BrandLogo brand=\{brandForLocalModel\(model\)\}/);
@@ -1379,14 +1846,128 @@ test("control center focus feedback uses state changes without focus rings", asy
 
 test("harness and context IPC remain fixed and session-scoped", async () => {
   const source = await readFile(new URL("../apps/control-center/electron/ipc.mjs", import.meta.url), "utf8");
-  assert.match(source, /const HARNESS_IDS = \["codex", "deepcode"\]/);
+  assert.match(source, /const HARNESS_IDS = \["codex", "dsh", "gemini", "cursor", "claude", "openclaw"\]/);
   assert.match(source, /const HARNESS_SURFACES = \["app", "terminal"\]/);
   assert.match(source, /const SESSION_UUID = \/\^\[0-9a-f\]/);
-  assert.match(source, /const DEEPCODE_PACKAGE = "@vegamo\/deepcode-cli"/);
+  assert.match(source, /const DSH_SESSION_ID = \/\^session-/);
   assert.match(source, /oneOf\(harnessId, HARNESS_IDS, "Harness"\)/);
-  assert.match(source, /stringValue\(sessionId, "Session", SESSION_UUID\)/);
+  assert.match(source, /harness === "dsh" \? DSH_SESSION_ID : harness === "cursor" \? CURSOR_SESSION_ID : SESSION_UUID/);
   assert.match(source, /codex:\/\/threads\/\$\{id\}/);
   assert.doesNotMatch(source, /readFileSync\(deepcodeSettings/);
+  const chatgptLogin = source.match(/handleAction\("loginChatGptSubscriptionAccount"[\s\S]*?\n  \}\);/)?.[0];
+  assert.ok(chatgptLogin, "ChatGPT subscription login handler should be readable");
+  assert.match(chatgptLogin, /openBrowserCommand\(codex, \["login"\]/);
+  assert.match(chatgptLogin, /\["chatgpt-account-pool", "status"\]/);
+  assert.match(chatgptLogin, /\["chatgpt-account-pool", "status"\][\s\S]{0,120}CATALOG_MUTATION_TIMEOUT_MS/);
+  assert.match(chatgptLogin, /account\.subscription\?\.usable === true/);
+  assert.match(chatgptLogin, /subscriptionLoginAttempts\.get\(id\)\?\.status !== "failed"/);
+  assert.match(chatgptLogin, /profileHome === primaryHome/);
+  assert.match(chatgptLogin, /subscriptionLoginInFlight/);
+  assert.match(chatgptLogin, /createChatGPTLoginLease/);
+  assert.match(chatgptLogin, /attachChatGPTLoginLease/);
+  assert.match(chatgptLogin, /clearChatGPTLoginLease/);
+  assert.ok(
+    chatgptLogin.indexOf("createChatGPTLoginLease") < chatgptLogin.indexOf("openBrowserCommand"),
+    "durable login ownership must be reserved before the credential writer starts",
+  );
+  assert.match(chatgptLogin, /"login-finalize", id, completionLease/);
+  assert.match(chatgptLogin, /"login-reset", id/);
+  assert.match(chatgptLogin, /enqueueMutation\(\(\) => runJson\([\s\S]*?"login-finalize", id, completionLease/);
+  assert.ok(
+    chatgptLogin.indexOf("loginFinalization = loginExited.then(processLoginExit)")
+      < chatgptLogin.indexOf("const opened = await openedPromise"),
+    "every attached credential writer must own finalization before browser handoff settles",
+  );
+  assert.match(chatgptLogin, /if \(loginFinalization\) \{[\s\S]*?await loginFinalization/);
+  const chatgptRemove = source.match(/handleAction\("removeChatGptSubscriptionAccount"[\s\S]*?\n  \}\);/)?.[0];
+  assert.ok(chatgptRemove, "ChatGPT subscription removal handler should be readable");
+  assert.match(chatgptRemove, /"chatgpt-account-pool", "status"/);
+  assert.match(chatgptRemove, /"chatgpt-account-pool", "login-reset", id/);
+  assert.ok(
+    chatgptRemove.indexOf('"login-reset", id') < chatgptRemove.indexOf('"remove", id'),
+    "only a core-classified failed login is reset before removal",
+  );
+  assert.match(chatgptLogin, /!chatGPTLoginAuthChanged\(id, loginLease,[\s\S]*?clearChatGPTLoginLease/);
+  assert.ok(
+    chatgptLogin.indexOf("deadlineAt: Date.now() + CATALOG_MUTATION_TIMEOUT_MS + 30_000")
+      < chatgptLogin.indexOf('"login-finalize", id, completionLease'),
+    "finalization must receive a fresh bounded polling deadline",
+  );
+  assert.match(
+    chatgptLogin,
+    /await enqueueMutation\([\s\S]*?"login-finalize", id, completionLease[\s\S]*?finally \{[\s\S]*?releaseSubscriptionLogin\(id\)/,
+    "the durable/in-memory login owner must survive through exact-lease finalization",
+  );
+  const chatgptRemoval = source.match(/handleAction\("removeChatGptSubscriptionAccount"[\s\S]*?\n  \}\);/)?.[0];
+  assert.ok(chatgptRemoval, "ChatGPT subscription removal handler should be readable");
+  assert.match(chatgptRemoval, /subscriptionLoginInFlight\.has\(id\)/);
+  assert.ok(
+    chatgptRemoval.indexOf("subscriptionLoginInFlight.has(id)")
+      < chatgptRemoval.indexOf('["chatgpt-account-pool", "remove", id]'),
+    "the detached login owner must be checked before account removal starts",
+  );
+  assert.doesNotMatch(chatgptLogin, /openTerminalCommand/);
+  assert.match(source, /const CHATGPT_LOGIN_URL/);
+  assert.match(source, /stdio: \["ignore", "pipe", "pipe"\]/);
+  assert.match(source, /openExternal\(match\[0\]\)/);
+  assert.match(source, /openExternal: shell\?\.openExternal\?\.bind\(shell\)/);
+  assert.match(source, /const openedPromise = openBrowserCommand\(codex, \["login"\]/);
+  assert.match(source, /did not provide an OAuth browser URL/);
+  assert.match(source, /surface: "browser"/);
+
+  const app = await readFile(new URL("../apps/control-center/src/App.tsx", import.meta.url), "utf8");
+  assert.match(app, /api\.getChatGptSession\(\)/);
+  assert.match(app, /alreadyAuthenticated/);
+  const settings = await readFile(new URL("../apps/control-center/src/pages/SettingsPage.tsx", import.meta.url), "utf8");
+  assert.match(settings, /filter\(\(account\) => account\.state !== "revoked"\)/);
+  assert.match(settings, /account\.subscription\?\.usable === true/);
+  assert.match(settings, /subscription\?\.usable === true && !loginAttempt/);
+  assert.match(settings, /accountLoginAttempt\?\.status !== "failed"/);
+  assert.match(settings, /loginPendingId === loginRetryingId/);
+  assert.match(settings, /account\.state === "revoked" \|\| accountLoginAttempt\?\.retryable === false \|\| accountLoginAttempt\?\.removable === false \|\| loginPendingId === account\.id/);
+  assert.match(settings, /const poll = async \(\) => \{[\s\S]*?await refreshRef\.current\(\)[\s\S]*?setTimeout\(\(\) => void poll\(\), 1_500\)/);
+  assert.doesNotMatch(settings, /setInterval\(\(\) => refreshRef\.current\(\), 1_500\)/);
+  assert.match(source, /\["client-setup", harness\]/);
+  assert.doesNotMatch(source, /readFileSync\([^\n]*session\.jsonl\.zstd/);
+});
+
+test("Harness page renders fixed client rows backed by the shared session index", async () => {
+  const harness = await readFile(
+    new URL("../apps/control-center/src/pages/HarnessPage.tsx", import.meta.url),
+    "utf8",
+  );
+  const app = await readFile(new URL("../apps/control-center/src/App.tsx", import.meta.url), "utf8");
+  const styles = await readFile(
+    new URL("../apps/control-center/src/pages/local-harness-context.css", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(harness, /const CLIENT_ORDER: HarnessId\[\] = \["openclaw", "cursor", "claude", "gemini", "dsh", "codex"\]/);
+  assert.match(harness, /api\.getContextSessions\(\)/);
+  assert.match(harness, /api\.getAgentBridges\(\)/);
+  assert.match(harness, /Official-client agent/);
+  assert.match(harness, /bridgeForHarness\(harness\.id, agentBridges\)/);
+  assert.doesNotMatch(harness, /Subscription agent bridges|Credentials.*Unavailable/);
+  assert.match(harness, /api\.connectCursor\(cursorHostname\.trim\(\) \|\| undefined\)/);
+  assert.match(harness, /Use an existing Cloudflare hostname/);
+  assert.match(harness, /Connect Cursor/);
+  assert.match(harness, /One guided setup/);
+  assert.match(harness, /Cursor setup progress/);
+  assert.match(harness, /api\.launchHarness\(harness\.id, "app"\)/);
+  assert.match(harness, /<AppWindow[^>]*\/> Open/);
+  assert.doesNotMatch(harness, /BookOpen|SquareTerminal|Open agent/);
+  assert.doesNotMatch(harness, /Stable public HTTPS origin|127\.0\.0\.1:4214/);
+  assert.match(harness, /assets\/clients\/cursor\.svg/);
+  assert.match(harness, /assets\/clients\/deepseek-harness\.svg/);
+  assert.match(harness, /assets\/clients\/codex-light\.svg/);
+  assert.match(harness, /assets\/clients\/claude\.svg/);
+  assert.match(harness, /assets\/providers\/gemini\.svg/);
+  assert.match(harness, /model\.visible && \(model\.enabled \|\| model\.native\)/);
+  assert.match(app, /OpenClaw, Cursor, Claude, Gemini, DeepSeek, Codex/);
+  assert.match(styles, /\.lhc-harness-list/);
+  assert.match(styles, /\.lhc-harness-row/);
+  assert.match(styles, /\.lhc-harness-logo/);
+  assert.doesNotMatch(`${harness}\n${app}`, /Deep Code/);
 });
 
 test("credential input stays off argv and is delivered over stdin", async () => {
@@ -1400,6 +1981,11 @@ test("credential input stays off argv and is delivered over stdin", async () => 
       path.join(temporaryRoot, "src", "control.mjs"),
       "let input = ''; for await (const chunk of process.stdin) input += chunk; process.stdout.write(JSON.stringify({ argv: process.argv.slice(2), input }));\n",
       { mode: 0o700 },
+    );
+    await writeFile(
+      path.join(temporaryRoot, "src", "windows-process-tree.ps1"),
+      await readFile(new URL("../src/windows-process-tree.ps1", import.meta.url), "utf8"),
+      { mode: 0o600 },
     );
     await writeFile(path.join(temporaryRoot, "bin", "control"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
     if (process.platform !== "win32") await chmod(path.join(temporaryRoot, "bin", "control"), 0o700);
@@ -1480,21 +2066,41 @@ test("provider writes republish all installed targets and roll selection back on
   }
 });
 
-test("catalog-backed mutations outlive the publication-lock wait", async () => {
+test("catalog-backed mutations preserve complete forward and rollback restart epochs", async () => {
   const source = await readFile(new URL("../apps/control-center/electron/ipc.mjs", import.meta.url), "utf8");
-  assert.match(source, /const CATALOG_MUTATION_TIMEOUT_MS = 330_000/);
+  assert.match(source, /const CATALOG_MUTATION_TIMEOUT_MS = 1_320_000/);
   assert.match(source, /\["set-apply"[\s\S]{0,180}timeoutMs: CATALOG_MUTATION_TIMEOUT_MS/);
   assert.match(source, /handleAction\("setSubagentMode"[\s\S]{0,280}CATALOG_MUTATION_TIMEOUT_MS/);
   assert.match(source, /handleAction\("setSubagentEffort"[\s\S]{0,320}\["subagents", "effort", model, effort\][\s\S]{0,120}CATALOG_MUTATION_TIMEOUT_MS/);
   assert.match(source, /handleAction\("setPickerModel"[\s\S]{0,320}CATALOG_MUTATION_TIMEOUT_MS/);
   assert.match(source, /handleAction\("setVisionBridgeEnabled"[\s\S]{0,280}CATALOG_MUTATION_TIMEOUT_MS/);
   assert.match(source, /handleAction\("setSignedRouting"[\s\S]{0,280}CATALOG_MUTATION_TIMEOUT_MS/);
+  assert.match(source, /handle\("getChatGptAccountPool"[\s\S]{0,260}timeoutMs: CATALOG_MUTATION_TIMEOUT_MS/);
+});
+
+test("Antigravity probe IPC has one inner deadline and a larger tree-kill margin", async () => {
+  const source = await readFile(new URL("../apps/control-center/electron/ipc.mjs", import.meta.url), "utf8");
+  assert.match(source, /ANTIGRAVITY_PROBE_ACTIVATION_TIMEOUT_MS = 10 \* 60_000/);
+  assert.match(
+    source,
+    /ANTIGRAVITY_PROBE_RUNNER_TIMEOUT_MS\s*=\s*ANTIGRAVITY_PROBE_ACTIVATION_TIMEOUT_MS \+ 60_000/,
+  );
+  const handler = source.match(/handleAction\("connectProvider"[\s\S]*?\n  \}\);/)?.[0];
+  assert.ok(handler, "provider-connect handler should be readable");
+  assert.match(handler, /\["probe-provider", id, "--live", "--yes"\]/);
+  assert.match(handler, /timeoutMs: ANTIGRAVITY_PROBE_RUNNER_TIMEOUT_MS/);
+  assert.match(handler, /CODEX_ROUTER_OPERATION_TIMEOUT_MS:[\s\S]{0,120}ANTIGRAVITY_PROBE_ACTIVATION_TIMEOUT_MS/);
+  assert.match(
+    handler,
+    /\["login", id\][\s\S]{0,220}CODEX_ROUTER_OPERATION_TIMEOUT_MS:[\s\S]{0,120}ANTIGRAVITY_PROBE_ACTIVATION_TIMEOUT_MS/,
+  );
+  assert.doesNotMatch(handler, /\["probe-provider"[\s\S]{0,120}timeoutMs: 120_000/);
 });
 
 test("service IPC exposes only safe beta actions and start covers readiness", async () => {
   const source = await readFile(new URL("../apps/control-center/electron/ipc.mjs", import.meta.url), "utf8");
   assert.match(source, /const SERVICE_COMMANDS = \["status", "start"\]/);
-  assert.match(source, /value === "start" \? 330_000 : 120_000/);
+  assert.match(source, /\["start", "restart"\]\.includes\(value\) \? 330_000 : 120_000/);
   assert.match(source, /runControl\(\["service", value\], \{ timeoutMs \}\)/);
   const api = await readFile(new URL("../apps/control-center/electron/api.d.ts", import.meta.url), "utf8");
   assert.match(api, /type ServiceAction = "status" \| "start"/);
@@ -1516,11 +2122,14 @@ test("tray mutations detach before the GUI releases its mutation drain", async (
 });
 
 test("detached tray acceptance is labeled started, never completed", async () => {
-  const source = await readFile(new URL("../apps/control-center/src/App.tsx", import.meta.url), "utf8");
+  const source = (await readFile(new URL("../apps/control-center/src/App.tsx", import.meta.url), "utf8"))
+    .replaceAll("\r\n", "\n");
   const action = source.slice(source.indexOf("const runAction"), source.indexOf("const t = useCallback"));
   assert.match(action, /accepted[^\n]+=== true/);
   assert.match(action, /`\$\{label\} started\.`/);
-  const accepted = action.slice(action.indexOf("accepted"), action.indexOf("return;", action.indexOf("accepted")));
+  const acceptedStart = action.indexOf("if (\n        actionResult?.accepted === true");
+  assert.notEqual(acceptedStart, -1, "runAction should keep a dedicated detached-acceptance branch");
+  const accepted = action.slice(acceptedStart, action.indexOf("return;", acceptedStart));
   assert.doesNotMatch(accepted, /status: "completed"/);
   assert.match(source, /<Badge tone="neutral">Started<\/Badge>/);
 });
@@ -1529,9 +2138,9 @@ test("local model mutations cover service readiness and validate consent flags",
   const source = await readFile(new URL("../apps/control-center/electron/ipc.mjs", import.meta.url), "utf8");
   assert.match(source, /typeof yes !== "boolean"/);
   assert.match(source, /typeof force !== "boolean"/);
-  assert.match(source, /local-models", "install"[\s\S]{0,260}timeoutMs: 330_000/);
-  assert.match(source, /local-models", "uninstall"[\s\S]{0,180}timeoutMs: 330_000/);
-  assert.match(source, /local-models", "set"[\s\S]{0,240}timeoutMs: 330_000/);
+  assert.match(source, /local-models", "install"[\s\S]{0,260}timeoutMs: CATALOG_MUTATION_TIMEOUT_MS/);
+  assert.match(source, /local-models", "uninstall"[\s\S]{0,180}timeoutMs: CATALOG_MUTATION_TIMEOUT_MS/);
+  assert.match(source, /local-models", "set"[\s\S]{0,240}timeoutMs: CATALOG_MUTATION_TIMEOUT_MS/);
 });
 
 test("one-click MLX setup stays on fixed IPC commands and polls background stages", async () => {
@@ -1567,7 +2176,9 @@ for (const mode of ["timeout", "overflow"]) {
       process.env.CODEX_ROUTER_SOURCE_ROOT = root;
       const command = runControl(
         [pidFile, mode],
-        mode === "timeout" ? { timeoutMs: 250 } : { timeoutMs: 5_000, maxOutputBytes: 32 },
+        mode === "timeout"
+          ? { timeoutMs: process.platform === "win32" ? 2_000 : 250 }
+          : { timeoutMs: 5_000, maxOutputBytes: 32 },
       );
       await assert.rejects(command, mode === "timeout" ? /timed out/ : /output exceeded/);
       descendantPid = Number.parseInt(await readFile(pidFile, "utf8"), 10);
@@ -1583,6 +2194,274 @@ for (const mode of ["timeout", "overflow"]) {
     }
   });
 }
+
+for (const { mode, expectedCode } of [
+  { mode: "success", expectedCode: 0 },
+  { mode: "failure", expectedCode: 7 },
+]) {
+  test(`command ${mode} retires descendants holding inherited pipes`, async () => {
+    const root = await makeProcessTreeControlRoot();
+    const pidFile = path.join(root, `${mode}.pid`);
+    const marker = `${pidFile}.survived`;
+    const priorRoot = process.env.CODEX_ROUTER_SOURCE_ROOT;
+    let descendantPid;
+    try {
+      process.env.CODEX_ROUTER_SOURCE_ROOT = root;
+      const result = await runControl([pidFile, mode], {
+        timeoutMs: 5_000,
+        allowNonZero: true,
+      });
+      assert.equal(result.code, expectedCode);
+      descendantPid = Number.parseInt(await readFile(pidFile, "utf8"), 10);
+      assert.ok(Number.isInteger(descendantPid) && descendantPid > 0);
+      await waitForProcessExit(descendantPid);
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      assert.equal(existsSync(marker), false);
+    } finally {
+      if (descendantPid) {
+        try { process.kill(descendantPid, "SIGKILL"); } catch { /* already gone */ }
+      }
+      if (priorRoot === undefined) delete process.env.CODEX_ROUTER_SOURCE_ROOT;
+      else process.env.CODEX_ROUTER_SOURCE_ROOT = priorRoot;
+      await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+  });
+}
+
+for (const ownerSignal of ["SIGINT", "SIGTERM"]) {
+  test(
+    `Electron command owner ${ownerSignal} drains its descendant tree before exit`,
+    { skip: process.platform === "win32" },
+    async () => {
+      const root = await makeProcessTreeControlRoot();
+      const pidFile = path.join(root, `${ownerSignal}.pid`);
+      const marker = `${pidFile}.survived`;
+      const moduleUrl = new URL(
+        "../apps/control-center/electron/command-runner.mjs",
+        import.meta.url,
+      ).href;
+      const program = [
+        `process.env.CODEX_ROUTER_SOURCE_ROOT = ${JSON.stringify(root)}`,
+        `const { runControl } = await import(${JSON.stringify(moduleUrl)})`,
+        `await runControl([${JSON.stringify(pidFile)}, 'timeout'], { timeoutMs: 60_000 })`,
+      ].join(";");
+      const owner = (await import("node:child_process")).spawn(
+        process.execPath,
+        ["--input-type=module", "-e", program],
+        {
+          stdio: "ignore",
+          env: {
+            ...process.env,
+            CODEX_ROUTER_OWNER_SIGNAL_BUDGET_MS: "1000",
+          },
+        },
+      );
+      let descendantPid;
+      try {
+        const deadline = Date.now() + 3_000;
+        while (!existsSync(pidFile) && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        assert.equal(existsSync(pidFile), true);
+        descendantPid = Number.parseInt(await readFile(pidFile, "utf8"), 10);
+        owner.kill(ownerSignal);
+        const [code, signal] = await once(owner, "exit");
+        assert.equal(signal, null);
+        assert.equal(code, ownerSignal === "SIGINT" ? 130 : 143);
+        await waitForProcessExit(descendantPid);
+        await new Promise((resolve) => setTimeout(resolve, 700));
+        assert.equal(existsSync(marker), false);
+      } finally {
+        if (owner.exitCode === null && owner.signalCode === null) owner.kill("SIGKILL");
+        if (descendantPid) {
+          try { process.kill(descendantPid, "SIGKILL"); } catch { /* already gone */ }
+        }
+        await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      }
+    },
+  );
+}
+
+async function startElectronBarrierTree({ mode, rollbackMs, barrierMs, depth = 0 }) {
+  const root = await makeBarrierControlRoot();
+  const readyPath = path.join(root, "barrier-ready.pid");
+  const ownerReadyPath = path.join(root, "owner-signal-ready");
+  const completedPath = path.join(root, "barrier-complete");
+  const moduleUrl = new URL(
+    "../apps/control-center/electron/command-runner.mjs",
+    import.meta.url,
+  ).href;
+  const program = [
+    `process.env.CODEX_ROUTER_SOURCE_ROOT = ${JSON.stringify(root)}`,
+    "const { writeFileSync } = await import('node:fs')",
+    `const { runControl } = await import(${JSON.stringify(moduleUrl)})`,
+    `const running = runControl(${JSON.stringify([
+      readyPath,
+      completedPath,
+      mode,
+      String(rollbackMs),
+      String(barrierMs),
+      String(depth),
+    ])}, { timeoutMs: 10_000 })`,
+    "while (process.listenerCount('SIGTERM') === 0) await new Promise((resolve) => setImmediate(resolve))",
+    `writeFileSync(${JSON.stringify(ownerReadyPath)}, 'ready')`,
+    "await running",
+  ].join(";");
+  const owner = (await import("node:child_process")).spawn(
+    process.execPath,
+    ["--input-type=module", "-e", program],
+    {
+      stdio: "ignore",
+      env: {
+        ...process.env,
+        CODEX_ROUTER_OWNER_SIGNAL_BUDGET_MS: "1500",
+      },
+    },
+  );
+  const deadline = Date.now() + 10_000;
+  while (
+    (!existsSync(readyPath) || !existsSync(ownerReadyPath))
+    && Date.now() < deadline
+  ) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(existsSync(readyPath), true);
+  assert.equal(existsSync(ownerReadyPath), true);
+  return {
+    root,
+    readyPath,
+    ownerReadyPath,
+    completedPath,
+    owner,
+    childPid: Number.parseInt(await readFile(readyPath, "utf8"), 10),
+  };
+}
+
+test(
+  "Electron and nested Node owners preserve a control rollback barrier",
+  { skip: process.platform === "win32" },
+  async () => {
+    const tree = await startElectronBarrierTree({
+      mode: "complete",
+      rollbackMs: 1_300,
+      barrierMs: 2_500,
+      depth: 1,
+    });
+    const startedAt = Date.now();
+    try {
+      tree.owner.kill("SIGTERM");
+      const [code, signal] = await once(tree.owner, "exit");
+      assert.equal(signal, null);
+      assert.equal(code, 143);
+      assert.equal(await readFile(tree.completedPath, "utf8"), "restored");
+      assert.ok(Date.now() - startedAt >= 1_100);
+      await waitForProcessExit(tree.childPid);
+    } finally {
+      if (tree.owner.exitCode === null && tree.owner.signalCode === null) tree.owner.kill("SIGKILL");
+      try { process.kill(tree.childPid, "SIGKILL"); } catch { /* already gone */ }
+      await rm(tree.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+  },
+);
+
+test(
+  "Electron forcibly retires a control child whose rollback barrier never releases",
+  { skip: process.platform === "win32" },
+  async () => {
+    const tree = await startElectronBarrierTree({
+      mode: "stuck",
+      rollbackMs: 0,
+      barrierMs: 1_800,
+    });
+    const startedAt = Date.now();
+    try {
+      tree.owner.kill("SIGTERM");
+      const [code, signal] = await once(tree.owner, "exit");
+      const elapsed = Date.now() - startedAt;
+      assert.equal(signal, null);
+      assert.equal(code, 143);
+      assert.ok(elapsed >= 1_500, `barrier was cut off after only ${elapsed}ms`);
+      assert.ok(elapsed < 4_000, `stuck barrier held shutdown for ${elapsed}ms`);
+      assert.equal(existsSync(tree.completedPath), false);
+      await waitForProcessExit(tree.childPid);
+    } finally {
+      if (tree.owner.exitCode === null && tree.owner.signalCode === null) tree.owner.kill("SIGKILL");
+      try { process.kill(tree.childPid, "SIGKILL"); } catch { /* already gone */ }
+      await rm(tree.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+  },
+);
+
+test(
+  "Windows Job containment drains a Control Center command after abrupt owner exit",
+  { skip: process.platform !== "win32" },
+  async () => {
+    const root = await makeProcessTreeControlRoot();
+    const pidFile = path.join(root, "owner-exit.pid");
+    const marker = `${pidFile}.survived`;
+    const moduleUrl = new URL(
+      "../apps/control-center/electron/command-runner.mjs",
+      import.meta.url,
+    ).href;
+    const program = [
+      `process.env.CODEX_ROUTER_SOURCE_ROOT = ${JSON.stringify(root)}`,
+      `const { runControl } = await import(${JSON.stringify(moduleUrl)})`,
+      `await runControl([${JSON.stringify(pidFile)}, 'timeout'], { timeoutMs: 60_000 })`,
+    ].join(";");
+    const owner = (await import("node:child_process")).spawn(
+      process.execPath,
+      ["--input-type=module", "-e", program],
+      { stdio: "ignore" },
+    );
+    let descendantPid;
+    try {
+      const deadline = Date.now() + 10_000;
+      while (!existsSync(pidFile) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      assert.equal(existsSync(pidFile), true);
+      descendantPid = Number.parseInt(await readFile(pidFile, "utf8"), 10);
+      owner.kill("SIGKILL");
+      await once(owner, "exit");
+      await waitForProcessExit(descendantPid, 10_000);
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      assert.equal(existsSync(marker), false);
+    } finally {
+      if (owner.exitCode === null && owner.signalCode === null) owner.kill("SIGKILL");
+      if (descendantPid) {
+        try { process.kill(descendantPid, "SIGKILL"); } catch { /* already gone */ }
+      }
+      await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+  },
+);
+
+test("Electron uses the installed Windows Job Object owner", () => {
+  const invocation = windowsJobProcessInvocation(
+    "C:\\Program Files\\Codex Router\\router.exe",
+    ["control.mjs", "doctor"],
+    {
+      sourceRoot: "C:\\Users\\operator\\codex-router",
+      environment: {},
+      ownerPid: 4321,
+    },
+  );
+  assert.equal(invocation.command, "powershell.exe");
+  assert.equal(
+    invocation.args.at(-2),
+    path.join("C:\\Users\\operator\\codex-router", "src", "windows-process-tree.ps1"),
+  );
+  assert.deepEqual(
+    JSON.parse(Buffer.from(invocation.args.at(-1), "base64").toString("utf8")),
+    {
+      command: "C:\\Program Files\\Codex Router\\router.exe",
+      arguments: ["control.mjs", "doctor"],
+      ownerProcessId: 4321,
+      windowsHide: true,
+      windowsVerbatimArguments: false,
+    },
+  );
+});
 
 test("router children inherit the proxy opt-in this install recorded", async () => {
   const runner = await readFile(

@@ -551,3 +551,26 @@ test("uninstall removes a router-owned default even with no snapshot to restore"
     rmSync(box.stateDir, { recursive: true, force: true });
   }
 });
+
+test("caller capability refresh changes only the installed DSH route and credential", () => {
+  const box = sandbox();
+  try {
+    manage("install --set-default-model", box);
+    const settingsPath = path.join(box.dshHome, "settings.yaml");
+    const credentialsPath = path.join(box.dshHome, ".credentials.yaml");
+    const beforeSettings = readFileSync(settingsPath, "utf8");
+    const beforeCredentials = readFileSync(credentialsPath, "utf8");
+    const nextSecret = "b".repeat(48);
+    writeFileSync(path.join(box.stateDir, "caller-secret"), `${nextSecret}\n`, { mode: 0o600 });
+    const result = manage("caller-capability-refresh", box);
+    assert.equal(result.refreshed, true);
+    const afterSettings = readFileSync(settingsPath, "utf8");
+    const afterCredentials = readFileSync(credentialsPath, "utf8");
+    assert.equal(afterSettings, beforeSettings.replaceAll(CALLER_SECRET, nextSecret));
+    assert.equal(afterCredentials, beforeCredentials.replaceAll(CALLER_SECRET, nextSecret));
+    assert.match(afterSettings, /agent-default-model:/);
+  } finally {
+    rmSync(box.dshHome, { recursive: true, force: true });
+    rmSync(box.stateDir, { recursive: true, force: true });
+  }
+});

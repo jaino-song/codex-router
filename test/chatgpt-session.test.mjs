@@ -31,38 +31,38 @@ function writeAuth() {
   );
 }
 
-test("enable requires the user's own Codex login", () => {
-  assert.throws(() => setChatGptSessionSharing(true), /codex login/i);
+test("enable requires the user's own Codex login", async () => {
+  await assert.rejects(setChatGptSessionSharing(true), /codex login/i);
   assert.equal(nativeSessionStatus().sharingEnabled, false);
 });
 
-test("one authorization applies to the shared local router plane and can be revoked", () => {
+test("one authorization applies to the shared local router plane and can be revoked", async () => {
   writeAuth();
-  const enabled = setChatGptSessionSharing(true);
+  const enabled = await setChatGptSessionSharing(true);
   assert.deepEqual(
     { sharing: enabled.sharing, session: enabled.session, refreshed: enabled.refreshed },
     { sharing: "enabled", session: "usable", refreshed: false },
   );
   assert.equal(nativeSessionAvailable(), true);
 
-  const disabled = setChatGptSessionSharing(false);
+  const disabled = await setChatGptSessionSharing(false);
   assert.equal(disabled.sharing, "disabled");
   assert.equal(nativeSessionAvailable(), false);
   assert.equal(nativeSessionStatus().usable, true, "revocation does not sign Codex out");
 });
 
-test("the command does not pretend to override an operator environment policy", () => {
+test("the command does not pretend to override an operator environment policy", async () => {
   process.env.CODEX_ROUTER_NATIVE_SESSION_FALLBACK = "0";
-  assert.throws(
-    () => setChatGptSessionSharing(true),
+  await assert.rejects(
+    setChatGptSessionSharing(true),
     /forced off by CODEX_ROUTER_NATIVE_SESSION_FALLBACK/,
   );
 
   delete process.env.CODEX_ROUTER_NATIVE_SESSION_FALLBACK;
-  setChatGptSessionSharing(true);
+  await setChatGptSessionSharing(true);
   process.env.CODEX_ROUTER_NATIVE_SESSION_FALLBACK = "1";
-  assert.throws(
-    () => setChatGptSessionSharing(false),
+  await assert.rejects(
+    setChatGptSessionSharing(false),
     /forces ChatGPT session sharing on/,
   );
   assert.equal(nativeSessionStatus().sharingEnabled, true);
@@ -72,7 +72,7 @@ test("the command does not pretend to override an operator environment policy", 
     true,
     "the saved authorization remains coherent until disable can republish",
   );
-  setChatGptSessionSharing(false);
+  await setChatGptSessionSharing(false);
   assert.equal(nativeSessionStatus().sharingEnabled, false);
 });
 

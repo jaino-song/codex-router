@@ -3,8 +3,10 @@ param(
   [switch]$CheckoutInstall,
   [switch]$PrepareOnly,
   [switch]$ForceDeps,
-  [ValidateSet("codex", "dsh", "gemini")]
+  [ValidateSet("codex", "dsh", "gemini", "cursor", "claude", "openclaw")]
   [string]$Target = "codex",
+  [string]$CursorPublicUrl,
+  [string]$CursorHostname,
   [switch]$Guided,
   [switch]$Auto,
   [string]$Providers,
@@ -30,6 +32,15 @@ param(
 
 $ErrorActionPreference = "Stop"
 $env:MODEL_ROUTER_TARGET = $Target
+if ($CursorPublicUrl) {
+  if ($Target -ne "cursor") { throw "-CursorPublicUrl applies to -Target cursor only." }
+  $env:MODEL_ROUTER_CURSOR_PUBLIC_BASE_URL = $CursorPublicUrl
+}
+if ($CursorHostname) {
+  if ($Target -ne "cursor") { throw "-CursorHostname applies to -Target cursor only." }
+  if ($CursorPublicUrl) { throw "Use either -CursorHostname or -CursorPublicUrl, not both." }
+  $env:MODEL_ROUTER_CURSOR_TUNNEL_HOSTNAME = $CursorHostname
+}
 # Legacy migration replaces an older router's managed Codex config block, and
 # the native catalog is the ChatGPT-plan model list Codex adopts. Neither has a
 # counterpart in DeepSeek Harness, whose integration is one settings section.
@@ -230,12 +241,19 @@ if ([int]$VersionParts[0] -lt 22 -or
     ([int]$VersionParts[0] -eq 22 -and [int]$VersionParts[1] -lt 19)) {
   throw "Node.js 22.19 or newer is required; Node.js 24 LTS is recommended."
 }
+if ($Target -eq "openclaw") {
+  & node (Join-Path $ScriptDirectory "src\openclaw-install.mjs") preflight | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw "OpenClaw requires a supported Node.js release." }
+}
 
 # Each target enables its own client configuration; everything around that one
 # step is the shared router plane.
 $ConfigManager = switch ($Target) {
   "dsh" { "src\dsh-config-manager.mjs" }
   "gemini" { "src\gemini-config-manager.mjs" }
+  "cursor" { "src\cursor-config-manager.mjs" }
+  "claude" { "src\claude-code-config-manager.mjs" }
+  "openclaw" { "src\openclaw-config-manager.mjs" }
   default { "src\config-manager.mjs" }
 }
 $ConfigEnableCommand = if ($Target -eq "codex") { "enable" } else { "install" }
@@ -243,6 +261,11 @@ $ConfigDisableCommand = if ($Target -eq "codex") { "disable" } else { "uninstall
 $ConfigEnabled = $false
 $ServiceInstalled = $false
 $AdoptionPending = $false
+# The foreign-state override below is set only for a full install, but the
+# finally runs for prepare-only and for failures that happen before that point
+# too. Snapshot the caller's environment before any installer step can throw.
+$HadForeignStateOverride = $null -ne (Get-Item Env:\MODEL_ROUTER_ALLOW_FOREIGN_STATE -ErrorAction SilentlyContinue)
+$SavedForeignStateOverride = $env:MODEL_ROUTER_ALLOW_FOREIGN_STATE
 $ConfigWasEnabled = $false
 $ServiceWasInstalled = $false
 $TrayWasInstalled = $false
@@ -269,6 +292,9 @@ try {
   $ConfigWasEnabled = switch ($Target) {
     "dsh" { (Get-InstallerStateField @($ConfigManager, "status") "routeInstalled") -eq $true }
     "gemini" { (Get-InstallerStateField @($ConfigManager, "status") "installed") -eq $true }
+    "cursor" { (Get-InstallerStateField @($ConfigManager, "status") "appConfigured") -eq $true }
+    "claude" { (Get-InstallerStateField @($ConfigManager, "status") "installed") -eq $true }
+    "openclaw" { (Get-InstallerStateField @($ConfigManager, "status") "installed") -eq $true }
     default { (Get-InstallerStateField @($ConfigManager, "status") "mode") -eq "router" }
   }
   $ServiceWasInstalled = (Get-InstallerStateField @("src\service.mjs", "status") "installed") -eq $true
@@ -393,6 +419,17 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Recording the Python dependency state failed." }
   }
 
+  # Installing is the sanctioned way for a checkout to take over a state
+  # directory: the generated files below are rebuilt here and the new owner is
+  # recorded before the service step, so the ownership guard must not block a
+  # full install. The override is scoped to exactly that run and only after
+  # -PrepareOnly is known: a -PrepareOnly run rewrites the same generated state
+  # but exits before the manifest record, so letting it past the guard would
+  # let a second checkout rebuild foreign-owned state with no ownership
+  # transfer ever recorded. The caller's own value is restored in the finally.
+  if (-not $PrepareOnly) {
+    $env:MODEL_ROUTER_ALLOW_FOREIGN_STATE = "1"
+  }
   & node src/secret.mjs ensure
   if ($LASTEXITCODE -ne 0) { throw "Local router-key setup failed." }
   # The state root is read by both arms below, so it is computed once rather
@@ -445,10 +482,34 @@ try {
     & node src/dsh-config-manager.mjs install | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "DeepSeek Harness republish failed." }
   }
+  if ($Target -ne "cursor" -and (Test-NonEmptyFile (Join-Path $StateRoot "cursor-models.json"))) {
+    $CursorRunning = (Get-InstallerStateField @("src\cursor-config-manager.mjs", "status") "running") -eq $true
+    if (-not $CursorRunning) {
+      & node src/cursor-config-manager.mjs install | Out-Null
+      if ($LASTEXITCODE -ne 0) { throw "Cursor republish failed." }
+    }
+  }
+  if ($Target -ne "claude" -and (Test-NonEmptyFile (Join-Path $StateRoot "claude-models.json"))) {
+    & node src/claude-code-config-manager.mjs install | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Claude Code republish failed." }
+  }
+  if ($Target -ne "openclaw" -and (Test-NonEmptyFile (Join-Path $StateRoot "openclaw-models.json"))) {
+    & node src/openclaw-config-manager.mjs install | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "OpenClaw republish failed." }
+  }
 
   if ($PrepareOnly) {
     Write-Host "Dependencies and generated files are prepared; application configuration was not changed."
-    exit 0
+    # Return from the script instead of terminating the caller's PowerShell
+    # host. The outer finally still has to restore the caller environment, and
+    # an invoked prepare-only install must hand control back so its caller can
+    # observe that restoration.
+    return
+  }
+
+  if ($Target -eq "openclaw") {
+    & node src/openclaw-install.mjs install | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "OpenClaw installation failed." }
   }
 
   $ConfigEnabled = $true
@@ -457,17 +518,19 @@ try {
   & node @ConfigArguments
   if ($LASTEXITCODE -ne 0) { throw "$Target configuration update failed." }
   $AdoptionPending = $false
+  # Record before the service starts, not after. The manifest is provenance for
+  # the install that just happened -- which checkout owns the state, and the
+  # proxy environment a later repair must restore -- and the service itself
+  # needs the record in place first: start.mjs rewrites the gateway config on
+  # every boot and refuses while the manifest still names another checkout, so
+  # recording after `service.mjs install` -- a step that contains the health
+  # wait -- let an install over a foreign-owned state directory crash-loop for
+  # the whole readiness budget while the ownership transfer never ran.
+  & node src/install-manifest.mjs record | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw "Install-manifest recording failed." }
   $ServiceInstalled = $true
   & node src/service.mjs install
   if ($LASTEXITCODE -ne 0) { throw "Background-service installation failed." }
-  # Record before the health wait, not after. The manifest is provenance for
-  # the install that just happened -- which checkout owns the state, and the
-  # proxy environment a later repair must restore -- and the service is already
-  # in place. Recording it only after a health check that a cold-starting
-  # gateway can lose left the manifest naming the previous owner while the
-  # running service pointed somewhere else.
-  & node src/install-manifest.mjs record | Out-Null
-  if ($LASTEXITCODE -ne 0) { throw "Install-manifest recording failed." }
   & node src/wait-health.mjs
   if ($LASTEXITCODE -ne 0) { throw "The router did not become healthy." }
 
@@ -523,6 +586,13 @@ try {
   } elseif ($Target -eq "gemini") {
     Write-Host "Published the selected external model routes to Gemini CLI. The next 'gemini' run picks them up."
     Write-Host "Choose 'Use Gemini API key' once if it asks how to authenticate; the key is this router's local caller capability."
+  } elseif ($Target -eq "cursor") {
+    Write-Host "Published all routed models to Cursor Agent and Cursor App."
+    Write-Host "Run cursor-router-agent for the CLI; fully quit and reopen Cursor for the app."
+  } elseif ($Target -eq "claude") {
+    Write-Host "Published all routed models to Claude Code. Run claude-router and choose a codex_router/anthropic/... model."
+  } elseif ($Target -eq "openclaw") {
+    Write-Host "Installed OpenClaw and published every routed model under its codex-router provider. Run openclaw to start."
   } else {
     Write-Host "Installed the selected external model routes. Fully quit and reopen Codex."
   }
@@ -543,5 +613,13 @@ try {
   }
   throw
 } finally {
+  # Restore the caller's environment exactly as it was found: a value this run
+  # did not set is removed, and a pre-existing one is put back verbatim. The
+  # scoped override must never outlive the install process that justified it.
+  if ($HadForeignStateOverride) {
+    $env:MODEL_ROUTER_ALLOW_FOREIGN_STATE = $SavedForeignStateOverride
+  } else {
+    Remove-Item Env:\MODEL_ROUTER_ALLOW_FOREIGN_STATE -ErrorAction SilentlyContinue
+  }
   Pop-Location
 }

@@ -14,6 +14,7 @@ test("the Windows operational scripts parse in Windows PowerShell", { skip: proc
     "deploy-codex-router.ps1",
     "restart-codex-router.ps1",
     "codex-router.ps1",
+    "src/windows-process-tree.ps1",
     "scripts/build-electron-companion.ps1",
   ]) {
     const target = path.join(root, name).replaceAll("'", "''");

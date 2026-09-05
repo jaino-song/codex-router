@@ -8,15 +8,9 @@ adopt_native_catalog=false
 force_deps=false
 target=${MODEL_ROUTER_TARGET:-codex}
 
-# Installing is the sanctioned way for a checkout to take over a state
-# directory: generated files are rebuilt here and the new owner is recorded at
-# the end, so the ownership guard must not block this run.
-MODEL_ROUTER_ALLOW_FOREIGN_STATE=1
-export MODEL_ROUTER_ALLOW_FOREIGN_STATE
-
 case "$target" in
-  codex|dsh|gemini) ;;
-  *) echo "MODEL_ROUTER_TARGET must be codex, dsh, or gemini." >&2; exit 2 ;;
+  codex|dsh|gemini|cursor|claude|openclaw) ;;
+  *) echo "MODEL_ROUTER_TARGET must be codex, dsh, gemini, cursor, claude, or openclaw." >&2; exit 2 ;;
 esac
 
 for argument in "$@"; do
@@ -28,6 +22,18 @@ for argument in "$@"; do
     *) echo "Usage: $0 [--prepare-only] [--migrate-known] [--adopt-native-catalog] [--force-deps]" >&2; exit 2 ;;
   esac
 done
+
+# Installing is the sanctioned way for a checkout to take over a state
+# directory: generated files are rebuilt here and the new owner is recorded at
+# the end, so the ownership guard must not block this run. The override is
+# scoped to that full install, and only after the arguments are known: a
+# --prepare-only run rewrites the same generated state but exits before the
+# manifest record, so letting it past the guard would let a second checkout
+# rebuild foreign-owned state with no ownership transfer ever recorded.
+if [ "$prepare_only" != true ]; then
+  MODEL_ROUTER_ALLOW_FOREIGN_STATE=1
+  export MODEL_ROUTER_ALLOW_FOREIGN_STATE
+fi
 
 if [ "$prepare_only" = true ] && [ "$migrate_known" = true ]; then
   echo "--prepare-only cannot migrate an active older router." >&2
@@ -109,6 +115,9 @@ for tool in node npm; do
 done
 
 node -e 'const [a,b]=process.versions.node.split(".").map(Number); if (!(a>22 || (a===22 && b>=19))) { console.error("Node.js 22.19 or newer is required."); process.exit(1) }'
+if [ "$target" = openclaw ]; then
+  node "$repo_dir/src/openclaw-install.mjs" preflight >/dev/null
+fi
 
 # Preserve the launcher selected by the operator. A compatibility wrapper may
 # delegate to another runtime, so process.execPath is not necessarily the
@@ -234,6 +243,22 @@ if [ "$target" = dsh ]; then
   config_manager=src/dsh-config-manager.mjs
   config_enable_command=install
   config_disable_command=uninstall
+elif [ "$target" = gemini ]; then
+  config_manager=src/gemini-config-manager.mjs
+  config_enable_command=install
+  config_disable_command=uninstall
+elif [ "$target" = cursor ]; then
+  config_manager=src/cursor-config-manager.mjs
+  config_enable_command=install
+  config_disable_command=uninstall
+elif [ "$target" = claude ]; then
+  config_manager=src/claude-code-config-manager.mjs
+  config_enable_command=install
+  config_disable_command=uninstall
+elif [ "$target" = openclaw ]; then
+  config_manager=src/openclaw-config-manager.mjs
+  config_enable_command=install
+  config_disable_command=uninstall
 else
   config_manager=src/config-manager.mjs
   config_enable_command=enable
@@ -262,6 +287,18 @@ process.stdin.on("end", () => {
 # settings document.
 if [ "$target" = dsh ]; then
   config_state_field=routeInstalled
+  config_state_enabled=true
+elif [ "$target" = gemini ]; then
+  config_state_field=installed
+  config_state_enabled=true
+elif [ "$target" = cursor ]; then
+  config_state_field=appConfigured
+  config_state_enabled=true
+elif [ "$target" = claude ]; then
+  config_state_field=installed
+  config_state_enabled=true
+elif [ "$target" = openclaw ]; then
+  config_state_field=installed
   config_state_enabled=true
 else
   config_state_field=mode
@@ -322,10 +359,27 @@ fi
 if [ "$target" != gemini ] && [ -s "$state_dir/gemini-models.json" ]; then
   node src/gemini-config-manager.mjs install >/dev/null
 fi
+if [ "$target" != cursor ] && [ -s "$state_dir/cursor-models.json" ]; then
+  # Cursor owns a live SQLite settings document. Republish only while it is
+  # stopped; a running app can overwrite the external transaction on exit.
+  if ! node src/cursor-config-manager.mjs status | grep -q '"running": true'; then
+    node src/cursor-config-manager.mjs install >/dev/null
+  fi
+fi
+if [ "$target" != claude ] && [ -s "$state_dir/claude-models.json" ]; then
+  node src/claude-code-config-manager.mjs install >/dev/null
+fi
+if [ "$target" != openclaw ] && [ -s "$state_dir/openclaw-models.json" ]; then
+  node src/openclaw-config-manager.mjs install >/dev/null
+fi
 
 if [ "$prepare_only" = true ]; then
   echo "Dependencies and local Codex router files are prepared. Application configuration was not changed."
   exit 0
+fi
+
+if [ "$target" = openclaw ]; then
+  node src/openclaw-install.mjs install >/dev/null
 fi
 
 config_enabled=true
@@ -334,16 +388,19 @@ if [ "$adopt_native_catalog" = true ]; then
 else
   node "$config_manager" "$config_enable_command"
 fi
+# Record before the service starts, not after. The generated state above was
+# written by this checkout, so ownership is already this checkout's in fact;
+# the manifest is provenance for exactly that -- which checkout owns the state,
+# and the proxy environment a later repair must restore -- and the desktop app
+# resolves its source root from the field. The service itself needs the record
+# in place first: start.mjs rewrites the gateway config on every boot and
+# refuses while the manifest still names another checkout, so recording after
+# `service.mjs install` -- a step that contains the health wait -- let an
+# install over a foreign-owned state directory crash-loop for the whole
+# readiness budget while the ownership transfer it needed never ran.
+node src/install-manifest.mjs record >/dev/null
 service_installed=true
 node src/service.mjs install
-# Record before the health wait, not after. The manifest is provenance for the
-# install that just happened -- which checkout owns the state, and the proxy
-# environment a later repair must restore -- and `service.mjs install` has
-# already put that checkout's service in place. Recording it only after a
-# health check that a cold-starting gateway can lose left the manifest naming
-# the previous owner while the running service pointed somewhere else, and the
-# desktop app resolves its source root from that field.
-node src/install-manifest.mjs record >/dev/null
 node src/wait-health.mjs
 # A companion that is never rebuilt drifts behind the router on every update
 # and keeps running its old binary. Rebuild only when one is already installed
@@ -415,6 +472,16 @@ fi
 if [ "$target" = dsh ]; then
   echo "Published the selected external model routes to DeepSeek Harness."
   echo "The harness reloads its settings document on the next request; no restart is needed."
+elif [ "$target" = cursor ]; then
+  echo "Published all routed models to Cursor Agent and Cursor App."
+  echo "Run cursor-router-agent for the CLI; fully quit and reopen Cursor for the app."
+elif [ "$target" = gemini ]; then
+  echo "Published all routed models to Gemini CLI. The next gemini run picks them up."
+elif [ "$target" = claude ]; then
+  echo "Published all routed models to Claude Code. Run claude-router and choose a codex_router/anthropic/... model."
+elif [ "$target" = openclaw ]; then
+  echo "Installed OpenClaw and published every routed model under its codex-router provider."
+  echo "Run openclaw to start; OpenClaw reads the route on the next agent run."
 else
   echo "Installed the selected external model routes for Codex."
   # The configuration this install just rewrote is read once, at client start.

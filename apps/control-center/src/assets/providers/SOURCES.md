@@ -2,7 +2,7 @@
 
 These local assets identify third-party providers and model makers inside the
 Codex Router control center. They are bundled with the app and are never
-hotlinked at runtime. Research was refreshed on 2026-08-21.
+hotlinked at runtime. Research was refreshed on 2026-08-29.
 
 | Local asset | Used for | Official brand or product page | Asset source |
 | --- | --- | --- | --- |
@@ -30,7 +30,8 @@ hotlinked at runtime. Research was refreshed on 2026-08-21.
 | `deepreinforce.svg` | Local Ornith models | https://deep-reinforce.com/ornith_1_0.html | https://github.com/ornith-ai/Ornith-1/blob/main/assets/ornith_logo.png (official MIT-licensed Ornith asset; locally cropped to its square character mark and downscaled) |
 | `poolside.svg` | Poolside Laguna models | https://poolside.ai/models | https://poolside.ai/favicon/favicon.svg (official site favicon; the official verified organization identifies Laguna as its model family at https://github.com/poolsideai) |
 | `stepfun.svg` | StepFun models | https://www.stepfun.com/ | https://www.stepfun.com/step_favicon.svg |
-| `tencent.svg` | Tencent Hy3 models | https://www.tencent.com/tencent-hunyuan-officially-releases-hy3-advancing-agent-capabilities-and-deeper-product-integration/ | https://www.tencent.com/wp-content/themes/tencent-web/assets/favicon/safari-pinned-tab.svg (official site vector mask, locally colored with Tencent's `#0052d9` mask-icon color) |
+| `tencent.svg` | Tencent models, including Hy3 and Hy4 preview | https://www.tencent.com/newsroom/media-resources/ | https://www.tencent.com/wp-content/uploads/2024/05/cropped-04_Tencent_Graphics2-192x192.png (official square Tencent corporate mark used by Tencent.com) |
+| `nanogpt.svg` | NanoGPT API provider | https://nano-gpt.com/ | https://nano-gpt.com/favicon.ico (official site favicon; its 48px PNG frame is bundled losslessly in the SVG wrapper and matches the full mark at https://nano-gpt.com/logo.png) |
 | `google.svg` | Google, and Gemma models | https://about.google/brand-resource-center/ | https://cdn.simpleicons.org/google |
 | `gemini.svg` | Gemini models | https://gemini.google/ | https://www.gstatic.com/lamda/images/gemini_sparkle_v002_d4735304ff6292a690345.svg (official sparkle, with its own purple-to-cyan gradient) |
 | `antigravity.png` | Google Antigravity | https://antigravity.google/ | https://antigravity.google/assets/image/brand/antigravity-icon__full-color.png (official press asset) |

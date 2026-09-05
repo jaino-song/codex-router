@@ -144,7 +144,7 @@ test("independent routes fan out, but recording and publishing do not", () => {
   // Recording happens after the fan-out, once per route, in this process.
   assert.ok(block.indexOf("await Promise.all(") < block.indexOf("recordVerification(slug"));
   // One republish for the whole batch, and only when something was promoted.
-  assert.match(block, /if \(promoted\) refreshModelSettingsCatalog\(\)/);
+  assert.match(block, /if \(promoted\) await refreshModelSettingsCatalog\(\)/);
   assert.equal(block.match(/refreshModelSettingsCatalog\(\)/g)?.length, 1);
   // One route's crash is not a verdict on the others.
   assert.match(block, /catch \(error\) \{[\s\S]{0,200}return \{ slug, error/);

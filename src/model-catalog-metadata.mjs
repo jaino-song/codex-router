@@ -114,31 +114,19 @@ function veniceMetadata(item) {
         capabilities.supportsVideoInput ? "video" : undefined,
       ].filter(Boolean)
     : undefined;
-  const isOxAlpha = item?.id === "stealth-ox-alpha";
   const reasoningSupported = boolean(capabilities?.supportsReasoning);
   const configurable = boolean(capabilities?.supportsReasoningEffort);
   const reasoning = reasoningSupported !== undefined || configurable !== undefined || advertisedEfforts
     ? nonempty(compact({
         supported: reasoningSupported,
         configurable,
-        // Venice's Ox Alpha advertisement is known to disagree with the
-        // model. Preserve it below, while the effective ladder records what
-        // all six checked-in Ox routes have actually accepted in live probes.
-        supportedEfforts: isOxAlpha ? ["low", "high", "max"] : advertisedEfforts,
-        defaultEffort: isOxAlpha
-          ? undefined
-          : typeof capabilities?.defaultReasoningEffort === "string"
-            ? capabilities.defaultReasoningEffort.trim().toLowerCase()
-            : undefined,
-        ...(isOxAlpha
-          ? {
-              advertisedSupportedEfforts: advertisedEfforts,
-              advertisedDefaultEffort: typeof capabilities?.defaultReasoningEffort === "string"
-                ? capabilities.defaultReasoningEffort.trim().toLowerCase()
-                : undefined,
-              effectiveMetadataSource: "repository-live-probes",
-            }
-          : {}),
+        // Discovery is evidence about the provider catalog, not a wire
+        // compatibility certificate. Preserve Venice's advertised ladder for
+        // operator curation unless this exact route earns checked-in proof.
+        supportedEfforts: advertisedEfforts,
+        defaultEffort: typeof capabilities?.defaultReasoningEffort === "string"
+          ? capabilities.defaultReasoningEffort.trim().toLowerCase()
+          : undefined,
       }))
     : undefined;
   return nonempty(compact({
@@ -185,11 +173,11 @@ function openCodeFreeMetadata(item) {
 }
 
 export function modelCatalogMetadata(payload, provider) {
-  const data = Array.isArray(payload) ? payload : payload?.data;
+  const data = Array.isArray(payload) ? payload : payload?.data ?? payload?.models;
   if (!Array.isArray(data)) return {};
   const metadata = Object.create(null);
   for (const item of data) {
-    const id = String(item?.id || "").trim();
+    const id = String(item?.id ?? item?.slug ?? "").trim();
     if (!id || Object.hasOwn(metadata, id)) continue;
     const value = provider?.id === "venice"
       ? veniceMetadata(item)

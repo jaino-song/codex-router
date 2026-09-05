@@ -2,6 +2,356 @@
 
 ## Unreleased
 
+- **Tok/s meter now excludes reasoning tokens and hides during generation.**
+  `observedTokensPerSecond` used full `outputTokens` while TTFT waited for the
+  first *visible* token. Providers often include `reasoning_tokens` (silent
+  thinking) in `output_tokens`, inflating reported speed (~+24% measured on
+  Muse Spark free: 502 output with 98 reasoning → 163.6 tok/s vs ~131.6 when
+  reasoning excluded). `normalizeTokenUsage` now extracts `reasoningTokens`
+  from `output_tokens_details.reasoning_tokens` /
+  `completion_tokens_details.reasoning_tokens` / `reasoning_tokens` when
+  present. `aggregateProviderUsage` and Control Center `tokensPerSecondFromEvent`
+  subtract reasoning from the tok/s numerator to match industry TTFT on first
+  visible token. Provider totals and billing still count full output. Panel and
+  tray status chips now hide the measured median while generating, showing only
+  "— tok/s" and "Appears after a metered reply" during active turns. Historical
+  events without `reasoningTokens` are unchanged. Also fixes chat first-token
+  detection: `chat.completion.chunk` often has no `type` field, so checking type
+  before delta meant chat TTFT never fired and tray speed stayed null.
+
+- **Startup prunes `enabled-providers.json` entries that cannot authenticate.**
+  Unknown ids (version skew) and recognised providers without a credential
+  were left in the selection file forever, so the dispatcher still treated
+  them as enabled and answered `provider_api_key_missing`. Startup now
+  rewrites the file to the configured subset (and deletes a file that named
+  only unknown ids, preserving the no-file show-all fallback). Idempotent;
+  discovery-disabled and show-all modes are left alone.
+- **macOS KeepAlive no longer uses launchd `Adaptive`, which starved startup.**
+  Adaptive only boosts on XPC transactions; the router is localhost HTTP, so
+  the job stayed at Background. Node OAuth/API forwarders then missed the 30s
+  health budget, `KeepAlive` restart-looped, and tray Update / doctor --fix
+  waited 300s on `/health` and rolled the checkout back. The LaunchAgent now
+  renders `ProcessType=Standard`. Do not revert to `Background` (LiteLLM
+  starved to ~4% CPU in `fb40f8c`).
+- **Grok OAuth post-tool turns no longer stay silent while their repair is
+  certified.** The forwarder now opens a streamed Chat Completions response as
+  soon as xAI returns its headers and relays reasoning immediately, while still
+  withholding the short visible sentence that may be a progress-only stop.
+  A certified retry supplies the final answer or tool call; an invalid repair
+  ends the already-open stream with one terminal error and never emits
+  `[DONE]`. Retry and failure logs now include per-attempt header, first-event,
+  and total timings plus the safe `x-grok-req-id`, so upstream silence can be
+  distinguished from router-side staging without logging prompt or output.
+
+- **Routed reasoning models no longer leak `<think>` chains into the visible
+  answer.** Qwen (and other reasoning models bridged through LiteLLM's
+  chat-completions path) sometimes emit their chain-of-thought inline in the
+  content channel as `<think>...</think>` instead of on the reasoning channel,
+  so LiteLLM relays it as `output_text` and the answer renders behind the
+  model's reasoning — or behind a bare `</think>` when the open tag is consumed
+  upstream but the close is not. A new `ReasoningTagStripper` egress transform
+  (`src/reasoning-tag-stripper.mjs`) removes `<think>...</think>` spans and
+  orphan tags from the message text across the streamed `output_text.delta`s
+  (buffering a tag split across deltas), the terminal `output_text.done`, and
+  the stored message item. It covers the reasoning-delimiter family the model
+  varies to (`think`/`thinking`/`reason`/`reasoning`), leaves the structured
+  reasoning channel and every non-message item untouched, and passes clean
+  answers through unchanged. Routed providers only.
+
+- **Routed turns that mix assistant text and a tool call no longer render
+  twice.** LiteLLM's chat-completions-to-Responses bridge
+  (`use_chat_completions_api`) could leave the assistant `message` item open
+  across a `function_call` item and emit its `output_item.done` late, so Codex
+  committed the streamed text once while it was live and again when the delayed
+  close arrived — the same sentence appeared twice, with the tool call after it.
+  It surfaced intermittently on qwen-plan turns that both speak and call a tool.
+  A new `ItemLifecycleNormalizer` egress transform (`src/item-lifecycle-normalizer.mjs`),
+  added last in the routed-provider response pipeline, holds events for a
+  newly-opened output item until the currently-open item closes, restoring the
+  Responses contract that every item is `done` before the next
+  `output_item.added`. It reorders only — no event body is added, dropped, or
+  rewritten — and engages only when the upstream actually interleaves; clean
+  streams and native OpenAI streams pass through unchanged.
+
+- **A Grok OAuth outage now terminates streamed Codex turns instead of leaving
+  a stale Working badge.** After the local gateway has exhausted its bounded
+  retries, a final Grok 5xx on an explicitly streamed Responses request is
+  returned as one terminal SSE `error` event. Non-streaming Grok calls,
+  actionable 4xx failures, and every other provider retain their HTTP status
+  and JSON body, while usage metering still records Grok's real failure status.
+
+- **Empty `tools: []` is now stripped for all API-forwarder routes, not only
+  `qwen38-community`.** Strict upstreams (vLLM >=0.20 Pydantic) refuse an empty
+  tools array. Codex sends `tools: []` on compaction and plain chat, so without
+  this strip every compaction against strict providers 400s. The repair was
+  previously applied only to the `qwen38-community` profile; it is now applied
+  to all routes so compaction and plain chat work against any strict provider.
+  Dangling `tool_choice` is dropped only after stripping an empty `tools: []`
+  array (not when tools was never present). The `qwen38-community` profile
+  additionally drops tool_choice when tools is absent, as that endpoint refuses
+  "When using `tool_choice`, `tools` must be set". Real non-empty tool arrays
+  and their tool_choice are forwarded unchanged. (Fixes #588)
+- **Grok OAuth reasoning summaries now appear in Codex while the model is
+  thinking.** LiteLLM can open an empty assistant message before Grok's first
+  reasoning delta, then assign a different item id to every delta and return
+  the terminal reasoning item in Chat Completions shape. Codex discarded that
+  orphaned lifecycle and showed no progress until answer text arrived. The
+  router now repairs only Grok OAuth event streams into one canonical Responses
+  reasoning item, preserves valid streams, and keeps the following message and
+  tool output indexes consistent.
+
+- **A `Retry-After` expressed as a date is now honored.** RFC 9110 allows
+  `Retry-After` to carry either delay-seconds or an HTTP-date. The router read
+  the header as a bare number, so a dated value became `NaN` and every consumer
+  discarded it: a burst 429 that named its own window did not qualify for
+  failover, no provider cooldown was recorded, and the translated error lost
+  its "retry in about Ns" hint. The turn therefore died on a provider that had
+  said exactly when it would be back, and each later turn paid the same refusal
+  again for the length of the window. The header now goes through the same
+  `resetAt` parser the `x-ratelimit-*` snapshot already used, which reads
+  delay-seconds, an HTTP-date, and a Go-style duration alike, and
+  `api-forwarder`'s private copy of that conversion is gone in favor of the
+  shared one, so there is one place the header is read.
+- **A 429 that named no wait no longer advises retrying "in about 0s".**
+  `headers.get` answers null for a header that was never sent and
+  `Number(null)` is `0` — a finite value, so the rate-limit message quoted a
+  zero-second wait as though the provider had asked for one. Absence and an
+  unparseable value now read as no window at all, while a delay of `0` (which
+  RFC 9110 permits) and a date that has already passed are kept as the zero
+  they are, because a provider saying "now" is not a provider saying nothing.
+  Only a positive wait is worth wording, so both zeroes reach the operator as
+  "Wait a bit and retry."
+- **Pin Gemini 3.8 Flash, Muse Spark 1.3, Claude Fable 5.1, and additional
+  models across providers.** Confirmed routes 2026-09-03: Gemini 3.8 Flash on
+  OpenRouter, Command Code, Nous Research, and Venice; Muse Spark 1.3 and 1.3
+  Contributor on OpenRouter, Nous Research, and opencode Go Responses; Claude
+  Fable 5.1 on OpenRouter, Command Code Messages, Nous Research, and Venice;
+  Command Code Qwen3.8 Max 0902 and GLM-5.3-Flash; opencode Go Messages
+  Qwen3.8 Flash. No new `multiAgentVersion: "v2"` stamps. Updated Command Code
+  curation allowlists for the new Chat and Messages ids.
+- **OpenCode Free Responses now lists Muse Spark 1.3 Contributor Free.** The
+  anonymous Zen Responses route now includes both `muse-spark-1.2-contributor-free`
+  and `muse-spark-1.3-contributor-free`. Same documented exception: no API key
+  needed, but the free catalog can vanish and Meta may train on these turns.
+- **Qwen Plan collaboration calls are now restored to namespaced shape.** Qwen
+  Plan (Alibaba Model Studio Token Plan) returns Codex v1 collaboration calls
+  as pre-flattened names (`multi_agent_v1__spawn_agent` with no namespace),
+  which Codex Desktop rejects. The Responses adapter now rebuilds the namespace
+  from flattened tool names that came from actual `type: "namespace"` entries or
+  from known collaboration namespaces (`multi_agent_v1`, `collaboration`), so
+  Desktop receives `spawn_agent` in the `multi_agent_v1` namespace instead.
+  MCP-style names like `mcp__node_repl__js` are left unchanged unless they came
+  from a real namespace tool, avoiding false restoration of tools that happen to
+  contain `__` (#568).
+- **An exhausted opencode Go plan no longer withdraws opencode Zen, or the
+  reverse.** Provider cooldowns were keyed by the canonical provider id, which
+  is the right identity for a protocol variant — opencode's Messages and
+  Responses routes are one subscription behind two wire formats, so one being
+  empty means all of them are. Zen is the exception the code already names in
+  `cooldownScope`: it shares Go's credential and selection toggle but is billed
+  separately at its own endpoint. Filing both windows under the parent meant a
+  closed Go plan silently answered a Zen turn from a different provider
+  (`reason=cooled_until_...`), and an exhausted Zen balance withdrew the whole
+  Go subscription — in both directions a paid route taken away for a window its
+  provider never named for it. Windows are now keyed by cooldown scope
+  wherever they are recorded, read, cleared, or ranked — including the vision
+  bridge's engine selection, which read a window its own writer files under a
+  different key — and `api-forwarder` passes the provider id through
+  unresolved so the scope is decided in one place. Protocol variants still
+  share a window, which is what the existing family test holds.
+- **The Windows Control Center no longer flashes PowerShell windows.** A console
+  process spawned by a parent that has no console of its own — the Electron
+  Control Center and the tray — gets its own window unless `windowsHide` is set,
+  and four background helpers were missing it. The one every private write
+  reaches meant a burst of visible windows on each status refresh, which is why
+  it showed up on every message sent (#565). The private-file ACL writer and its
+  verifier, scheduled-task registration, and the tray's task-state poll now all
+  hide. Interactive prompts are untouched: they inherit a console the operator is
+  already looking at, and hiding it would ask for input through a window nobody
+  can see. A source-level test holds the line, since the failure is invisible off
+  Windows.
+- **A failed Windows scheduled-task launch now explains itself.** Node reports a
+  module it cannot *read* exactly as it reports one that is not there —
+  `Cannot find module` with `MODULE_NOT_FOUND` — so an install whose checkout
+  the task's own token cannot read looked like a missing `src\start.mjs` that
+  the operator could open in front of them (#548). Readiness failure now checks
+  whether the path the loader named exists: if it does, it reports a permission
+  or token problem and how to confirm it, and if it does not, it reports an
+  incomplete checkout. When the log carries no such evidence the original
+  wording is kept rather than a cause being invented. This improves the
+  diagnosis only; the underlying ACL condition is not yet reproduced.
+- **The Codex picker now shows vendor groups.** Codex sorts its model picker by
+  each entry's `priority`, never by catalog order, and routed models reused
+  the same low integers as native GPT entries, so DeepSeek and Grok routes
+  interleaved with GPT models and the vendor grouping the catalog always
+  carried never reached the screen (#544). Routed models that are not
+  certified v2 spawn routes are now published in a band above the highest
+  visible native priority, in vendor-group order. A certified v2 route keeps
+  its authored priority, because that value is what keeps it inside Codex's
+  small spawn-model override window; renumbering it would crowd it out. Only
+  the published entry changes: failover ranking, the vision bridge, and every
+  other client keep reading the registry's authored value.
+- **Grok OAuth no longer replays a known progress-only sentence after an
+  aborted follow-up.** The first affected turn remains fully live. Once a
+  conversation has actually produced the progress-only shape, later
+  user-message turns buffer only a short visible prefix while leaving the
+  response head and preceding reasoning live. A real tool call or longer
+  answer releases that prefix immediately; an upstream abort reports its terminal
+  stream error without first committing the same status sentence to Codex
+  again. Evidence is retained in a bounded in-memory conversation set.
+
+- **Request bodies are decompressed off the event loop, and an oversize zstd
+  frame is refused from its header.** Codex zstd-compresses every request, so
+  the router inflated a buffer that grows with the conversation on the thread
+  serving every other request, through the one-shot synchronous decoder. That
+  path is the one implicated in an intermittent native abort on Windows
+  (#465: exit `0xC0000409` with no JavaScript frame, always late in a long
+  session, always right after a successful turn), which took every listener
+  down with it. The router now reads the size a Zstandard frame declares and
+  answers 413 before any native decoder runs when it exceeds the decode cap,
+  and inflates everything else through the asynchronous decoder under the same
+  cap. The crash has not been reproduced outside Windows, so this is
+  defensive hardening rather than a confirmed fix; the issue stays open for a
+  crash dump.
+- **Antigravity OAuth now uses an operator-owned, fail-closed sign-in.** The
+  router requires one matching Google Desktop-app client ID/secret pair,
+  collects it through an ephemeral IPv4 loopback listener, and stores the pair
+  privately with the refresh session on macOS, Linux, and Windows. It no longer
+  borrows the official `agy`/IDE credential or identity, copies a secret into
+  service definitions, or provisions a project during sign-in. The route stays
+  disabled until a separately confirmed, quota-consuming live probe succeeds
+  with the truthful `codex-router` identity; incompatible legacy records are
+  preserved until the operator explicitly disconnects them. Its forwarder is
+  not spawned or health-gated before proof. A passing probe is persisted as a
+  generation-bound pending activation that remains unpublishable until the
+  restarted local stack is fully healthy; failed startup, process death,
+  credential replacement, and disconnect cannot promote it. Thus an unused
+  provider port cannot take down the router or leave an unready route exposed.
+  Pre-activation v2 proof records are deliberately unverified and require a
+  fresh explicit probe rather than being grandfathered past this readiness gate.
+  An authorization-code `invalid_client` rejection also tombstones only the
+  exact credential-and-proof snapshot submitted with that same client pair;
+  concurrent replacements and unrelated attempted clients remain untouched.
+  The Control Center gives the live request, restart readiness, exact-generation
+  confirmation, and client publication one shared ten-minute deadline, with a
+  separate one-minute command-runner cleanup margin, so a wedged command tree
+  can be terminated without shortening the cooperative activation budget. On
+  Windows, bounded children start suspended in a kill-on-close Job Object, get
+  only dedicated standard handles through an explicit inheritance allowlist,
+  and remain attached to the console for interactive operations; restricted
+  PowerShell hosts fail before launching the mutation.
+
+- **Support bundles now always omit historical logs.** A log may contain a
+  credential that was later rotated or deleted, so current-secret discovery
+  cannot prove any historical tail safe. Bundles retain redacted generated
+  diagnostics and log-file metadata without copying arbitrary log contents;
+  the former `--include-logs` switch remains accepted as a deprecated no-op.
+- **OpenClaw is now a one-click routed client.** The Harness page can install
+  the official `openclaw@latest` package when it is missing and publish every
+  selected router model through a private `codex-router` Responses provider.
+  The integration preserves unrelated OpenClaw config and user-selected
+  defaults, participates in shared catalog refresh and caller-key rotation,
+  and is available as `--target openclaw` on POSIX and Windows.
+
+- **Muse Spark 1.2 Contributor no longer fails on recursive Codex tool
+  schemas through OpenCode Go.** Console Go rejects the whole Responses turn
+  before inference when this model receives a recursive local JSON-Schema
+  reference. The router now breaks only cycle-closing reference edges for the
+  paid Muse route, preserving definitions, acyclic references, and sibling
+  constraints. Other Console Go Responses models retain their existing schema
+  payloads until they demonstrate the same restriction.
+
+- **OpenCode Console Go chat models no longer reject ambient hosted-search
+  options.** Codex can attach `web_search_options` even when the selected
+  OpenCode Go model does not advertise hosted search; Console Go forwards the
+  unknown field to its strict Chat Completions backend, which rejects the
+  entire turn with HTTP 400. The router now removes only that unsupported
+  option for the `opencode-go` provider on ordinary and compaction requests,
+  with the API forwarder enforcing the same boundary. Other search payloads
+  and providers that accept the option remain unchanged.
+
+- **Strict generic providers no longer receive unadvertised hosted-search
+  extensions.** Codex may attach `web_search`, `web_search_preview`,
+  `web_search_options`, and search-only `include` entries even when the chosen
+  routed model does not advertise search. The router now removes only those
+  hosted-search artifacts at its managed Responses boundary for unsupported
+  runtime-generic routes, while preserving ordinary functions (including one
+  named `web_search`), capable models, and direct gateway traffic. An explicit
+  request that can no longer satisfy `tool_choice` fails locally with a named
+  400 instead of reaching a strict upstream as an ambiguous request. Failover
+  also preserves the source model's hosted-versus-standalone search mode for
+  search-capable turns and refuses to guess after search history exists.
+
+- **Reinstalling over a state directory owned by another checkout no longer
+  deadlocks.** The installers recorded the state directory's new owner only
+  after the background service reported healthy, while the service itself
+  refuses to boot for as long as the record still names another checkout
+  (`foreign_state_owner`): an install that followed one from a different
+  checkout crash-looped for the full 300-second readiness budget, rolled
+  back, and repeated on every retry, and deleting the whole state directory
+  -- every stored provider key with it -- was the only escape. The record now
+  precedes the service step it describes, so the service boots against its
+  own ownership. The ownership override the installers run under is scoped
+  to that full, ownership-transferring install on both platforms: a
+  prepare-only run meets the guard like any other writer (and the Windows
+  installer restores the caller's environment when it finishes). Linux
+  readiness also fails fast once the service manager's restart counter shows
+  a crash loop, instead of waiting out the whole budget, and names the
+  journal and the router log in the error; the counter query itself is
+  killed inside a bounded slice of the remaining budget, so a blocked
+  `systemctl` cannot stretch the wait, and a health answer that lands as the
+  threshold is crossed still wins over the crash-loop verdict.
+
+- **OpenCode Go Kimi K2.7 Code now accepts current Codex tool schemas.** Its
+  Moonshot-backed validator receives the same bounded decorated-`$defs` repair
+  as the first-party Kimi routes. The compatibility gate names only this
+  observed Console Go model, so unrelated OpenCode Go routes keep their tool
+  payloads unchanged.
+
+- **Translated tool streams no longer expose bridge-only assistant turns.**
+  Bounded, fail-open normalization removes only empty assistant envelopes that
+  LiteLLM's Chat Completions and Anthropic Messages bridges corroborate with a
+  completed tool lifecycle, then compacts the affected output indexes. Real
+  text, reasoning, refusals, malformed or ambiguous streams, and native
+  Responses routes remain untouched. Non-streaming bodies receive equivalent
+  bounded, fail-open handling under an exact terminal-output proof. Direct
+  DeepSeek keeps its narrower provider-specific proof: the historical
+  no-prelude bridge drops its corroborated private-reasoning blank, while the
+  current bridge reconstructs candidate-attached reasoning under the terminal
+  reasoning ID and removes only the separately corroborated blank output.
+
+- **Live model certification now proves the requested route.** Compatibility
+  and smoke probes disable router failover, so a healthy alternate can no
+  longer certify a broken preset. Direct probes retained GLM-5.3-Flash on
+  OpenCode Go, OpenRouter, and Z.ai Coding; the unproved Command Code, Nous
+  Research, and Venice Flash presets were withdrawn. Command Code's Ox Alpha
+  id returned `model_unavailable` on every exact surface, while the available
+  Venice account was billing-blocked before its Ox route could be certified,
+  so neither Ox preset ships. Provider discovery remains available for explicit
+  per-machine curation without presenting catalog presence as wire proof.
+  Curated models now inherit a request profile only when every checked-in route
+  in that provider family has the same non-empty profile, so a model-specific
+  repair such as OpenRouter Flash's `ox-alpha` profile cannot leak onto an
+  unrelated model selected from the same catalog.
+
+- **Router retention and concurrency now stay bounded without crossing native accounts.**
+  Request bodies and buffered upstream errors have explicit byte ceilings,
+  active turns retain truthful accounting after tray records expire, and a
+  separate 24-hour execution deadline protects abandoned work. Encrypted
+  collaboration relays coalesce only within the same resolved native account;
+  one canceled waiter cannot stop another, while the shared read is aborted
+  when every waiter leaves. Aggregate limits and cache counters are visible
+  only through caller-authenticated health.
+
+- **Qwen3.8 Flash and GLM-5.3 full are now pinned on listed providers.**
+  Live catalogs confirmed 2026-08-27: OpenRouter `qwen/qwen3.8-flash` and
+  `z-ai/glm-5.3`; Command Code `Qwen/Qwen3.8-Flash` and `zai-org/GLM-5.3`;
+  QwenCloud/DashScope `qwen3.8-flash`; Nous Research `qwen/qwen3.8-flash`;
+  Venice `z-ai-glm-5-3`; Z.ai API `glm-5.3-flash`. GLM-5.3-Flash was already
+  shipped in #466; this adds the full GLM-5.3 on OpenRouter, Command Code, and
+  Venice, plus Qwen3.8 Flash on OpenRouter, Command Code, Nous Research, and
+  Qwen Plan, plus GLM-5.3-Flash on zai-api.
+
 - **OpenCode Go's Ox Alpha preview has graduated to GLM-5.3-Flash.** The
   authenticated catalog now publishes `glm-5.3-flash` and reports the old
   `ox-alpha-free` ID unavailable, matching OpenCode's current Chat Completions
@@ -14,10 +364,17 @@
   large live multimodal histories returned empty completions before the generic
   85% point of its advertised 1M window.
 
-- **README: Ox Alpha availability updated.** The preview was withdrawn from
-  OpenCode Zen, OpenCode Go, OpenRouter, and Nous Research as of 2026-08-26.
-  It remains available on Command Code and Venice. The checked-in
-  `opencode-free/ox-alpha` pin is now stale versus the live catalog.
+- **OpenRouter now ships Grok 4.6 as a listed route.** The checked-in pin is
+  `openrouter/grok-4.6`, upstream id `x-ai/grok-4.6`, 500,000 context with
+  auto-compact at 440,000, text+image input, and the low/medium/high reasoning
+  ladder (matching Command Code, not Nous Research's xhigh-ladder route).
+
+- **README: Ox Alpha availability updated.** No checked-in Ox Alpha preset
+  remains. The withdrawn OpenCode Free, OpenRouter, and Nous routes are gone;
+  Command Code directly reported its id unavailable, and Venice could not be
+  wire-certified through the available account's billing gate. OpenCode Go,
+  OpenRouter, and Z.ai Coding retain their direct-proven named
+  GLM-5.3-Flash routes.
 
 ## 0.5.0
 

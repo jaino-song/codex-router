@@ -286,7 +286,7 @@ export async function handleGeminiRequest(
     geminiError(
       response,
       501,
-      "The router serves chat turns only; no routed provider exposes an embedding endpoint through it.",
+      "Gemini embedContent is not bridged; the separate OpenAI-compatible embeddings route requires an explicitly capable model.",
     );
     return;
   }

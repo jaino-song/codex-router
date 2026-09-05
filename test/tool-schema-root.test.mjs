@@ -10,7 +10,47 @@ import {
   normalizeSchemaLiterals,
   objectRootToolSchema,
   providerToolSchema,
+  stripCodexEncryptedSchemaAnnotation,
 } from "../src/tool-schema-root.mjs";
+
+test("Codex encrypted annotations are removed only from JSON-Schema nodes", () => {
+  const ordinary = {
+    type: "object",
+    properties: { value: { type: "string" } },
+  };
+  assert.equal(stripCodexEncryptedSchemaAnnotation(ordinary), ordinary);
+
+  const schema = {
+    type: "object",
+    encrypted: true,
+    properties: {
+      encrypted: {
+        type: "string",
+        description: "A legitimate user property named encrypted.",
+      },
+      nested: {
+        type: "object",
+        properties: {
+          value: { type: "string", encrypted: true },
+        },
+      },
+    },
+    default: { encrypted: true },
+    examples: [{ encrypted: true }],
+  };
+  const repaired = stripCodexEncryptedSchemaAnnotation(schema);
+  assert.notEqual(repaired, schema);
+  assert.equal("encrypted" in repaired, false);
+  assert.deepEqual(repaired.properties.encrypted, {
+    type: "string",
+    description: "A legitimate user property named encrypted.",
+  });
+  assert.equal("encrypted" in repaired.properties.nested.properties.value, false);
+  assert.deepEqual(repaired.default, { encrypted: true });
+  assert.deepEqual(repaired.examples, [{ encrypted: true }]);
+  assert.equal(schema.encrypted, true, "the caller's schema must not be mutated");
+  assert.equal(schema.properties.nested.properties.value.encrypted, true);
+});
 
 test("recursive local refs keep definitions and only the cycle edge becomes permissive", () => {
   const schema = {
@@ -34,6 +74,11 @@ test("recursive local refs keep definitions and only the cycle edge becomes perm
   assert.deepEqual(repaired.$defs.node.properties.child, {
     description: "optional child",
   });
+  assert.equal(
+    schema.$defs.node.properties.child.$ref,
+    "#/$defs/node",
+    "the caller's recursive schema is not mutated",
+  );
 });
 
 test("mutually recursive refs retain their shared definitions and break one back edge", () => {
@@ -552,6 +597,26 @@ test("a sibling-property ref is inlined with the target's constraints", () => {
   assert.deepEqual(schema, flightsSearchSchema());
 });
 
+// A foreign `$ref` plus a validation sibling is a conjunction. Blind object
+// spread is only lossless when overlapping keywords agree: replacing the
+// target's tighter maxLength with the sibling's looser value would widen what
+// the caller's tool accepts. When that conjunction cannot be represented by a
+// simple inline, keep the original ref and let the strict provider fail closed.
+test("a conflicting foreign ref validation sibling is not widened", () => {
+  const schema = {
+    type: "object",
+    properties: {
+      base: { type: "string", maxLength: 5 },
+      alias: { $ref: "#/properties/base", maxLength: 10 },
+    },
+  };
+  const inlined = inlineForeignRefs(schema);
+  assert.equal(inlined, schema);
+  assert.deepEqual(inlined.properties.alias, {
+    $ref: "#/properties/base",
+    maxLength: 10,
+  });
+});
 test("a $defs ref is the form Moonshot asks for and survives untouched", () => {
   const schema = {
     type: "object",

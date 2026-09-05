@@ -61,6 +61,14 @@
   padding: 0;
 }
 
+.pm-models-loading {
+  min-height: 430px;
+}
+
+.pm-models-loading .panel-skeleton-item {
+  min-height: 58px;
+}
+
 .pm-model-toolbar {
   display: flex;
   min-width: 0;
@@ -752,6 +760,15 @@
   padding: 12px 14px;
 }
 
+.pm-connections-loading {
+  display: grid;
+  grid-template-columns: minmax(140px, 0.7fr) repeat(2, minmax(120px, 1fr));
+}
+
+.pm-connections-loading .skeleton-block {
+  min-height: 34px;
+}
+
 .pm-connections-label {
   display: grid;
   gap: 2px;
@@ -1089,6 +1106,10 @@
 .pm-model-details-mono {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 9.5px !important;
+}
+
+.pm-model-details dd.pm-model-details-controls {
+  overflow: visible;
 }
 
 .pm-model-details .pm-subagent-controls {

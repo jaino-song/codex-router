@@ -309,7 +309,7 @@ struct NativeMutationDrain: Equatable {
   }
 }
 
-enum RouterActivityState: String, Decodable {
+enum RouterActivityState: String, Decodable, Equatable {
   case idle
   case generating
   case starting
@@ -372,21 +372,295 @@ enum MenuBarRouterMarkImage {
 @main
 struct ModelRouterTrayApp: App {
   @NSApplicationDelegateAdaptor private var appDelegate: AppDelegate
-  @ObservedObject private var store = RouterStore.shared
 
   var body: some Scene {
-    // The insertion binding is read-only from our side: visibility is decided
-    // by the presence mode, not by the system writing back.
-    MenuBarExtra(isInserted: Binding(
-      get: { store.surfacesVisible },
-      set: { _ in }
-    )) {
-      TrayView(store: store)
-        .frame(width: 352, height: 560)
-    } label: {
-      StatusItemLabel(store: store)
+    // MenuBarExtra(.window) re-anchors from a SwiftUI-driven status item on
+    // every RouterStore publish, which parks the panel on opposite screen
+    // corners. The AppDelegate owns one fixed NSStatusItem and NSPanel instead.
+    // This empty Settings scene is only here to satisfy App.
+    Settings { EmptyView() }
+  }
+}
+
+// A borderless NSWindow refuses key status by default. The tray deliberately
+// uses a borderless, non-activating panel so opening it does not steal the
+// foreground app, but its search, credential, and local-model fields still
+// need a first responder once the operator clicks them. Opting into key status
+// keeps that keyboard focus inside the panel without turning it into a normal
+// activating application window.
+final class TrayInputPanel: NSPanel {
+  override var canBecomeKey: Bool { true }
+  override var canBecomeMain: Bool { false }
+}
+
+enum TrayControlAppearance {
+  // The tray is a non-activating panel, so SwiftUI otherwise reports every
+  // control as belonging to an inactive window and macOS removes the tint
+  // from enabled switches. The panel is visible only while it is key; publish
+  // that actual state to the hosted controls so on/off remains legible.
+  static let activeState: ControlActiveState = .key
+}
+
+enum TraySubagentTogglePolicy {
+  // An unknown route is intentionally selectable: that explicit choice is
+  // what publishes it as a candidate and starts the compatibility check. Only
+  // a repository-reviewed v1-only route is a genuine dead end. Picker
+  // visibility is a separate setting: Codex can run a route as a subagent
+  // without showing it in the top-level model picker.
+  static func isDisabled(certification: String) -> Bool {
+    certification == "v1"
+  }
+}
+
+// The switch reflects the effective router selection, not only the registry's
+// provenance label. `selected` and `all` deliberately promote otherwise
+// unknown routes when the operator opts in; recomputing the switch from the
+// registry alone made a successful click snap back to off after refresh.
+enum TraySubagentSelectionPolicy {
+  static func isOn(
+    certification: String,
+    mode: String,
+    explicitlyEnabled: Bool,
+    explicitlyDisabled: Bool
+  ) -> Bool {
+    guard !explicitlyDisabled, certification != "v1" else { return false }
+    if certification == "v2" { return true }
+    return mode == "all" || (mode == "selected" && explicitlyEnabled)
+  }
+}
+
+enum TrayPanelClickPolicy {
+  // A non-activating status panel can surface its own mouse-down through the
+  // global monitor on some macOS releases. Closing on every global event tears
+  // the panel down before a SwiftUI switch receives mouse-up, so inside clicks
+  // must be excluded explicitly in screen coordinates.
+  static func shouldClose(
+    screenPoint: NSPoint,
+    panelFrame: NSRect,
+    statusItemFrame: NSRect?
+  ) -> Bool {
+    if panelFrame.contains(screenPoint) { return false }
+    if statusItemFrame?.contains(screenPoint) == true { return false }
+    return true
+  }
+}
+
+@MainActor
+final class TrayMenuController: NSObject {
+  private let store: RouterStore
+  private let statusItem: NSStatusItem
+  private let panel: NSPanel
+  private let statusHostingView: NSHostingView<StatusItemLabel>
+  private var displayModeCancellable: AnyCancellable?
+  private var localEventMonitor: Any?
+  private var globalEventMonitor: Any?
+  private var screenObserver: NSObjectProtocol?
+
+  init(store: RouterStore) {
+    self.store = store
+    let length = MenuBarLayoutMetrics.statusItemWidth(displayMode: store.menuBarDisplayMode)
+    statusItem = NSStatusBar.system.statusItem(withLength: length)
+    let hosting = NSHostingView(rootView: StatusItemLabel(store: store))
+    hosting.sizingOptions = []
+    hosting.translatesAutoresizingMaskIntoConstraints = true
+    hosting.autoresizingMask = []
+    hosting.wantsLayer = true
+    hosting.layer?.masksToBounds = true
+    statusHostingView = hosting
+    panel = TrayInputPanel(
+      contentRect: NSRect(origin: .zero, size: TrayPanelPlacement.panelSize),
+      styleMask: [.borderless, .nonactivatingPanel, .fullSizeContentView],
+      backing: .buffered,
+      defer: false
+    )
+    super.init()
+    configureStatusItem()
+    configurePanel()
+    displayModeCancellable = store.$menuBarDisplayMode
+      .receive(on: DispatchQueue.main)
+      .sink { [weak self] _ in
+        guard let self else { return }
+        self.applyStatusItemMetrics()
+        if self.panel.isVisible {
+          self.reposition()
+        }
+      }
+    // Local UI verification launches the real tray binary without requiring a
+    // synthetic click on macOS's otherwise inaccessible status-item window.
+    // The production launch agent never supplies this private test argument.
+    if CommandLine.arguments.contains("--ui-test-show-panel") {
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+        self?.showPanel()
+      }
     }
-    .menuBarExtraStyle(.window)
+  }
+
+  func setVisible(_ visible: Bool) {
+    statusItem.isVisible = visible
+    if !visible {
+      closePanel()
+    }
+  }
+
+  func tearDown() {
+    closePanel()
+    removeMonitors()
+    if let screenObserver {
+      NotificationCenter.default.removeObserver(screenObserver)
+    }
+    screenObserver = nil
+    NSStatusBar.system.removeStatusItem(statusItem)
+  }
+
+  private func configureStatusItem() {
+    guard let button = statusItem.button else { return }
+    button.title = ""
+    button.image = nil
+    button.autoresizesSubviews = false
+    button.addSubview(statusHostingView)
+    button.target = self
+    button.action = #selector(statusItemClicked(_:))
+    button.sendAction(on: [.leftMouseUp])
+    statusItem.isVisible = store.surfacesVisible
+    applyStatusItemMetrics()
+  }
+
+  private func configurePanel() {
+    panel.isOpaque = false
+    panel.backgroundColor = .clear
+    panel.hasShadow = true
+    panel.level = .statusBar
+    panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+    panel.isMovable = false
+    panel.hidesOnDeactivate = false
+    panel.becomesKeyOnlyIfNeeded = true
+  }
+
+  private func installPanelContentIfNeeded() {
+    guard panel.contentViewController == nil else { return }
+    let content = NSHostingController(
+      rootView: TrayView(store: store)
+        .environment(\.controlActiveState, TrayControlAppearance.activeState)
+        .frame(
+          width: TrayPanelPlacement.panelSize.width,
+          height: TrayPanelPlacement.panelSize.height
+        )
+    )
+    content.sizingOptions = []
+    content.view.frame = NSRect(origin: .zero, size: TrayPanelPlacement.panelSize)
+    content.view.wantsLayer = true
+    content.view.layer?.cornerRadius = 12
+    content.view.layer?.masksToBounds = true
+    panel.contentViewController = content
+    panel.setContentSize(TrayPanelPlacement.panelSize)
+  }
+
+  private func applyStatusItemMetrics() {
+    let width = MenuBarLayoutMetrics.statusItemWidth(displayMode: store.menuBarDisplayMode)
+    let height = MenuBarLayoutMetrics.statusItemHeight(displayMode: store.menuBarDisplayMode)
+    statusItem.length = width
+    statusHostingView.frame = NSRect(x: 0, y: 0, width: width, height: height)
+  }
+
+  @objc private func statusItemClicked(_ sender: Any?) {
+    if panel.isVisible {
+      closePanel()
+    } else {
+      showPanel()
+    }
+  }
+
+  private func showPanel() {
+    guard statusItem.isVisible, statusItem.button?.window != nil else { return }
+    installPanelContentIfNeeded()
+    reposition()
+    panel.orderFrontRegardless()
+    panel.makeKey()
+    statusItem.button?.highlight(true)
+    installMonitors()
+  }
+
+  private func closePanel() {
+    panel.orderOut(nil)
+    // The settings tree can contain hundreds of model and provider rows. It
+    // observes RouterStore, so retaining it after the panel closes makes every
+    // background health update re-evaluate a large, invisible SwiftUI graph.
+    // Recreate it lazily on the next open instead of paying that cost forever.
+    panel.contentViewController = nil
+    statusItem.button?.highlight(false)
+    removeMonitors()
+  }
+
+  private func reposition() {
+    guard let buttonWindow = statusItem.button?.window else { return }
+    let buttonRect = buttonWindow.frame
+    // A status-item window sits in the menu-bar strip, outside visibleFrame.
+    // Ask AppKit which screen owns that window instead of hit-testing a point
+    // that no screen's visible frame is expected to contain.
+    let visible = buttonWindow.screen?.visibleFrame
+      ?? NSScreen.main?.visibleFrame
+      ?? buttonRect
+    let frame = TrayPanelPlacement.frame(
+      buttonScreenRect: buttonRect,
+      visibleFrame: visible
+    )
+    panel.setFrame(NSRect(origin: frame.origin, size: TrayPanelPlacement.panelSize), display: false)
+  }
+
+  private func installMonitors() {
+    removeMonitors()
+    globalEventMonitor = NSEvent.addGlobalMonitorForEvents(
+      matching: [.leftMouseDown, .rightMouseDown]
+    ) { [weak self] _ in
+      let screenPoint = NSEvent.mouseLocation
+      Task { @MainActor in
+        guard let self else { return }
+        let statusItemFrame = self.statusItem.button?.window?.frame
+        guard TrayPanelClickPolicy.shouldClose(
+          screenPoint: screenPoint,
+          panelFrame: self.panel.frame,
+          statusItemFrame: statusItemFrame
+        ) else { return }
+        self.closePanel()
+      }
+    }
+    localEventMonitor = NSEvent.addLocalMonitorForEvents(
+      matching: [.leftMouseDown, .rightMouseDown, .keyDown]
+    ) { [weak self] event in
+      guard let self else { return event }
+      if event.type == .keyDown, event.keyCode == 53 {
+        self.closePanel()
+        return nil
+      }
+      if event.type == .leftMouseDown || event.type == .rightMouseDown {
+        if event.window == self.statusItem.button?.window {
+          return event
+        }
+        if event.window != self.panel {
+          self.closePanel()
+        }
+      }
+      return event
+    }
+    screenObserver = NotificationCenter.default.addObserver(
+      forName: NSApplication.didChangeScreenParametersNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      Task { @MainActor in
+        guard let self, self.panel.isVisible else { return }
+        self.reposition()
+      }
+    }
+  }
+
+  private func removeMonitors() {
+    if let globalEventMonitor { NSEvent.removeMonitor(globalEventMonitor) }
+    if let localEventMonitor { NSEvent.removeMonitor(localEventMonitor) }
+    globalEventMonitor = nil
+    localEventMonitor = nil
+    if let screenObserver { NotificationCenter.default.removeObserver(screenObserver) }
+    screenObserver = nil
   }
 }
 
@@ -395,22 +669,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   let store = RouterStore.shared
   private var islandController: IslandWindowController?
   private var desktopPanelController: DesktopPanelWindowController?
+  private var trayMenuController: TrayMenuController?
   private var surfaceVisibility: AnyCancellable?
+  private var widgetSnapshotPublishing: AnyCancellable?
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSApp.setActivationPolicy(.accessory)
+    trayMenuController = TrayMenuController(store: store)
     islandController = IslandWindowController(store: store)
     desktopPanelController = DesktopPanelWindowController(store: store)
     surfaceVisibility = store.$surfacesVisible
       .combineLatest(store.$islandMode)
       .sink { [weak self] visible, mode in
         // Publishing from a refresh can happen while SwiftUI is evaluating the
-        // MenuBarExtra tree. Defer AppKit window/layout work until that render
-        // transaction has finished, otherwise relaunches can recurse through
-        // layoutSubtreeIfNeeded.
+        // island/desktop hosting trees. Defer AppKit window/layout work until
+        // that render transaction has finished, otherwise relaunches can
+        // recurse through layoutSubtreeIfNeeded.
         Task { @MainActor [weak self] in
           self?.islandController?.setVisible(visible && mode == .notch)
           self?.desktopPanelController?.setVisible(visible && mode == .desktop)
+          self?.trayMenuController?.setVisible(visible)
+        }
+      }
+    widgetSnapshotPublishing = store.objectWillChange
+      .debounce(for: .milliseconds(450), scheduler: RunLoop.main)
+      .sink { [weak store] _ in
+        Task { @MainActor in
+          // ObservableObject announces immediately before it mutates. Yield so
+          // the Widget snapshot reads the committed values, not the old turn.
+          await Task<Never, Never>.yield()
+          store?.publishWidgetSnapshot()
         }
       }
     store.retireLoginItem()
@@ -419,6 +707,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     Task { await store.startActivityPolling() }
     Task { await store.startAccountUsagePolling() }
     Task { await store.startProviderPolling() }
+    store.publishWidgetSnapshot()
     if Self.launchedByUser {
       store.revealForUserLaunch()
       ControlCenterLauncher.open()
@@ -435,6 +724,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     return true
   }
 
+  func application(_ application: NSApplication, open urls: [URL]) {
+    guard let navigation = urls.compactMap(ControlCenterNavigationRequest.init(url:)).first else { return }
+    store.revealForUserLaunch()
+    ControlCenterLauncher.open(navigation: navigation)
+  }
+
   // launchd passes --supervised (see src/tray-service-macos.mjs) so a login
   // start is distinguishable from a person opening the app. Without the
   // distinction every login would force the surfaces visible and quietly
@@ -444,12 +739,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
   }
 
   func applicationWillTerminate(_ notification: Notification) {
+    trayMenuController?.tearDown()
     ControlCenterLauncher.terminateEmbeddedApplication()
     store.restoreServiceOnQuit()
   }
 
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
     store.applicationTerminationReply()
+  }
+}
+
+enum ControlCenterDestination: String, Equatable {
+  case usage
+  case usageResets = "usage-resets"
+
+}
+
+struct ControlCenterNavigationRequest: Equatable {
+  static let scheme = "codex-router"
+  static let host = "control-center"
+  static let sourcePattern = try! NSRegularExpression(pattern: "^[a-z0-9][a-z0-9-]{0,63}$")
+
+  let destination: ControlCenterDestination
+  let sourceID: String?
+
+  init?(url: URL) {
+    guard url.scheme == Self.scheme,
+          url.host == Self.host,
+          url.user == nil,
+          url.password == nil,
+          url.port == nil,
+          url.fragment == nil
+    else { return nil }
+    let rawDestination: String
+    switch url.path {
+    case "/usage": rawDestination = "usage"
+    case "/usage-resets": rawDestination = "usage-resets"
+    default: return nil
+    }
+    guard let destination = ControlCenterDestination(rawValue: rawDestination),
+          let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+    else { return nil }
+    let items = components.queryItems ?? []
+    guard items.allSatisfy({ $0.name == "source" }), items.count <= 1 else { return nil }
+    let sourceID = items.first?.value
+    if let sourceID {
+      let range = NSRange(sourceID.startIndex..<sourceID.endIndex, in: sourceID)
+      guard Self.sourcePattern.firstMatch(in: sourceID, range: range)?.range == range else { return nil }
+    }
+    self.destination = destination
+    self.sourceID = sourceID
+  }
+
+  var arguments: [String] {
+    var result = ["--router-destination", destination.rawValue]
+    if let sourceID { result += ["--router-source", sourceID] }
+    return result
+  }
+
+  var url: URL {
+    var components = URLComponents()
+    components.scheme = Self.scheme
+    components.host = Self.host
+    components.path = "/\(destination.rawValue)"
+    if let sourceID { components.queryItems = [URLQueryItem(name: "source", value: sourceID)] }
+    return components.url!
   }
 }
 
@@ -464,7 +818,7 @@ enum ControlCenterLauncher {
     return FileManager.default.fileExists(atPath: candidate.path) ? candidate : nil
   }
 
-  static func open() {
+  static func open(navigation: ControlCenterNavigationRequest? = nil) {
     guard let application = bundledApplicationURL else {
       RouterStore.shared.reportControlCenterLaunchFailure(
         "The embedded Control Center is missing. Rebuild Codex Router."
@@ -474,7 +828,7 @@ enum ControlCenterLauncher {
     Task { @MainActor in
       do {
         try await retireSupersededControlCenters(except: application)
-        openBundledApplication(application)
+        openBundledApplication(application, navigation: navigation)
       } catch {
         RouterStore.shared.reportControlCenterLaunchFailure(error.localizedDescription)
       }
@@ -506,20 +860,41 @@ enum ControlCenterLauncher {
     )
   }
 
-  private static func openBundledApplication(_ application: URL) {
+  private static func openBundledApplication(
+    _ application: URL,
+    navigation: ControlCenterNavigationRequest?
+  ) {
     let configuration = NSWorkspace.OpenConfiguration()
     configuration.activates = true
-    configuration.environment = embeddedEnvironment(
-      processEnvironment: ProcessInfo.processInfo.environment
-    )
-    NSWorkspace.shared.openApplication(at: application, configuration: configuration) { _, error in
+    configuration.environment = embeddedEnvironment(processEnvironment: ProcessInfo.processInfo.environment)
+    let completion: @Sendable (NSRunningApplication?, (any Error)?) -> Void = { _, error in
       guard let error else { return }
+      let message = error.localizedDescription
       Task { @MainActor in
         RouterStore.shared.reportControlCenterLaunchFailure(
-          "Control Center could not open: \(error.localizedDescription)"
+          "Control Center could not open: \(message)"
         )
       }
     }
+    if let navigation {
+      // Launch arguments are deterministic for a cold Electron start, while
+      // LaunchServices drops them when it merely activates a running process.
+      // The URL Apple Event covers that warm path, so carry both forms of the
+      // same validated, idempotent navigation request.
+      configuration.arguments = navigation.arguments
+      NSWorkspace.shared.open(
+        [navigation.url],
+        withApplicationAt: application,
+        configuration: configuration,
+        completionHandler: completion
+      )
+      return
+    }
+    NSWorkspace.shared.openApplication(
+      at: application,
+      configuration: configuration,
+      completionHandler: completion
+    )
   }
 
   nonisolated static func embeddedEnvironment(
@@ -674,46 +1049,6 @@ final class RouterStore: ObservableObject {
   private var latestObservedActivityRequestID: String?
   private var lastObservedSessionID: String?
   private var activityHealthFailureStartedAt: Date?
-  private var dailyUsageCache: [DailyUsageCacheKey: [DailyUsagePoint]] = [:]
-  private var localUsageTotalsCache: [LocalUsageTotalsCacheKey: UsageTotals] = [:]
-
-  private struct DailyUsageCacheBucket: Hashable {
-    let startDate: String
-    let tokens: Int64
-  }
-
-  private struct DailyUsageCacheKey: Hashable {
-    let providerID: String
-    let days: Int
-    let today: Date
-    let buckets: [DailyUsageCacheBucket]
-  }
-
-  private struct LocalUsageTotalsCacheBucket: Hashable {
-    let startDate: String
-    let tokens: Int64
-    let requests: Int
-  }
-
-  private struct LocalUsageTotalsCacheKey: Hashable {
-    let providerID: String
-    let days: Int
-    let today: Date
-    let buckets: [LocalUsageTotalsCacheBucket]
-  }
-
-  private struct UsageTotals {
-    let tokens: Double
-    let requests: Int
-  }
-
-  private static let dayKeyFormatter: DateFormatter = {
-    let formatter = DateFormatter()
-    formatter.locale = Locale(identifier: "en_US_POSIX")
-    formatter.calendar = Calendar(identifier: .gregorian)
-    formatter.dateFormat = "yyyy-MM-dd"
-    return formatter
-  }()
 
   // What the three stored signals mean, as one pure decision. Pulled out of
   // `init` so it can be tested: the mode this picks is the difference between
@@ -1901,25 +2236,44 @@ final class RouterStore: ObservableObject {
     focusUsageProvider(providerID)
   }
 
-  // One click covers the whole route into an OAuth provider: install the
-  // official CLI when it is missing, then run its sign-in flow. Stopping after
-  // the install left a row that looked finished but still had no credential.
-  // install-cli is a no-op when the CLI is already present, so an unknown
-  // state costs a lookup rather than a wrong branch.
+  // One click covers the whole route into an OAuth provider. CLI-owned routes
+  // install and launch their official client; Antigravity uses this router's
+  // local browser flow and stops before its separately labelled live probe.
   func connectProvider(_ provider: String) async {
+    let setupAction = providerSetup[provider]?.action
+    if setupAction == "probe" {
+      await performProviderOperation(
+        provider,
+        successMessage: "Live compatibility verified and provider enabled. Restart Codex to refresh its model picker."
+      ) {
+        _ = try await runControl(arguments: ["probe-provider", provider, "--live", "--yes"])
+        try await updateProviderSelection(provider, enabled: true)
+      }
+      return
+    }
     let reconnecting = providerSetup[provider]?.configured == true
     let needsInstall = providerSetup[provider]?.cliInstalled != true
+    let displayName = providerSetup[provider]?.displayName ?? provider
+    let awaitsAntigravityProbe = provider == "antigravity-oauth" && setupAction == "login"
     await performProviderOperation(
       provider,
-      successMessage: reconnecting
-        ? "Provider reconnected."
-        : "Provider connected. Restart Codex to refresh its model picker."
+      progressMessage: reconnecting
+        ? "Opening \(displayName) sign-in in your browser…"
+        : "Starting \(displayName) sign-in…",
+      successMessage: awaitsAntigravityProbe
+        ? "Signed in. Run the live compatibility test before enabling this provider."
+        : reconnecting
+          ? "Provider reconnected."
+          : "Provider connected. Restart Codex to refresh its model picker."
     ) {
       if needsInstall {
         _ = try await runControl(arguments: ["install-cli", provider])
       }
       _ = try await runControl(arguments: ["login", provider])
-      if !reconnecting {
+      // Antigravity sign-in deliberately stops before the quota-consuming live
+      // compatibility test. The next, clearly labelled action performs that
+      // test and only then enables the route.
+      if !reconnecting && !awaitsAntigravityProbe {
         try await updateProviderSelection(provider, enabled: true)
       }
     }
@@ -1927,11 +2281,17 @@ final class RouterStore: ObservableObject {
 
   func loginProvider(_ provider: String) async {
     let reconnecting = providerSetup[provider]?.configured == true
+    let displayName = providerSetup[provider]?.displayName ?? provider
     await performProviderOperation(
       provider,
-      successMessage: reconnecting
-        ? "Provider reconnected."
-        : "Provider connected. Restart Codex to refresh its model picker."
+      progressMessage: reconnecting
+        ? "Opening \(displayName) sign-in in your browser…"
+        : "Starting \(displayName) sign-in…",
+      successMessage: provider == "antigravity-oauth"
+        ? "Signed in again. Run the live compatibility test before re-enabling this provider."
+        : reconnecting
+          ? "Provider reconnected."
+          : "Provider connected. Restart Codex to refresh its model picker."
     ) {
       _ = try await runControl(arguments: ["login", provider])
       if !reconnecting {
@@ -1968,39 +2328,43 @@ final class RouterStore: ObservableObject {
   }
 
   func dailyUsage(days: Int) -> [DailyUsagePoint] {
-    let buckets: [DailyUsageCacheBucket]
-    if selectedUsageUsesChatGPT {
-      buckets = accountUsage?.dailyUsageBuckets.map {
-        DailyUsageCacheBucket(startDate: $0.startDate, tokens: $0.tokens)
-      } ?? []
+    dailyUsage(for: selectedUsageProviderID, days: days)
+  }
+
+  func dailyFallbackDays(days: Int) -> Int {
+    guard selectedUsageUsesChatGPT else { return 0 }
+    return dailyUsage(days: days).filter(\.isRouterFallback).count
+  }
+
+  func dailyUsage(for providerID: String, days: Int) -> [DailyUsagePoint] {
+    // Pure read: never mutate store state from a SwiftUI body call site.
+    // Issue #601 pegged a core when the old memo keyed on growing bucket
+    // arrays and wrote that cache during layout of the usage LazyVGrid.
+    let buckets: [DailyUsageDisplayBucket]
+    if providerID == "openai" {
+      // OpenAI's account stream is authoritative whenever it contains a date.
+      // The local OpenAI provider stream is narrower router telemetry, so it
+      // only fills an absent account date and never replaces an explicit zero.
+      buckets = mergeAccountUsageBuckets(
+        account: accountUsage?.dailyUsageBuckets ?? [],
+        router: providerUsage(for: "openai")?.dailyUsageBuckets ?? []
+      )
     } else {
-      buckets = selectedProviderUsage?.dailyUsageBuckets.map {
-        DailyUsageCacheBucket(startDate: $0.startDate, tokens: $0.tokens)
+      buckets = providerUsage(for: providerID)?.dailyUsageBuckets.map {
+        DailyUsageDisplayBucket(
+          startDate: $0.startDate,
+          tokens: $0.tokens,
+          isRouterFallback: false
+        )
       } ?? []
     }
     let calendar = Calendar.current
-    let today = calendar.startOfDay(for: .now)
-    let cacheKey = DailyUsageCacheKey(
-      providerID: selectedUsageProviderID,
+    return dailyUsagePoints(
+      from: buckets,
       days: days,
-      today: today,
-      buckets: buckets
+      today: calendar.startOfDay(for: .now),
+      calendar: calendar
     )
-    if let cached = dailyUsageCache[cacheKey] { return cached }
-
-    let indexed = Dictionary(uniqueKeysWithValues: buckets.map {
-      ($0.startDate, Double($0.tokens))
-    })
-    let points = (0..<days).map { offset in
-      let date = calendar.date(byAdding: .day, value: offset - (days - 1), to: today) ?? today
-      return DailyUsagePoint(
-        date: date,
-        tokens: indexed[Self.dayKeyFormatter.string(from: date)] ?? 0
-      )
-    }
-    if dailyUsageCache.count >= 24 { dailyUsageCache.removeAll(keepingCapacity: true) }
-    dailyUsageCache[cacheKey] = points
-    return points
   }
 
   func localUsageTotals(days: Int) -> (tokens: Double, requests: Int) {
@@ -2010,38 +2374,12 @@ final class RouterStore: ObservableObject {
   func localUsageTotals(for providerID: String, days: Int) -> (tokens: Double, requests: Int) {
     guard providerID != "openai", let usage = providerUsage(for: providerID) else { return (0, 0) }
     let calendar = Calendar.current
-    let today = calendar.startOfDay(for: .now)
-    let buckets = usage.dailyUsageBuckets.map {
-      LocalUsageTotalsCacheBucket(
-        startDate: $0.startDate,
-        tokens: $0.tokens,
-        requests: $0.requests
-      )
-    }
-    let cacheKey = LocalUsageTotalsCacheKey(
-      providerID: providerID,
+    return sumLocalUsageTotals(
+      from: usage.dailyUsageBuckets,
       days: days,
-      today: today,
-      buckets: buckets
+      today: calendar.startOfDay(for: .now),
+      calendar: calendar
     )
-    if let cached = localUsageTotalsCache[cacheKey] {
-      return (cached.tokens, cached.requests)
-    }
-
-    let firstDay = calendar.date(byAdding: .day, value: -(days - 1), to: today) ?? today
-    let totals = usage.dailyUsageBuckets.reduce(into: (tokens: 0.0, requests: 0)) { totals, bucket in
-      guard let date = Self.dayKeyFormatter.date(from: bucket.startDate),
-            date >= firstDay,
-            date <= today
-      else { return }
-      totals.tokens += Double(bucket.tokens)
-      totals.requests += bucket.requests
-    }
-    if localUsageTotalsCache.count >= 48 {
-      localUsageTotalsCache.removeAll(keepingCapacity: true)
-    }
-    localUsageTotalsCache[cacheKey] = UsageTotals(tokens: totals.tokens, requests: totals.requests)
-    return totals
   }
 
   func localUsageSummary(for providerID: String, days: Int = 7) -> String {
@@ -2524,8 +2862,8 @@ final class RouterStore: ObservableObject {
       },
       success: { enabled in
         enabled
-        ? "Old tool-result compaction is on for the next external-model request."
-        : "Exact tool results will be sent on the next external-model request."
+        ? "Token maxxing is on for the next external-model request."
+        : "Token maxxing is off; exact tool results will be sent on the next external-model request."
       }
     )
   }
@@ -2879,6 +3217,7 @@ final class RouterStore: ObservableObject {
 
   private func performProviderOperation(
     _ provider: String,
+    progressMessage: String? = nil,
     successMessage: String,
     operation: () async throws -> Void
   ) async {
@@ -2890,6 +3229,7 @@ final class RouterStore: ObservableObject {
     // is still authoritative.
     invalidateProviderCatalogs(catalogSourceIDs)
     providerOperation = provider
+    if let progressMessage { message = progressMessage }
     defer { providerOperation = nil }
     do {
       try await operation()
@@ -2933,7 +3273,11 @@ final class RouterStore: ObservableObject {
       let nextActiveRequests = health.activity.active ?? []
       let nextActiveRequestCount = health.activity.activeCount ?? nextActiveRequests.count
       activityHealthFailureStartedAt = nil
-      routerHealth = health
+      // Health is polled once a second so activity changes stay responsive.
+      // Publishing an identical value still invalidates every observed SwiftUI
+      // tree (and schedules a widget snapshot), which made an open settings
+      // panel visibly hitch while the router was idle.
+      if routerHealth != health { routerHealth = health }
       if activityState != health.activity.state { activityState = health.activity.state }
       if activeRequests != nextActiveRequests { activeRequests = nextActiveRequests }
       if activeRequestCount != nextActiveRequestCount {
@@ -3169,6 +3513,11 @@ final class RouterStore: ObservableObject {
     environment["MODEL_ROUTER_SOURCE_ROOT"] = root.path
     environment["MODEL_ROUTER_TARGET"] = "codex"
     environment.removeValue(forKey: "CODEX_ROUTER_DEFER_TRAY_REBUILD")
+    environment.removeValue(forKey: "CODEX_ROUTER_OPERATION_DEADLINE_MS")
+    environment.removeValue(forKey: "CODEX_ROUTER_OPERATION_TIMEOUT_MS")
+    environment.removeValue(forKey: "CODEX_ROUTER_OPERATION_CHILD")
+    environment.removeValue(forKey: "CODEX_ROUTER_OWNER_SIGNAL_BUDGET_MS")
+    environment.removeValue(forKey: "CODEX_ROUTER_OWNER_SIGNAL_BARRIER_DIR")
     environment.removeValue(forKey: "ELECTRON_RUN_AS_NODE")
     task.environment = environment
     task.standardInput = FileHandle.nullDevice
@@ -3196,6 +3545,8 @@ final class RouterStore: ObservableObject {
       task.arguments = arguments
       task.currentDirectoryURL = root
       var environment = ProcessInfo.processInfo.environment
+      environment.removeValue(forKey: "CODEX_ROUTER_OWNER_SIGNAL_BUDGET_MS")
+      environment.removeValue(forKey: "CODEX_ROUTER_OWNER_SIGNAL_BARRIER_DIR")
       let home = FileManager.default.homeDirectoryForCurrentUser.path
       let preferredPaths = [
         "\(home)/.npm-global/bin",
@@ -3204,6 +3555,23 @@ final class RouterStore: ObservableObject {
         "/usr/local/bin",
       ]
       environment["PATH"] = (preferredPaths + [environment["PATH"] ?? ""]).joined(separator: ":")
+      let controlTimeout = RouterScriptWatchdog.controlTimeout(arguments: arguments)
+      if !outlivesApplication {
+        let operationTimeout = RouterScriptWatchdog.operationTimeout(arguments: arguments)
+        let ownerTimeout = RouterScriptWatchdog.operationOwnerTimeout(arguments: arguments)
+        let deadlineMilliseconds = Int64(
+          (Date().timeIntervalSince1970 + ownerTimeout) * 1_000
+        )
+        environment["CODEX_ROUTER_OPERATION_TIMEOUT_MS"] = String(
+          Int(operationTimeout * 1_000)
+        )
+        environment["CODEX_ROUTER_OPERATION_DEADLINE_MS"] = String(deadlineMilliseconds)
+        environment.removeValue(forKey: "CODEX_ROUTER_OPERATION_CHILD")
+      } else {
+        environment.removeValue(forKey: "CODEX_ROUTER_OPERATION_DEADLINE_MS")
+        environment.removeValue(forKey: "CODEX_ROUTER_OPERATION_TIMEOUT_MS")
+        environment.removeValue(forKey: "CODEX_ROUTER_OPERATION_CHILD")
+      }
       if arguments == ["maintenance"] || arguments == ["doctor", "--fix"] {
         // The installer must return before it replaces the app that is waiting
         // for this mutation. A detached tray refresh below performs the
@@ -3263,7 +3631,10 @@ final class RouterStore: ObservableObject {
         input.fileHandleForWriting.write(stdin)
         try? input.fileHandleForWriting.close()
       }
+      let watchdog = RouterScriptWatchdog(task: task)
+      if !outlivesApplication { watchdog.arm(after: controlTimeout) }
       task.waitUntilExit()
+      if !outlivesApplication { watchdog.disarm() }
       let stdout = await stdoutReader?.value ?? Data()
       let stderr: Data
       if let durableErrorHandle {
@@ -3273,6 +3644,11 @@ final class RouterStore: ObservableObject {
         stderr = (try? durableErrorHandle.read(upToCount: 65_536)) ?? Data()
       } else {
         stderr = await stderrReader?.value ?? Data()
+      }
+      if watchdog.didTimeOut {
+        throw RouterError(
+          "Codex Router control command exceeded its absolute deadline and was stopped."
+        )
       }
       guard task.terminationStatus == 0 else {
         let detail = String(data: stderr, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3317,6 +3693,18 @@ final class RouterStore: ObservableObject {
         "/usr/local/bin",
       ]
       environment["PATH"] = (preferredPaths + [environment["PATH"] ?? ""]).joined(separator: ":")
+      environment.removeValue(forKey: "CODEX_ROUTER_OPERATION_DEADLINE_MS")
+      environment.removeValue(forKey: "CODEX_ROUTER_OPERATION_TIMEOUT_MS")
+      environment.removeValue(forKey: "CODEX_ROUTER_OPERATION_CHILD")
+      environment.removeValue(forKey: "CODEX_ROUTER_OWNER_SIGNAL_BUDGET_MS")
+      environment.removeValue(forKey: "CODEX_ROUTER_OWNER_SIGNAL_BARRIER_DIR")
+      if script == "curate-models.mjs" {
+        let operationTimeout = RouterScriptWatchdog.catalogPublicationOperationTimeout
+        environment["CODEX_ROUTER_OPERATION_TIMEOUT_MS"] = String(Int(operationTimeout * 1_000))
+        environment["CODEX_ROUTER_OPERATION_DEADLINE_MS"] = String(
+          Int64((Date().timeIntervalSince1970 + operationTimeout) * 1_000)
+        )
+      }
       task.environment = environment
       let output = Pipe()
       let errors = Pipe()
@@ -3461,7 +3849,7 @@ final class RouterStore: ObservableObject {
   }
 }
 
-private struct RouterHealth: Decodable {
+private struct RouterHealth: Decodable, Equatable {
   let ok: Bool?
   let error: String?
   let degraded: [String]?
@@ -3502,7 +3890,7 @@ private struct TrayServiceHealthRow: Identifiable {
   let detail: String
 }
 
-private struct RouterActivity: Decodable {
+private struct RouterActivity: Decodable, Equatable {
   let state: RouterActivityState
   let provider: String?
   let model: String?
@@ -3535,10 +3923,30 @@ final class RouterScriptWatchdog: @unchecked Sendable {
   /// Electron's discovery budget (`{ timeoutMs: 45_000 }` in
   /// apps/control-center/electron/ipc.mjs). One provider HTTP round trip.
   static let discoveryTimeout: TimeInterval = 45
-  /// Electron's `CATALOG_MUTATION_TIMEOUT_MS` (330_000). Curation waits on a
-  /// cross-process publish lock and rebuilds every installed client, so it
-  /// gets the same long budget rather than a discovery-sized one.
-  static let catalogMutationTimeout: TimeInterval = 330
+  /// Electron's `CATALOG_MUTATION_TIMEOUT_MS` (1_320_000). A restart-bearing
+  /// curation reserves two complete 640s forward/rollback epochs and keeps the
+  /// remaining owner margin for process-tree cleanup and UI reporting.
+  static let catalogMutationTimeout: TimeInterval = 1_320
+  /// Curation's internal transaction expires before its 1,320s UI owner.
+  static let catalogPublicationOperationTimeout: TimeInterval = 1_280
+  /// Generic control owns one more nested tree around the 1,280s transaction.
+  static let catalogControlOperationTimeout: TimeInterval = 1_300
+  /// The Node owner receives this margin beyond its cooperative child budget
+  /// to terminate a complete process tree before the UI watchdog fires.
+  static let processTreeCleanupReserve: TimeInterval = 10
+  /// Interactive Antigravity OAuth includes the browser wait, live request,
+  /// service readiness, and client publication under one absolute deadline.
+  static let antigravityOperationTimeout: TimeInterval = 600
+  /// The UI watchdog keeps a termination margin beyond the internal deadline,
+  /// so it cannot kill the group leader before that process kills its tree.
+  static let antigravityRunnerTimeout: TimeInterval = 660
+  /// Every other ordinary control mutation expires inside bin/control before
+  /// the outer Swift watchdog. The margin lets Node kill the full descendant
+  /// process group, which Process.terminate() alone cannot guarantee.
+  static let ordinaryOperationTimeout: TimeInterval = 840
+  /// A final safety ceiling for ordinary control calls that are expected to
+  /// return to the app. Self-replacing maintenance deliberately opts out.
+  static let defaultControlTimeout: TimeInterval = 900
   /// Grace period between SIGTERM and SIGKILL, for a child that traps TERM.
   static let terminationGrace: TimeInterval = 5
 
@@ -3547,10 +3955,52 @@ final class RouterScriptWatchdog: @unchecked Sendable {
   private var finished = false
   private var timedOut = false
   // Signalled by `disarm` so a deadline that is no longer needed stops waiting
-  // immediately instead of sleeping out a 330s curation budget.
+  // immediately instead of sleeping out a catalog-sized curation budget.
   private let gate = DispatchSemaphore(value: 0)
 
   init(task: Process) { self.task = task }
+
+  static func isBoundedAntigravityOperation(arguments: [String]) -> Bool {
+    (arguments.count >= 2 && arguments[0] == "login" && arguments[1] == "antigravity-oauth")
+      || (arguments.count >= 2 && arguments[0] == "probe-provider"
+        && arguments[1] == "antigravity-oauth")
+  }
+
+  static func isCatalogMutation(arguments: [String]) -> Bool {
+    guard let command = arguments.first else { return false }
+    return [
+      "set-apply",
+      "credential",
+      "auth-mode",
+      "subagents",
+      "picker",
+      "vision-bridge",
+      "local-models",
+      "signed-routing",
+    ].contains(command)
+  }
+
+  static func controlTimeout(arguments: [String]) -> TimeInterval {
+    if isBoundedAntigravityOperation(arguments: arguments) {
+      return antigravityRunnerTimeout
+    }
+    return isCatalogMutation(arguments: arguments)
+      ? catalogMutationTimeout
+      : defaultControlTimeout
+  }
+
+  static func operationTimeout(arguments: [String]) -> TimeInterval {
+    if isBoundedAntigravityOperation(arguments: arguments) {
+      return antigravityOperationTimeout
+    }
+    return isCatalogMutation(arguments: arguments)
+      ? catalogControlOperationTimeout
+      : ordinaryOperationTimeout
+  }
+
+  static func operationOwnerTimeout(arguments: [String]) -> TimeInterval {
+    operationTimeout(arguments: arguments) + processTreeCleanupReserve
+  }
 
   var didTimeOut: Bool {
     lock.lock()
@@ -3831,7 +4281,7 @@ enum TokenDisplayUnit: String, CaseIterable, Identifiable {
     let normalized = value.isFinite ? max(0, value) : 0
     switch self {
     case .full:
-      return Int64(normalized.rounded()).formatted(.number.grouping(.automatic))
+      return RouterWidgetTokenCount.from(normalized).formatted(.number.grouping(.automatic))
     case .millions:
       return "\(String(format: "%.1f", normalized / 1_000_000))M"
     }
@@ -3888,6 +4338,7 @@ struct CodexDailyUsageBucket: Decodable, Equatable {
 struct DailyUsagePoint: Identifiable, Equatable {
   let date: Date
   let tokens: Double
+  let isRouterFallback: Bool
   var id: Date { date }
 }
 
@@ -3979,6 +4430,83 @@ struct ProviderDailyUsageBucket: Decodable, Equatable {
   let startDate: String
   let tokens: Int64
   let requests: Int
+}
+
+/// The account stream is the only source that can describe the user's global
+/// OpenAI usage. Router telemetry is local to this installation, so it is
+/// allowed to fill a date the account stream omitted, but it must never replace
+/// an account bucket (including an explicit zero).
+struct DailyUsageDisplayBucket: Equatable {
+  let startDate: String
+  let tokens: Int64
+  let isRouterFallback: Bool
+}
+
+let dailyUsageDayKeyFormatter: DateFormatter = {
+  let formatter = DateFormatter()
+  formatter.locale = Locale(identifier: "en_US_POSIX")
+  formatter.calendar = Calendar(identifier: .gregorian)
+  formatter.dateFormat = "yyyy-MM-dd"
+  return formatter
+}()
+
+func mergeAccountUsageBuckets(
+  account: [CodexDailyUsageBucket],
+  router: [ProviderDailyUsageBucket]
+) -> [DailyUsageDisplayBucket] {
+  var merged: [String: DailyUsageDisplayBucket] = [:]
+  for bucket in router {
+    merged[bucket.startDate] = DailyUsageDisplayBucket(
+      startDate: bucket.startDate,
+      tokens: bucket.tokens,
+      isRouterFallback: true
+    )
+  }
+  for bucket in account {
+    merged[bucket.startDate] = DailyUsageDisplayBucket(
+      startDate: bucket.startDate,
+      tokens: bucket.tokens,
+      isRouterFallback: false
+    )
+  }
+  return merged.values.sorted { $0.startDate < $1.startDate }
+}
+
+/// Pure chart projection. Safe to call from SwiftUI view bodies.
+func dailyUsagePoints(
+  from buckets: [DailyUsageDisplayBucket],
+  days: Int,
+  today: Date,
+  calendar: Calendar = .current
+) -> [DailyUsagePoint] {
+  let indexed = Dictionary(uniqueKeysWithValues: buckets.map { ($0.startDate, $0) })
+  return (0..<days).map { offset in
+    let date = calendar.date(byAdding: .day, value: offset - (days - 1), to: today) ?? today
+    let bucket = indexed[dailyUsageDayKeyFormatter.string(from: date)]
+    return DailyUsagePoint(
+      date: date,
+      tokens: Double(bucket?.tokens ?? 0),
+      isRouterFallback: bucket?.isRouterFallback ?? false
+    )
+  }
+}
+
+/// Pure 7/30-day total. Safe to call from SwiftUI view bodies.
+func sumLocalUsageTotals(
+  from buckets: [ProviderDailyUsageBucket],
+  days: Int,
+  today: Date,
+  calendar: Calendar = .current
+) -> (tokens: Double, requests: Int) {
+  let firstDay = calendar.date(byAdding: .day, value: -(days - 1), to: today) ?? today
+  return buckets.reduce(into: (tokens: 0.0, requests: 0)) { totals, bucket in
+    guard let date = dailyUsageDayKeyFormatter.date(from: bucket.startDate),
+          date >= firstDay,
+          date <= today
+    else { return }
+    totals.tokens += Double(bucket.tokens)
+    totals.requests += bucket.requests
+  }
 }
 
 struct RouterTarget: Decodable {
@@ -4588,6 +5116,8 @@ struct ProviderSetupState: Decodable, Identifiable, Equatable {
   let cliInstalled: Bool?
   let action: String
   let credentialLabel: String?
+  let disconnectable: Bool?
+  let blockedNote: String?
   // Set when connecting successfully still leaves the account unable to use
   // the API, because its plan does not include one. Shown before the buttons
   // rather than after a 403 lands in Codex.
@@ -4887,6 +5417,7 @@ private struct TrayView: View {
   @ObservedObject var store: RouterStore
   @AppStorage("trayTab") private var tab: TrayTab = .usage
   @State private var providersExpanded = true
+  @State private var providerFilter = ""
   @State private var savingsRange: SavingsRange = .day
   @State private var savingsRangeSelectedByUser = false
   @State private var confirmSessionSharing = false
@@ -4993,6 +5524,31 @@ private struct TrayView: View {
       .sorted { ($0.vendorLabel ?? $0.members[0].id) < ($1.vendorLabel ?? $1.members[0].id) }
   }
 
+  // Search preserves the vendor grouping rather than flattening a matching
+  // account out of it. A vendor-name match keeps every account in that group;
+  // a provider-name or id match keeps only the matching account rows.
+  private var filteredProviderVendorGroups: [ProviderGroup] {
+    let query = providerFilter.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard !query.isEmpty else { return providerVendorGroups }
+    let displayNames = Dictionary(
+      uniqueKeysWithValues: (target?.providers ?? []).map { ($0.id, $0.displayName) }
+    )
+    return providerVendorGroups.compactMap { group in
+      if group.vendorLabel?.lowercased().contains(query) == true {
+        return group
+      }
+      let members = group.members.filter { member in
+        [member.id, member.shortName, displayNames[member.id]]
+          .compactMap { $0 }
+          .joined(separator: " ")
+          .lowercased()
+          .contains(query)
+      }
+      guard !members.isEmpty else { return nil }
+      return ProviderGroup(id: group.id, vendorLabel: group.vendorLabel, members: members)
+    }
+  }
+
   // The vendor name is the leading words every display name in the group
   // shares: "Z.ai GLM Coding Plan" + "Z.ai API" -> "Z.ai", and "xAI Grok OAuth"
   // + "xAI Grok API" -> "xAI Grok". Whole words only, so a group that happens to
@@ -5060,7 +5616,6 @@ private struct TrayView: View {
       }
       .padding(14)
     }
-    .preferredColorScheme(.dark)
     .foregroundStyle(routerText)
     .task {
       await store.refresh()
@@ -5877,11 +6432,11 @@ private struct TrayView: View {
       isDisabled: store.signedRoutingEnabled(authoritative: store.signedRouting)
     )
     settingRow(
-      title: routerLocalized("Compact old tool results"),
+      title: routerLocalized("Token maxxing"),
       detail: target.modelSettings?.toolResultAging?.environmentOverride == true
         ? routerLocalized("Forced off by CODEX_ROUTER_TOOL_RESULT_AGING=0")
         : (target.modelSettings?.toolResultAging?.stats?.savingsSummary
-          ?? routerLocalized("Off by default · token maxxing starts at 70% on external models")),
+          ?? routerLocalized("Off by default · compacts old results; RTK shapes routed compaction")),
       isOn: Binding(
         // Off when the snapshot has not arrived, because that is what the
         // router does with no state file (tool-result-aging-state.mjs). The row
@@ -5908,15 +6463,39 @@ private struct TrayView: View {
       // re-runs on each store publish, so the cost would be paid continuously
       // rather than once: measured at 89us a pass, that is 2.4ms of a render
       // spent on nothing.
-      let groups = providerVendorGroups
-      VStack(spacing: 0) {
+      let groups = filteredProviderVendorGroups
+      VStack(alignment: .leading, spacing: 0) {
+        AccordionSearchField(
+          placeholder: routerLocalized("Search providers"),
+          query: $providerFilter
+        )
+        .padding(.bottom, 6)
+        HStack(alignment: .top, spacing: 5) {
+          Image(systemName: "arrow.triangle.2.circlepath.circle")
+            .font(.system(size: 9, weight: .semibold))
+          Text(routerLocalized("OAuth sessions refresh automatically. Reconnect opens browser sign-in when approval is required."))
+            .font(.system(size: 9))
+            .fixedSize(horizontal: false, vertical: true)
+        }
+        .foregroundStyle(routerMuted)
+        .padding(.bottom, 4)
+        if groups.isEmpty {
+          Text(routerLocalized("No providers match this search."))
+            .font(.system(size: 9))
+            .foregroundStyle(routerMuted)
+            .padding(.vertical, 8)
+        }
         ForEach(groups) { group in
           if let vendorLabel = group.vendorLabel {
             HStack(spacing: 6) {
               Text(vendorLabel)
                 .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(routerMuted)
-              Text(routerFormat("%d accounts", group.members.count))
+              Text(
+                group.members.count == 1
+                  ? routerLocalized("1 account")
+                  : routerFormat("%d accounts", group.members.count)
+              )
                 .font(.system(size: 9))
                 .foregroundStyle(routerMuted.opacity(0.7))
               Spacer()
@@ -5975,6 +6554,7 @@ private struct TrayView: View {
     @State private var expandedLocalVariants = Set<String>()
     @State private var variantHelpExpanded = false
     @State private var localCatalogFilter = ""
+    @State private var subagentModelFilter = ""
     @State private var pickerModelFilter = ""
     @State private var installTag = ""
     @State private var armedRemoval: String?
@@ -6028,6 +6608,17 @@ private struct TrayView: View {
         }
     }
 
+    private var filteredSubagentModels: [RouterModel] {
+      let query = subagentModelFilter.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+      guard !query.isEmpty else { return subagentModels }
+      return subagentModels.filter { model in
+        [model.displayName, model.slug, model.provider, providerName(model.provider)]
+          .joined(separator: " ")
+          .lowercased()
+          .contains(query)
+      }
+    }
+
     private var filteredPickerModels: [RouterModel] {
       let query = pickerModelFilter.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
       guard !query.isEmpty else { return enabledModels }
@@ -6076,7 +6667,7 @@ private struct TrayView: View {
     // Per-provider counts, so a click that lands on the wrong panel is visible
     // in the header it did not change instead of only in Codex's picker.
     private func subagentGroupSummary(_ group: ProviderModels) -> String {
-      "\(group.models.filter { isSubagent($0) }.count) of \(group.models.count) on"
+      "\(group.models.filter { subagentToggleOn($0) }.count) of \(group.models.count) on"
     }
 
     private func pickerGroupSummary(_ group: ProviderModels) -> String {
@@ -6113,13 +6704,22 @@ private struct TrayView: View {
             Text(routerLocalized("Subagent choices do not hide models from Codex's picker — use Model picker below for that."))
               .font(.system(size: 9))
               .foregroundStyle(routerMuted)
+            AccordionSearchField(
+              placeholder: routerLocalized("Search subagent models"),
+              query: $subagentModelFilter
+            )
             toolbar(
               buttons: [
                 ("Subagents on", { Task { await store.selectAllSubagents() } }),
                 ("Subagents off", { Task { await store.unselectAllSubagents() } }),
               ]
             )
-            ForEach(providerGroups(subagentModels)) { group in
+            if filteredSubagentModels.isEmpty && !subagentModelFilter.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+              Text(routerLocalized("No subagent models match this search."))
+                .font(.system(size: 9))
+                .foregroundStyle(routerMuted)
+            }
+            ForEach(providerGroups(filteredSubagentModels)) { group in
               AccordionPanel(
                 title: providerName(group.provider),
                 summary: subagentGroupSummary(group),
@@ -6197,9 +6797,10 @@ private struct TrayView: View {
                 ("Hide all", { Task { await store.hideAllPickerModels() } }),
               ]
             )
-            TextField(routerLocalized("Search available models"), text: $pickerModelFilter)
-              .textFieldStyle(.roundedBorder)
-              .font(.system(size: 10))
+            AccordionSearchField(
+              placeholder: routerLocalized("Search available models"),
+              query: $pickerModelFilter
+            )
             if filteredPickerModels.isEmpty && !pickerModelFilter.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
               Text(routerLocalized("No provider models match this search."))
                 .font(.system(size: 9))
@@ -7700,6 +8301,10 @@ private struct TrayView: View {
       Set(settings?.subagents.disabled ?? [])
     }
 
+    private var enabledSubagentSet: Set<String> {
+      Set(settings?.subagents.enabled ?? [])
+    }
+
     // The capability the catalog actually published wins. A route the operator
     // selected is v2 to Codex even though the registry never certified it, and
     // asking the registry first told them a spawnable route could not be used.
@@ -7714,25 +8319,31 @@ private struct TrayView: View {
       subagentCertification(for: model) == "v2"
     }
 
-    // Status tags, effort controls, and enabled counts must reflect only the
-    // capability Codex receives. A selected compatibility-test candidate is
-    // not a usable subagent until the exact registry route is certified v2.
+    // This is the capability Codex receives after the router applies the
+    // operator's selection. Registry v2 routes are on by default; selected or
+    // all mode promotes an unknown route, while an explicit off wins over all.
     private func isSubagent(_ model: RouterModel) -> Bool {
-      if !isPickerVisible(model) { return false }
-      let authoritative = !disabledSubagentSet.contains(model.slug)
-        && isCertifiedV2(model)
+      let authoritative = TraySubagentSelectionPolicy.isOn(
+        certification: subagentCertification(for: model),
+        mode: settings?.subagents.mode ?? "proven",
+        explicitlyEnabled: enabledSubagentSet.contains(model.slug),
+        explicitlyDisabled: disabledSubagentSet.contains(model.slug)
+      )
       return store.subagentModelEnabled(model.slug, authoritative: authoritative)
     }
 
     // The switch says one thing wherever it can be used: run this route as a
-    // subagent, or do not. On a route that cannot, it is simply unavailable --
-    // there is no test to request and no candidate state to decode.
+    // subagent, or do not. An unknown route remains interactive because that
+    // explicit selection is what asks the control plane to publish and verify
+    // it; only a reviewed v1-only route is incapable of becoming a subagent.
     private func subagentToggleOn(_ model: RouterModel) -> Bool {
       isSubagent(model)
     }
 
     private func subagentToggleDisabled(_ model: RouterModel) -> Bool {
-      !isPickerVisible(model) || !isCertifiedV2(model)
+      TraySubagentTogglePolicy.isDisabled(
+        certification: subagentCertification(for: model)
+      )
     }
 
     // Codex chooses which model a child runs on; this chooses how hard it
@@ -7798,7 +8409,7 @@ private struct TrayView: View {
     }
 
   private var subagentSummary: String {
-      let count = subagentModels.filter { isSubagent($0) }.count
+      let count = subagentModels.filter { subagentToggleOn($0) }.count
       let mode = store.subagentModeAll(authoritative: settings?.subagents.mode == "all")
         ? "all"
         : (settings?.subagents.mode ?? "proven")
@@ -7908,6 +8519,42 @@ private struct TrayView: View {
         Color.primary.opacity(0.045),
         in: RoundedRectangle(cornerRadius: 10, style: .continuous)
       )
+    }
+  }
+
+  // A single compact search treatment for the three large settings
+  // accordions. The clear affordance matters in a menu-bar popover where a
+  // stale query can otherwise make an entire provider/model section appear
+  // empty the next time it is opened.
+  private struct AccordionSearchField: View {
+    let placeholder: String
+    @Binding var query: String
+
+    var body: some View {
+      HStack(spacing: 6) {
+        Image(systemName: "magnifyingglass")
+          .font(.system(size: 9, weight: .medium))
+          .foregroundStyle(routerMuted)
+        TextField(placeholder, text: $query)
+          .textFieldStyle(.plain)
+          .font(.system(size: 10))
+        if !query.isEmpty {
+          Button(action: { query = "" }) {
+            Image(systemName: "xmark.circle.fill")
+              .font(.system(size: 10))
+              .foregroundStyle(routerMuted)
+          }
+          .buttonStyle(.plain)
+          .help(routerLocalized("Clear search"))
+        }
+      }
+      .padding(.horizontal, 8)
+      .padding(.vertical, 6)
+      .background(Color.primary.opacity(0.055), in: RoundedRectangle(cornerRadius: 6))
+      .overlay {
+        RoundedRectangle(cornerRadius: 6)
+          .stroke(Color.primary.opacity(0.08), lineWidth: 0.5)
+      }
     }
   }
 
@@ -8544,9 +9191,16 @@ private struct ProviderSetupRow: View {
     }
     switch setup.action {
     case "install": return routerLocalized("Official CLI required")
-    case "login": return routerLocalized("Sign in with the official CLI")
+    case "login":
+      return setup.id == "antigravity-oauth"
+        ? routerLocalized("Operator-owned Google OAuth client required")
+        : routerLocalized("Sign in with the official CLI")
     case "add-key":
       return "\(credentialLabel) \(routerLocalized("required"))"
+    case "probe": return routerLocalized("Live test required · sends a small prompt and uses quota")
+    case "blocked":
+      return setup.blockedNote
+        ?? routerLocalized("Disconnect the incompatible router record before signing in")
     default: return routerLocalized("Setup required")
     }
   }
@@ -8554,18 +9208,41 @@ private struct ProviderSetupRow: View {
   @ViewBuilder
   private var actionControl: some View {
     if isBusy {
-      ProgressView()
-        .controlSize(.small)
-        .tint(routerAccent)
-        .frame(width: 42)
+      HStack(spacing: 6) {
+        if setup?.kind == "oauth" {
+          Text(routerLocalized("Finish sign-in in browser"))
+            .font(.system(size: 9, weight: .medium))
+            .foregroundStyle(routerAccent)
+            .lineLimit(1)
+        }
+        ProgressView()
+          .controlSize(.small)
+          .tint(routerAccent)
+      }
     } else if setup?.configured == true {
-      HStack(spacing: 8) {
+      HStack(spacing: 6) {
         if setup?.kind == "oauth" {
           if oauthNeedsReconnect {
-            Button(routerLocalized("Reconnect"), action: onLogin)
+            Button(action: onLogin) {
+              HStack(spacing: 4) {
+                Image(systemName: "arrow.clockwise")
+                  .font(.system(size: 9, weight: .semibold))
+                Text(routerLocalized("Reconnect"))
+                  .font(.system(size: 9, weight: .semibold))
+                  .lineLimit(1)
+              }
+                .fixedSize(horizontal: true, vertical: false)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 4)
+                .contentShape(Rectangle())
+            }
               .buttonStyle(.plain)
-              .font(.system(size: 10, weight: .medium))
               .foregroundStyle(routerYellow)
+              .background(routerYellow.opacity(0.08), in: Capsule())
+              .overlay {
+                Capsule().stroke(routerYellow.opacity(0.18), lineWidth: 0.5)
+              }
+              .help(routerLocalized("Open browser sign-in"))
               .disabled(controlsDisabled)
           } else {
             Button(action: onLogin) {
@@ -8594,6 +9271,8 @@ private struct ProviderSetupRow: View {
           )
           .disabled(controlsDisabled)
 
+        }
+        if setup?.kind == "api" || setup?.disconnectable == true {
           Button(action: { tapRemove() }) {
             Image(systemName: removalArmed ? "checkmark.circle.fill" : "trash")
               .font(.system(size: removalArmed ? 12 : 10, weight: .semibold))
@@ -8616,11 +9295,28 @@ private struct ProviderSetupRow: View {
       }
     } else {
       HStack(spacing: 10) {
-        Button(actionTitle) { performAction() }
+        if setup?.action != "blocked" {
+          Button(actionTitle) { performAction() }
+            .buttonStyle(.plain)
+            .font(.system(size: 10, weight: .medium))
+            .foregroundStyle(routerAccent)
+            .disabled(controlsDisabled || setup == nil)
+        }
+        if setup?.disconnectable == true {
+          Button(action: { tapRemove() }) {
+            Image(systemName: removalArmed ? "checkmark.circle.fill" : "trash")
+              .font(.system(size: removalArmed ? 12 : 10, weight: .semibold))
+              .frame(width: 20, height: 20)
+          }
           .buttonStyle(.plain)
-          .font(.system(size: 10, weight: .medium))
-          .foregroundStyle(routerAccent)
-          .disabled(controlsDisabled || setup == nil)
+          .foregroundStyle(removalArmed ? routerRed : routerYellow)
+          .help(
+            removalArmed
+              ? routerLocalized("Click again to delete the stored credential")
+              : routerLocalized("Remove stored OAuth client and session")
+          )
+          .disabled(controlsDisabled)
+        }
       }
     }
   }
@@ -8634,6 +9330,7 @@ private struct ProviderSetupRow: View {
       return credentialLabel == routerLocalized("API key")
         ? routerLocalized("Add Key")
         : (RouterLanguage.isSimplifiedChinese ? "添加\(credentialLabel)" : "Add \(credentialLabel)")
+    case "probe": return routerLocalized("Test & Enable")
     default: return routerLocalized("Checking…")
     }
   }
@@ -8645,7 +9342,7 @@ private struct ProviderSetupRow: View {
 
   private func performAction() {
     switch setup?.action {
-    case "install", "login": onConnect()
+    case "install", "login", "probe": onConnect()
     case "add-key": toggleKeyField()
     default: break
     }
@@ -8738,6 +9435,13 @@ private struct ProviderUsageSection: View {
         .id("\(store.selectedUsageProviderID)-\(range.rawValue)-\(self.tokenDisplayUnit.rawValue)")
         .frame(height: 88)
 
+      if fallbackDays > 0 {
+        Text(fallbackNotice)
+          .font(.system(size: 9))
+          .foregroundStyle(routerYellow)
+          .fixedSize(horizontal: false, vertical: true)
+      }
+
       HStack {
         Text(rangeCaption)
         Spacer()
@@ -8829,9 +9533,22 @@ private struct ProviderUsageSection: View {
         ? "\(formattedTotal) token · \(requests) 个请求 · 近 \(range.rawValue) 天"
         : "\(formattedTotal) tokens · \(requests) requests over \(range.rawValue) days"
     }
-    return RouterLanguage.isSimplifiedChinese
+    let caption = RouterLanguage.isSimplifiedChinese
       ? "\(formattedTotal) token · 近 \(range.rawValue) 天"
       : "\(formattedTotal) tokens over \(range.rawValue) days"
+    guard fallbackDays > 0 else { return caption }
+    let suffix = fallbackDays == 1
+      ? routerLocalized("1 local fallback date")
+      : routerFormat("%d local fallback dates", fallbackDays)
+    return "\(caption) · \(suffix)"
+  }
+
+  private var fallbackDays: Int {
+    store.dailyFallbackDays(days: range.rawValue)
+  }
+
+  private var fallbackNotice: String {
+    routerLocalized("OpenAI supplied no account bucket for these dates; local router traffic fills the gap. These are not global account totals.")
   }
 
   private var usageError: String? {
@@ -9281,6 +9998,12 @@ struct UsageBarChart: View {
                 RoundedRectangle(cornerRadius: min(2.5, width / 2), style: .continuous)
                   .fill(point.tokens == 0 ? Color.primary.opacity(0.07) : tint.opacity(0.86))
                   .frame(height: max(2, chartHeight * CGFloat(point.tokens / maximum)))
+                  .overlay {
+                    if point.isRouterFallback {
+                      RoundedRectangle(cornerRadius: min(2.5, width / 2), style: .continuous)
+                        .stroke(routerYellow, style: StrokeStyle(lineWidth: 1, dash: [2, 2]))
+                    }
+                  }
               }
               .frame(width: width, height: chartHeight)
               .contentShape(Rectangle())
@@ -9352,7 +10075,9 @@ struct UsageBarChart: View {
   private func hoverText(for point: DailyUsagePoint) -> String {
     let date = point.date.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day())
     let tokens = self.tokenDisplayUnit.format(point.tokens)
-    return RouterLanguage.isSimplifiedChinese ? "\(date) · \(tokens) token" : "\(date) · \(tokens) tokens"
+    let text = RouterLanguage.isSimplifiedChinese ? "\(date) · \(tokens) token" : "\(date) · \(tokens) tokens"
+    guard point.isRouterFallback else { return text }
+    return "\(text) · \(routerLocalized("local fallback"))"
   }
 }
 

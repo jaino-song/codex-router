@@ -85,11 +85,19 @@ export function loopbackProbeFetch(url, init = {}, dispatcher = loopbackProbeDis
   return undiciFetch(url, { ...init, dispatcher });
 }
 
-// Local generation is different from both remote provider traffic and health
-// probes: mlx-vlm does not send response headers until a non-streaming
-// generation is complete, which can legitimately take longer than Undici's
-// five-minute default. Keep that wider wait isolated to the loopback model so
-// a stalled remote provider still retains the normal transport deadline.
+// Re-entry surfaces carry the caller capability in their loopback URL. Unlike
+// health probes, that hop must never honor an environment proxy: doing so can
+// disclose the local capability to a corporate or user-configured proxy. Keep
+// one direct HTTP/1.1 pool for those authenticated same-machine requests.
+let sharedDirectLoopbackDispatcher;
+
+export function directLoopbackFetch(url, init = {}) {
+  sharedDirectLoopbackDispatcher ??= new Agent(fetchDispatcherOptions());
+  return undiciFetch(url, { ...init, dispatcher: sharedDirectLoopbackDispatcher });
+}
+
+// mlx-vlm does not send response headers until a non-streaming generation is
+// complete. Keep its wider timeout isolated from remote provider traffic.
 export function createLoopbackGenerationDispatcher({ AgentClass = Agent } = {}) {
   return new AgentClass({
     allowH2: false,

@@ -21848,18 +21848,12 @@
             "supported": true,
             "configurable": true,
             "supportedEfforts": [
-              "low",
-              "high",
-              "max"
-            ],
-            "advertisedSupportedEfforts": [
               "none",
               "low",
               "medium",
               "high"
             ],
-            "advertisedDefaultEffort": "high",
-            "effectiveMetadataSource": "repository-live-probes"
+            "defaultEffort": "high"
           },
           "metadataSource": "provider-catalog"
         },

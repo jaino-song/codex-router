@@ -121,6 +121,7 @@ export function recordUsageEvent({
   cachedInputTokens,
   outputTokens,
   billedOutputTokens,
+  reasoningTokens,
   totalTokens,
   retries,
   // True when the upstream stream died after its 200 head was already
@@ -167,6 +168,9 @@ export function recordUsageEvent({
   // for the provider having recovered -- and a run of these events is the
   // signal that it has not.
   estimatedInputTokens,
+  // True when the router canceled a request at its separately configured
+  // execution deadline. Activity-record retention never sets this field.
+  requestDeadlineExceeded,
   // Present only when the routed request compacted old results or pressure-
   // shaped noisy results. Counts and bytes describe the request sent upstream,
   // never the result contents themselves.
@@ -190,6 +194,12 @@ export function recordUsageEvent({
   // who simply changed models, which is the difference between "your provider
   // is empty" and "you switched".
   failoverFrom,
+  // Codex standalone search normally spends the caller's native ChatGPT
+  // session. These fields distinguish an explicitly configured external
+  // sidecar request and whether it was served from its account-scoped cache.
+  searchSidecar,
+  searchCacheHit,
+  searchResults,
   at = Date.now(),
 }) {
   const event = {
@@ -215,6 +225,7 @@ export function recordUsageEvent({
     ...(emptyCompletionGuardReleased === true
       ? { emptyCompletionGuardReleased: true }
       : {}),
+    ...(requestDeadlineExceeded === true ? { requestDeadlineExceeded: true } : {}),
     ...(emptyCompletionPreludeLimit === "bytes" ||
     emptyCompletionPreludeLimit === "time"
       ? { emptyCompletionPreludeLimit }
@@ -222,6 +233,13 @@ export function recordUsageEvent({
     ...(safeRetryCount(retries) !== undefined ? { retries: safeRetryCount(retries) } : {}),
     ...(typeof failoverFrom === "string" && failoverFrom.trim()
       ? { failoverFrom: safeText(failoverFrom, "unknown") }
+      : {}),
+    ...(searchSidecar === true ? { searchSidecar: true } : {}),
+    ...(searchSidecar === true && typeof searchCacheHit === "boolean"
+      ? { searchCacheHit }
+      : {}),
+    ...(searchSidecar === true && safeTokenCount(searchResults) !== undefined
+      ? { searchResults: safeTokenCount(searchResults) }
       : {}),
     ...(safeTokenCount(inputTokens) !== undefined
       ? { inputTokens: safeTokenCount(inputTokens) }
@@ -237,6 +255,9 @@ export function recordUsageEvent({
       : {}),
     ...(safeTokenCount(billedOutputTokens) !== undefined
       ? { billedOutputTokens: safeTokenCount(billedOutputTokens) }
+      : {}),
+    ...(safeTokenCount(reasoningTokens) !== undefined
+      ? { reasoningTokens: safeTokenCount(reasoningTokens) }
       : {}),
     ...(safeTokenCount(totalTokens) !== undefined
       ? { totalTokens: safeTokenCount(totalTokens) }
@@ -473,6 +494,7 @@ export function recentUsageEvents({ sinceMs = 24 * 60 * 60 * 1000, limit = 1_000
         const cachedInputTokens = safeTokenCount(event.cachedInputTokens);
         const outputTokens = safeTokenCount(event.outputTokens);
         const billedOutputTokens = safeTokenCount(event.billedOutputTokens);
+        const reasoningTokens = safeTokenCount(event.reasoningTokens);
         const totalTokens = safeTokenCount(event.totalTokens);
         const retries = safeRetryCount(event.retries);
         const estimatedInputTokens = safeTokenCount(event.estimatedInputTokens);
@@ -482,6 +504,7 @@ export function recentUsageEvents({ sinceMs = 24 * 60 * 60 * 1000, limit = 1_000
         const toolResultBytesAfter = safeTokenCount(event.toolResultBytesAfter);
         const toolResultBytesSaved = safeTokenCount(event.toolResultBytesSaved);
         const toolResultShapeBytesSaved = safeTokenCount(event.toolResultShapeBytesSaved);
+        const searchResults = safeTokenCount(event.searchResults);
         return {
           ...(event.meteringVersion === 1 ? { meteringVersion: 1 } : {}),
           at: event.at,
@@ -517,11 +540,19 @@ export function recentUsageEvents({ sinceMs = 24 * 60 * 60 * 1000, limit = 1_000
             ? { emptyCompletionPreludeLimit: event.emptyCompletionPreludeLimit }
             : {}),
           ...(retries !== undefined ? { retries } : {}),
+          ...(event.searchSidecar === true ? { searchSidecar: true } : {}),
+          ...(event.searchSidecar === true && typeof event.searchCacheHit === "boolean"
+            ? { searchCacheHit: event.searchCacheHit }
+            : {}),
+          ...(event.searchSidecar === true && searchResults !== undefined
+            ? { searchResults }
+            : {}),
           ...(inputTokens !== undefined ? { inputTokens } : {}),
           ...(billedInputTokens !== undefined ? { billedInputTokens } : {}),
           ...(cachedInputTokens !== undefined ? { cachedInputTokens } : {}),
           ...(outputTokens !== undefined ? { outputTokens } : {}),
           ...(billedOutputTokens !== undefined ? { billedOutputTokens } : {}),
+          ...(reasoningTokens !== undefined ? { reasoningTokens } : {}),
           ...(totalTokens !== undefined ? { totalTokens } : {}),
           ...(estimatedInputTokens !== undefined ? { estimatedInputTokens } : {}),
           ...(toolResultsAged ? { toolResultsAged } : {}),
