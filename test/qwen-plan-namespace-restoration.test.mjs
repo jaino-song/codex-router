@@ -151,7 +151,7 @@ test("createResponsesStreamTransform restores namespaced function calls", async 
   ];
 
   const lookups = buildNamespaceLookupsFromTools(tools);
-  const transform = createResponsesStreamTransform(lookups);
+  const transform = createResponsesStreamTransform({ flatToNative: lookups });
 
   // Simulate a Responses SSE stream with a flattened function call
   const sseInput = `event: response.output_item.added
@@ -217,7 +217,7 @@ test("createResponsesJsonTransform restores namespaced function calls", async ()
   ];
 
   const lookups = buildNamespaceLookupsFromTools(tools);
-  const transform = createResponsesJsonTransform(lookups);
+  const transform = createResponsesJsonTransform({ flatToNative: lookups });
 
   // Simulate a Responses JSON response with flattened function calls
   const jsonInput = JSON.stringify({
@@ -267,7 +267,7 @@ test("transforms preserve non-flattened function calls", async () => {
   ];
 
   const lookups = buildNamespaceLookupsFromTools(tools);
-  const transform = createResponsesJsonTransform(lookups);
+  const transform = createResponsesJsonTransform({ flatToNative: lookups });
 
   const jsonInput = JSON.stringify({
     id: "resp_123",
@@ -303,7 +303,7 @@ test("transforms preserve non-flattened function calls", async () => {
 
 test("transforms work with empty lookups", async () => {
   // When no flattened tools are present, transforms should work normally
-  const transform = createResponsesJsonTransform(new Map());
+  const transform = createResponsesJsonTransform({ flatToNative: new Map() });
 
   const jsonInput = JSON.stringify({
     id: "resp_123",
@@ -425,7 +425,7 @@ test("MCP-style names are left unchanged in responses without namespace tools", 
   ];
 
   const lookups = buildNamespaceLookupsFromTools(tools);
-  const transform = createResponsesJsonTransform(lookups);
+  const transform = createResponsesJsonTransform({ flatToNative: lookups });
 
   const jsonInput = JSON.stringify({
     id: "resp_123",

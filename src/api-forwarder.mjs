@@ -89,6 +89,7 @@ import { applyQwenToolContinuation } from "./qwen-tool-continuation.mjs";
 installStableFetchTransport();
 
 const QWEN38_MLX_PROFILE = "qwen38-mlx";
+const QWEN38_MLX_TOOL_OUTPUT_LIMIT = 1024;
 
 const LISTEN_HOST =
   process.env.MODEL_ROUTER_API_HOST ||
@@ -1014,7 +1015,7 @@ function normalizeBody(buffer, contentType, route) {
     if (Array.isArray(payload.messages)) {
       payload.messages = normalizeQwen38SystemMessages(payload.messages);
     }
-  } else if (model.requestProfile === "qwen38-mlx") {
+  } else if (model.requestProfile === QWEN38_MLX_PROFILE) {
     // The MLX chat template exposes three literal thinking levels. Preserve an
     // absent effort so the model applies its own default, and fold the wider
     // Codex ladder onto the nearest supported tier for explicit selections.
@@ -1036,6 +1037,17 @@ function normalizeBody(buffer, contentType, route) {
     }
     if (Array.isArray(payload.messages)) {
       payload.messages = normalizeQwen38SystemMessages(payload.messages);
+    }
+    // Keep interactive tool turns short enough for the local model to return
+    // before the generation transport deadline, while preserving smaller
+    // explicit budgets and leaving tool-free turns unchanged.
+    if (
+      Array.isArray(payload.tools) &&
+      payload.tools.length > 0 &&
+      (!Number.isInteger(payload.max_output_tokens) ||
+        payload.max_output_tokens > QWEN38_MLX_TOOL_OUTPUT_LIMIT)
+    ) {
+      payload.max_output_tokens = QWEN38_MLX_TOOL_OUTPUT_LIMIT;
     }
     const continuation = applyQwenToolContinuation(payload);
     payload = continuation.payload;

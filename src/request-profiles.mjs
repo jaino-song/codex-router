@@ -21,6 +21,7 @@ export const REQUEST_PROFILES = Object.freeze([
   "ox-alpha",
   "qwen-plan",
   "qwen38-community",
+  "qwen38-mlx",
   "xai-reasoning",
 ]);
 
