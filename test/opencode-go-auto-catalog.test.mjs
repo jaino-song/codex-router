@@ -337,3 +337,15 @@ test("existing user route takes priority over a documented preset on another Go 
     assert.equal(readFileSync(p.pickerPath, "utf8"), pickerText);
   }
 });
+
+
+test("distinct live IDs that collapse to one gateway cannot be falsely adopted", async () => {
+  const p = tempPaths(); p.policyPath = path.join(p.stateDir, "policy.json");
+  mkdirSync(p.stateDir, { recursive: true, mode: 0o700 }); policy(p);
+  const result = await checkGoAutoCatalog({ ...p, configuredCheck: () => ["opencode-go"], discoveryDisabledCheck: () => false,
+    discover: async () => ({ discovered: ["new.foo", "new-foo"] }), fetchDocs: async () => html(["new.foo", "new-foo"].map(id => [id, "https://opencode.ai/zen/go/v1/chat/completions"])),
+    transact: async () => { assert.fail("colliding models cannot mutate state"); },
+  });
+  assert.equal(result.state, "pending"); assert.equal(result.reason, "model_identity_collision");
+  for (const file of ["user-models.json", "model-picker.json", "opencode-go-auto-catalog-seen.json"]) assert.equal(existsSync(path.join(p.stateDir, file)), false);
+});

@@ -13,7 +13,7 @@ import { fileURLToPath } from "node:url";
 
 import { applyModelOverlayPublication, transactModelOverlayMutation } from "./model-overlay-publication.mjs";
 import { discoverProviderModels } from "./model-discovery.mjs";
-import { CHECKED_IN_MODELS } from "./model-registry.mjs";
+import { CHECKED_IN_MODELS, MODEL_SLUG_ALIASES } from "./model-registry.mjs";
 import { canonicalProviderId, configuredProviderIds } from "./provider-selection.mjs";
 import { discoveryDisabled } from "./discovery-mode.mjs";
 import { readControlActivity } from "./control-activity.mjs";
@@ -376,6 +376,9 @@ function buildPlan({ discovery, docs, currentModels, picker, seen }) {
   for (const model of CHECKED_IN_MODELS) {
     if (GO_FAMILY.has(model.provider) && model.listed !== false && !checkedByUpstream.has(model.upstreamModel)) checkedByUpstream.set(model.upstreamModel, model);
   }
+  const reservedSlugs = new Set([...CHECKED_IN_MODELS, ...currentModels].map(model => model.slug));
+  for (const slug of MODEL_SLUG_ALIASES.keys()) reservedSlugs.add(slug);
+  const reservedGateways = new Set([...CHECKED_IN_MODELS, ...currentModels].map(model => model.gatewayModel));
   const newModels = [];
   const modelSlugs = [];
   const maxPriority = Math.max(0, ...CHECKED_IN_MODELS.map((model) => Number.isInteger(model.priority) ? model.priority : 0), ...currentModels.map((model) => Number.isInteger(model.priority) ? model.priority : 0));
@@ -399,7 +402,12 @@ function buildPlan({ discovery, docs, currentModels, picker, seen }) {
       continue;
     }
     const model = existing || userModelEntry({ providerId: row.providerId, upstreamId: id, priority: priority++, metadata: normalizeMetadata(discovery, id, row.endpoint, row.metadata) });
-    if (!existing) newModels.push(model);
+    if (!existing) {
+      if (reservedSlugs.has(model.slug) || reservedGateways.has(model.gatewayModel)) throw makeError("model_identity_collision", "A discovered model conflicts with an existing route identity.");
+      reservedSlugs.add(model.slug);
+      reservedGateways.add(model.gatewayModel);
+      newModels.push(model);
+    }
     modelSlugs.push(model.slug);
     nextSeen.add(identityKey);
   }
