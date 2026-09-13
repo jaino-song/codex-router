@@ -185,19 +185,27 @@ test("browser opener settlement survives the Codex child exiting first", async (
           markChildExited();
         },
       });
-      await openerCalled;
-      await childExited;
-      settleOpener();
-      const bounded = Promise.race([
-        opened,
-        new Promise((_, reject) => setTimeout(() => reject(new Error("browser opener remained pending")), 700)),
-      ]);
-      if (expected === "reject") {
-        await assert.rejects(bounded, /Could not open the default browser: delayed browser refusal/);
-      } else {
-        assert.deepEqual(await bounded, { opened: true, surface: "browser" });
+      // Electron keeps its event loop alive; this Node-only fixture does not.
+      // Cover the entire wait with a referenced, bounded deadline so the
+      // deliberately unref'd child can deliver its close notification.
+      let timer;
+      const deadline = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("browser opener remained pending")), 5_000);
+      });
+      try {
+        await Promise.race([openerCalled, deadline]);
+        await Promise.race([childExited, deadline]);
+        settleOpener();
+        const bounded = Promise.race([opened, deadline]);
+        if (expected === "reject") {
+          await assert.rejects(bounded, /Could not open the default browser: delayed browser refusal/);
+        } else {
+          assert.deepEqual(await bounded, { opened: true, surface: "browser" });
+        }
+        assert.equal(exitCount, 1, "child exit notification must remain exactly once");
+      } finally {
+        clearTimeout(timer);
       }
-      assert.equal(exitCount, 1, "child exit notification must remain exactly once");
     }
   } finally {
     await rm(directory, { recursive: true, force: true });

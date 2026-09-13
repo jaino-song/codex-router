@@ -191,6 +191,6 @@ struct UsageDaySpaceTests {
     // The start of UTC 2026-09-06. Formatted in a zone west of UTC this instant
     // falls on the 5th, so a device-zone label would name the wrong day.
     let dayStart = Date(timeIntervalSince1970: 1_788_652_800)
-    #expect(dayStart.usageDayLabel(.dateTime.month(.defaultDigits).day()) == "9/6")
+    #expect(dayStart.usageDayLabel(.dateTime.month(.defaultDigits).day().locale(Locale(identifier: "en_US"))) == "9/6")
   }
 }
