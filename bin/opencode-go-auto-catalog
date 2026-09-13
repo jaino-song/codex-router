@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+
+SOURCE_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+NODE_BIN=${CODEX_ROUTER_NODE_BIN:-node}
+exec "$NODE_BIN" "$SOURCE_ROOT/src/opencode-go-auto-catalog.mjs" "$@"
