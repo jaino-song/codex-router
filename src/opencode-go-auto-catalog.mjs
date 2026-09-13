@@ -209,20 +209,10 @@ function tableRows(table) {
 }
 
 function normalizeEndpoint(raw) {
-  const source = decodeHtml(raw).replace(/[`"']/g, "").trim();
-  // The public page currently prints the complete Zen URL. Treating a path
-  // fragment as protocol evidence would let an unrelated URL or prose row
-  // select a route, so require exactly the official host, prefix, and one
-  // allowlisted endpoint (an optional HTTP method is tolerated around it).
-  const urls = source.match(/https?:\/\/[^\s<>()]+/gi) || [];
-  if (urls.length !== 1) throw makeError("docs_unknown_endpoint", "The official Go table has no exact supported endpoint.");
-  let parsed;
-  try { parsed = new URL(urls[0]); } catch { throw makeError("docs_unknown_endpoint", "The official Go endpoint URL is invalid."); }
-  if (parsed.protocol !== "https:" || parsed.hostname !== "opencode.ai" || parsed.port || parsed.search || parsed.hash) throw makeError("docs_unknown_endpoint", "The official Go endpoint host is not allowed.");
-  const prefix = "/zen/go/v1";
-  if (!parsed.pathname.startsWith(`${prefix}/`)) throw makeError("docs_unknown_endpoint", "The official Go endpoint path is not allowed.");
-  const endpoint = parsed.pathname.slice(prefix.length).toLowerCase();
-  if (!GO_ENDPOINT_PROVIDERS[endpoint]) throw makeError("docs_unknown_endpoint", "The official Go table contains an unsupported endpoint.");
+  const source = decodeHtml(raw).replace(/^POST\s+/, "");
+  const prefix = "https://opencode.ai/zen/go/v1";
+  const endpoint = Object.keys(GO_ENDPOINT_PROVIDERS).find((value) => source === `${prefix}${value}`);
+  if (!endpoint) throw makeError("docs_unknown_endpoint", "The official Go table has no exact supported endpoint.");
   return endpoint;
 }
 
@@ -252,7 +242,8 @@ export function parseOfficialGoDocs(html) {
     const header = table[0]?.map((value) => value.toLowerCase()).join(" ") || "";
     if (!/model|model id|id/.test(header) || !/endpoint|api|route|protocol/.test(header)) continue;
     const headers = table[0].map((value) => value.toLowerCase());
-    const modelIndex = headers.findIndex((value) => /model\s*(id|name)?\b|^id$/.test(value));
+    const modelIndex = headers.findIndex((value) => /^(?:model\s+)?id$/.test(value));
+    if (modelIndex < 0) continue;
     const endpointIndex = headers.findIndex((value) => /endpoint|api|route|protocol/.test(value));
     const contextIndex = headers.findIndex((value) => /context|max.*token|window/.test(value));
     const inputIndex = headers.findIndex((value) => /input|modal/.test(value));
@@ -360,7 +351,7 @@ function normalizeMetadata(discovery, id, endpoint, documented = {}) {
   return metadata;
 }
 
-function key(providerId, modelId) { return `${providerId}\u0000${modelId}`; }
+function key(providerId, modelId) { return JSON.stringify([providerId, modelId]); }
 
 function findChecked(providerId, upstreamModel) {
   return CHECKED_IN_MODELS.find((model) => model.provider === providerId && model.upstreamModel === upstreamModel && model.listed !== false);
@@ -431,7 +422,9 @@ function buildPlan({ discovery, docs, currentModels, picker, seen }) {
     hidden: [...hidden].sort(),
     visible: [...visible].filter((slug) => !hidden.has(slug)).sort(),
     seeded: [...seeded].sort(),
-    explicit: true,
+    // Preserve legacy implicit visibility until the owning catalog migration
+    // can see every selected provider, including unrelated routed models.
+    explicit: picker.explicit || !picker.recognized,
   };
   const seenChanged = nextSeen.size !== seen.size;
   const pickerChanged = visibilityChanged.length > 0;
@@ -439,7 +432,7 @@ function buildPlan({ discovery, docs, currentModels, picker, seen }) {
 }
 
 function writePicker(file, picker) {
-  writeJson(file, { version: 1, hidden: picker.hidden, visible: picker.visible, seeded: picker.seeded });
+  writeJson(file, { version: 1, hidden: picker.hidden, ...(picker.explicit ? { visible: picker.visible } : {}), seeded: picker.seeded });
 }
 
 function normalizeTimestamp(value, fallback) {

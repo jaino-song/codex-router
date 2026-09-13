@@ -168,12 +168,27 @@ test("undocumented legacy live ids remain pending while documented ids still act
   mkdirSync(p.stateDir, { recursive: true, mode: 0o700 }); policy(p);
   const now = Date.now(); const activity = { ok: true, version: 1, instanceId: "router-1", observedAt: now - GO_AUTO_QUIET_MS - 1_000, active: [], recent: [] };
   status(p, { instanceId: "router-1", inFlightRequests: 0, activeCount: 0, observedAt: activity.observedAt, latestActivityAt: activity.observedAt });
+  writeFileSync(p.pickerPath, JSON.stringify({ version: 1, hidden: ["other/hidden"], seeded: [] }));
   let published = 0;
-  const result = await checkGoAutoCatalog({ ...p, sourceRoot: process.cwd(), configuredCheck: () => ["opencode-go"], discoveryDisabledCheck: () => false, discover: async () => ({ discovered: ["legacy-alias", "documented"], modelMetadata: {} }), fetchDocs: async () => html([["documented", "https://opencode.ai/zen/go/v1/chat/completions"]]), readHealth: async () => ({ ok: true, resources: { inFlightRequests: 0 } }), readActivity: async () => activity, now: () => now, transact: (transaction) => transactModelOverlayMutation({ ...transaction, lock: false }), applyPublication: async () => { published += 1; } });
+  const options = { ...p, sourceRoot: process.cwd(), configuredCheck: () => ["opencode-go"], discoveryDisabledCheck: () => false, discover: async () => ({ discovered: ["legacy-alias", "documented"], modelMetadata: {} }), fetchDocs: async () => html([["documented", "https://opencode.ai/zen/go/v1/chat/completions"]]), readHealth: async () => ({ ok: true, resources: { inFlightRequests: 0 } }), readActivity: async () => activity, now: () => now, transact: (transaction) => transactModelOverlayMutation({ ...transaction, lock: false }), applyPublication: async () => { published += 1; } };
+  const result = await checkGoAutoCatalog(options);
   assert.equal(result.state, "pending");
   assert.deepEqual(result.plan.missingDocs, ["legacy-alias"]);
   assert.equal(published, 1);
+  assert.equal(Object.hasOwn(JSON.parse(readFileSync(p.pickerPath, "utf8")), "visible"), false);
+  const visibility = execFileSync(process.execPath, ["--input-type=module", "-e", `
+    import {effectiveVisibleModels,migrateLegacyVisibleModels} from ${JSON.stringify(new URL("../src/model-picker-state.mjs", import.meta.url).href)};
+    const slugs=["other/visible","other/hidden"];
+    migrateLegacyVisibleModels(slugs);
+    console.log(JSON.stringify([...effectiveVisibleModels(slugs)]));
+  `], { env: { ...process.env, MODEL_ROUTER_STATE_DIR: p.stateDir, CODEX_HOME: p.root, MODEL_ROUTER_MODEL_PICKER_STATE: p.pickerPath }, encoding: "utf8" });
+  assert.deepEqual(JSON.parse(visibility), ["other/visible"]);
+
   assert.match(readFileSync(p.statusPath, "utf8"), /missing|pending/i);
+  const again = await checkGoAutoCatalog(options);
+  assert.equal(again.reason, "missing_documentation");
+  assert.equal(published, 1, "persisted history must remain readable and avoid a second publication");
+
 });
 
 test("publication failure rolls all three updater files back", async () => {
@@ -225,4 +240,13 @@ test("disable does not claim success when launchd refuses bootout", async () => 
   Object.assign(p, { policyPath: path.join(p.stateDir, "policy.json"), statusPath: path.join(p.stateDir, "status.json"), seenPath: path.join(p.stateDir, "seen.json"), lockPath: path.join(p.stateDir, "lock") });
   mkdirSync(p.stateDir, { recursive: true, mode: 0o700 }); policy(p);
   await assert.rejects(disableGoAutoCatalog({ stateDir: p.stateDir, paths: { policyPath: p.policyPath }, platform: "darwin", launchctl: () => { throw new Error("busy"); } }), /disabled/i);
+});
+
+
+test("official table uses Model ID instead of the preceding display name", () => {
+  const rows = parseOfficialGoDocs('<table><tr><th>Model</th><th>Model ID</th><th>Endpoint</th><th>AI SDK Package</th></tr><tr><td>Example Display Name</td><td>example-id</td><td>https://opencode.ai/zen/go/v1/responses</td><td>sdk</td></tr></table>');
+  assert.equal(rows[0].modelId, "example-id");
+  for (const endpoint of ["https://user@opencode.ai/zen/go/v1/responses", "see https://opencode.ai/zen/go/v1/responses here", "https://opencode.ai/zen/go/v1/RESPONSES", "https://opencode.ai:443/zen/go/v1/responses"]) {
+    assert.throws(() => parseOfficialGoDocs(html([["example-id", endpoint]])), /endpoint/i);
+  }
 });
