@@ -345,7 +345,10 @@ function normalizeMetadata(discovery, id, endpoint, documented = {}) {
     metadata.contextWindow = discovery.contextLengths[id];
     metadata.autoCompact = Math.max(1, Math.floor(discovery.contextLengths[id] * 0.85));
   }
-  if (Array.isArray(source.inputModalities) && source.inputModalities.length > 0 && source.inputModalities.every((item) => validString(item, { max: 20 }))) metadata.inputModalities = [...new Set(source.inputModalities)];
+  if (Array.isArray(source.inputModalities)) {
+    const supported = source.inputModalities.filter(item => item === "text" || item === "image");
+    metadata.inputModalities = supported.length ? [...new Set(supported)] : ["text"];
+  }
   const description = `OpenCode Go model ${id} via documented ${endpoint}; other picker metadata uses conservative defaults and can be edited in the user model file.`;
   metadata.description = description;
   return metadata;

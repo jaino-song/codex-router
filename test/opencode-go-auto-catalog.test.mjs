@@ -98,7 +98,7 @@ test("all three newly documented protocols are adopted while existing state is p
     sourceRoot: process.cwd(),
     configuredCheck: () => ["opencode-go"],
     discoveryDisabledCheck: () => false,
-    discover: async () => ({ discovered: ["new-chat", "new-messages", "new-responses"], modelMetadata: {} }),
+    discover: async () => ({ discovered: ["new-chat", "new-messages", "new-responses"], modelMetadata: { "new-chat": { inputModalities: ["text", "audio"] } } }),
     fetchDocs: async () => html([["new-chat", "https://opencode.ai/zen/go/v1/chat/completions"], ["new-messages", "https://opencode.ai/zen/go/v1/messages"], ["new-responses", "https://opencode.ai/zen/go/v1/responses"]]),
     readHealth: async () => ({ ok: true, resources: { inFlightRequests: 0 } }),
     readActivity: async () => activity,
@@ -114,6 +114,13 @@ test("all three newly documented protocols are adopted while existing state is p
   assert.equal(models.find((model) => model.slug === old.slug).description, "keep");
   assert.deepEqual(new Set(models.filter((model) => model.upstreamModel.startsWith("new-")).map((model) => model.provider)), new Set(["opencode-go", "opencode-go-messages", "opencode-go-responses"]));
   assert.equal(JSON.parse(readFileSync(p.pickerPath, "utf8")).visible.length, 3);
+  assert.deepEqual(models.find(model => model.upstreamModel === "new-chat").inputModalities, ["text"]);
+  const loaded = JSON.parse(execFileSync(process.execPath, ["--input-type=module", "-e", `
+    import {MODELS} from ${JSON.stringify(new URL("../src/model-registry.mjs", import.meta.url).href)};
+    console.log(JSON.stringify(MODELS.map(model => model.slug)));
+  `], { env: { ...process.env, CODEX_HOME: p.root, MODEL_ROUTER_STATE_DIR: p.stateDir, MODEL_ROUTER_USER_MODELS: p.userModelsPath }, encoding: "utf8" }));
+  for (const model of models.filter(model => model.upstreamModel.startsWith("new-"))) assert.ok(loaded.includes(model.slug), `${model.slug} must load in a fresh registry`);
+
 });
 
 test("busy router, unknown health, and no-op checks defer without restarting", async () => {
