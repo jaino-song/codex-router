@@ -138,6 +138,30 @@ test("idle observations tolerate advancing snapshot timestamps when no request i
   assert.equal(first.inFlightRequests, 0);
 });
 
+test("idle activation still requires a sixty-second gap between persisted observations", async () => {
+  const p = tempPaths();
+  Object.assign(p, { policyPath: path.join(p.stateDir, "policy.json"), statusPath: path.join(p.stateDir, "status.json"), seenPath: path.join(p.stateDir, "seen.json"), lockPath: path.join(p.stateDir, "lock"), pickerPath: path.join(p.stateDir, "picker.json"), userModelsPath: path.join(p.stateDir, "user-models.json") });
+  mkdirSync(p.stateDir, { recursive: true, mode: 0o700 }); policy(p);
+  const now = Date.now(); const activity = { ok: true, version: 1, instanceId: "router-1", observedAt: now - 1_000, active: [], recent: [] };
+  status(p, { instanceId: "router-1", inFlightRequests: 0, activeCount: 0, observedAt: now - 1_000, latestActivityAt: 0 });
+  const result = await checkGoAutoCatalog({ ...p, sourceRoot: process.cwd(), configuredCheck: () => ["opencode-go"], discoveryDisabledCheck: () => false, discover: async () => ({ discovered: ["gap"], modelMetadata: {} }), fetchDocs: async () => html([["gap", "https://opencode.ai/zen/go/v1/chat/completions"]]), readHealth: async () => ({ ok: true, resources: { inFlightRequests: 0 } }), readActivity: async () => activity, now: () => now, transact: async () => { throw new Error("should not transact"); } });
+  assert.equal(result.state, "deferred");
+  assert.equal(result.reason, "quiet_window");
+});
+
+test("a failed final gate cannot be followed by a mutation after a healthy recheck", async () => {
+  const p = tempPaths();
+  Object.assign(p, { policyPath: path.join(p.stateDir, "policy.json"), statusPath: path.join(p.stateDir, "status.json"), seenPath: path.join(p.stateDir, "seen.json"), lockPath: path.join(p.stateDir, "lock"), pickerPath: path.join(p.stateDir, "picker.json"), userModelsPath: path.join(p.stateDir, "user-models.json") });
+  mkdirSync(p.stateDir, { recursive: true, mode: 0o700 }); policy(p);
+  const now = Date.now(); const activity = { ok: true, version: 1, instanceId: "router-1", observedAt: now - GO_AUTO_QUIET_MS - 1_000, active: [], recent: [] };
+  status(p, { instanceId: "router-1", inFlightRequests: 0, activeCount: 0, observedAt: activity.observedAt, latestActivityAt: activity.observedAt });
+  const before = ["user-models.json", "picker.json", "seen.json"].map((name) => [name, existsSync(path.join(p.stateDir, name)) ? readFileSync(path.join(p.stateDir, name)) : null]);
+  let observations = 0;
+  const result = await checkGoAutoCatalog({ ...p, sourceRoot: process.cwd(), configuredCheck: () => ["opencode-go"], discoveryDisabledCheck: () => false, discover: async () => ({ discovered: ["gate-race"], modelMetadata: {} }), fetchDocs: async () => html([["gate-race", "https://opencode.ai/zen/go/v1/responses"]]), readHealth: async () => ({ ok: true, resources: { inFlightRequests: 0 } }), readActivity: async () => { observations += 1; return observations === 3 ? { ok: false } : activity; }, now: () => now, transact: (transaction) => transactModelOverlayMutation({ ...transaction, lock: false }), applyPublication: async () => { throw new Error("must not publish"); } });
+  assert.equal(result.state, "deferred");
+  for (const [name, bytes] of before) assert.equal(existsSync(path.join(p.stateDir, name)) ? readFileSync(path.join(p.stateDir, name)).toString() : null, bytes?.toString() || null);
+});
+
 test("undocumented legacy live ids remain pending while documented ids still activate", async () => {
   const p = tempPaths();
   Object.assign(p, { policyPath: path.join(p.stateDir, "policy.json"), statusPath: path.join(p.stateDir, "status.json"), seenPath: path.join(p.stateDir, "seen.json"), lockPath: path.join(p.stateDir, "lock"), pickerPath: path.join(p.stateDir, "picker.json"), userModelsPath: path.join(p.stateDir, "user-models.json") });

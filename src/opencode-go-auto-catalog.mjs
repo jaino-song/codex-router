@@ -492,6 +492,8 @@ function quietEligible(status, observation, now) {
   const previous = Array.isArray(status?.observations) ? status.observations.at(-1) : undefined;
   if (!observation?.ok || observation.busy) return { ok: false, reason: observation?.state === "busy" ? "router_busy" : "router_unknown", observation };
   if (!equivalentObservation(previous, observation)) return { ok: false, reason: "quiet_window", observation };
+  const previousObservedAt = normalizeTimestamp(previous?.observedAt, 0);
+  if (!previous || previousObservedAt <= 0 || now - previousObservedAt < GO_AUTO_QUIET_MS) return { ok: false, reason: "quiet_window", observation };
   // `activity.observedAt` is the time the snapshot was read, not a request
   // event. When the router reports no request timestamps, retain the prior
   // observation as the beginning of the quiet window instead of resetting it
@@ -738,6 +740,7 @@ export async function checkGoAutoCatalog(options = {}) {
         return true;
       };
       const mutate = async () => {
+        if (deferredInMutation) return;
         if (!(await activationGate())) { deferredInMutation = true; return; }
         const latestCurrent = strictUserModels(userModelsFile(options, paths));
         const latestPicker = strictPickerState(pickerFile(options, paths));
@@ -750,6 +753,11 @@ export async function checkGoAutoCatalog(options = {}) {
         // process was outside the overlay lock. Preserve the fresh state and
         // suppress publication/restart for the resulting no-op.
         if (!latestPlan.catalogChanged && !latestPlan.seenChanged) { skipPublication = true; return; }
+        if (!latestPlan.catalogChanged && latestPlan.seenChanged) {
+          writeJson(paths.seenPath, { version: 1, seen: latestPlan.nextSeen });
+          skipPublication = true;
+          return;
+        }
         writeJson(userModelsFile(options, paths), { version: 1, models: latestPlan.nextModels });
         writePicker(pickerFile(options, paths), latestPlan.nextPicker);
         writeJson(paths.seenPath, { version: 1, seen: latestPlan.nextSeen });
