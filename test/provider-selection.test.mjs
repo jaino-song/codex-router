@@ -68,7 +68,6 @@ test("provider selection keeps backward compatibility and can hide the final pro
     // credential to configure and they are always available. Everything else
     // has to authenticate before it counts.
     assert.deepEqual(configuredProviderIds(), [
-      "chatgpt-web",
       "custom",
       "kilo-free",
       "lmstudio",
@@ -80,7 +79,6 @@ test("provider selection keeps backward compatibility and can hide the final pro
     delete process.env.KIMI_API_KEY;
     writeProviderCredential("deepseek", "TEST_DEEPSEEK_SELECTION_KEY");
     assert.deepEqual(configuredProviderIds(), [
-      "chatgpt-web",
       "custom",
       "deepseek",
       "kilo-free",
@@ -105,6 +103,7 @@ test("provider selection keeps backward compatibility and can hide the final pro
         "deepseek/deepseek-v4-flash",
         "deepseek/deepseek-v4-flash-vision-exp",
         "deepseek/deepseek-v4-pro",
+        "deepseek/deepseek-v4.1-flash",
       ],
     );
     assert.deepEqual(
@@ -113,6 +112,7 @@ test("provider selection keeps backward compatibility and can hide the final pro
         "deepseek/deepseek-v4-flash",
         "deepseek/deepseek-v4-flash-vision-exp",
         "deepseek/deepseek-v4-pro",
+        "deepseek/deepseek-v4.1-flash",
       ],
     );
 
@@ -275,6 +275,7 @@ test("an unknown provider id in the selection file is filtered out, not fatal", 
         "deepseek/deepseek-v4-flash",
         "deepseek/deepseek-v4-flash-vision-exp",
         "deepseek/deepseek-v4-pro",
+        "deepseek/deepseek-v4.1-flash",
       ],
     );
     // Doctor and the support bundle read through this, so the damage is

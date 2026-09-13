@@ -170,13 +170,13 @@ test("the response schema has bounded records and safe model identities", async 
   assert.deepEqual(result.data, [{ id: "provider/model" }]);
 });
 
-test("a bounded Codex model catalog is accepted for the local ChatGPT Web bridge", () => {
+test("a bounded Codex model catalog is accepted from a local bridge", () => {
   assert.deepEqual(
-    validateModelCatalogPayload({ models: [{ slug: "chatgpt-web/light" }] }),
-    [{ slug: "chatgpt-web/light" }],
+    validateModelCatalogPayload({ models: [{ slug: "provider/model" }] }),
+    [{ slug: "provider/model" }],
   );
   assert.throws(
-    () => validateModelCatalogPayload({ models: [{ slug: "chatgpt-web/\u0000bad" }] }),
+    () => validateModelCatalogPayload({ models: [{ slug: "provider/\u0000bad" }] }),
     /invalid model id/,
   );
 });

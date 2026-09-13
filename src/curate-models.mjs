@@ -460,10 +460,12 @@ async function main() {
     }
   }
 
-  const inheritedProfile = uniformProviderFamilyRequestProfile(
-    CHECKED_IN_MODELS,
-    familyProviderIds,
-  );
+  // Zen Free mixes unrelated upstream models behind one anonymous catalog.
+  // Its two Muse Responses ids have a documented model-specific profile, so a
+  // checked-in Muse pin must not lend that profile to every other free model.
+  const inheritedProfile = providerId === "opencode-free"
+    ? undefined
+    : uniformProviderFamilyRequestProfile(CHECKED_IN_MODELS, familyProviderIds);
 
   // Which models exist is decided by the provider's own /v1/models endpoint.
   // Metadata comes from that catalog, the interactive user, or the narrow
@@ -476,21 +478,6 @@ async function main() {
       ...(flagEfforts || {}),
       ...(discovery.free?.includes(id) ? { isFree: true } : {}),
     };
-    // The ChatGPT Web launcher owns these catalog rows and derives them from
-    // the signed-in account. Its clean labels and input modalities are part of
-    // the same local contract as the account-gated model ids, so preserve them
-    // instead of turning every row into a generic text-only curated model.
-    if (providerId === "chatgpt-web") {
-      const live = Array.isArray(discovery.modelMetadata)
-        ? discovery.modelMetadata.find((entry) => entry?.upstreamId === id)
-        : discovery.modelMetadata?.[id];
-      if (typeof live?.displayName === "string" && live.displayName) {
-        metadata.displayName = live.displayName;
-      }
-      if (Array.isArray(live?.inputModalities) && live.inputModalities.length) {
-        metadata.inputModalities = live.inputModalities;
-      }
-    }
     // The served catalog value wins when present. OpenCode's exact documented
     // free-model size is the fallback for its id-only Zen catalog; every other
     // silent catalog still gets the conservative generic default.

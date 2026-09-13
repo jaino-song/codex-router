@@ -1112,3 +1112,89 @@ test("an idle keep-alive connection survives past Node's default timeout", async
     await closeServer(gateway.server);
   }
 });
+
+test("protected activity follows a quiet stream through reasoning and client cancellation", async () => {
+  const threadId = "11111111-1111-4111-8111-111111111111";
+  let upstreamResponse;
+  let upstreamClosed = false;
+  let requestCount = 0;
+  let signalStarted;
+  const started = new Promise((resolve) => { signalStarted = resolve; });
+  const gateway = await mockServer((request, response) => {
+    if (request.method === "GET") {
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end('{"ok":true}');
+      return;
+    }
+    requestCount += 1;
+    upstreamResponse = response;
+    response.once("close", () => { upstreamClosed = true; });
+    signalStarted();
+  });
+  const routerPort = await openPort();
+  const router = run({
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_ROUTER_ACTIVITY_RECORD_RETENTION_MS: "40",
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_OAUTH_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
+    CODEX_ROUTER_API_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
+    CODEX_ROUTER_GROK_OAUTH_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
+    CODEX_ROUTER_GATEWAY_HEALTH_URL: `http://127.0.0.1:${gateway.port}/health`,
+  });
+  const base = callerBaseUrl(routerPort, CALLER_KEY);
+  const controller = new AbortController();
+  const snapshot = () => fetch(`${base}/activity?threadId=${threadId}`).then((r) => r.json());
+  async function until(predicate) {
+    const end = Date.now() + 3_000;
+    while (Date.now() < end) {
+      const state = await snapshot();
+      if (predicate(state)) return state;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.fail(`activity did not reach expected state: ${JSON.stringify(await snapshot())}`);
+  }
+  let pending;
+  try {
+    await waitFor(`http://127.0.0.1:${routerPort}/health`, router);
+    assert.equal((await fetch(`http://127.0.0.1:${routerPort}/v1/activity`)).status, 401);
+    assert.equal((await fetch(`${base}/activity?threadId=invalid%2Fid`)).status, 400);
+    pending = fetch(`${base}/responses`, {
+      method: "POST", signal: controller.signal,
+      headers: { "Content-Type": "application/json", session_id: threadId },
+      body: JSON.stringify({ model: "grok-oauth/grok-4.6", stream: true, input: "private-prompt-marker" }),
+    }).then(async (response) => { await response.text(); }).catch(() => {});
+    await started;
+    const quiet = await snapshot();
+    assert.equal(quiet.active.length, 1);
+    assert.equal(quiet.active[0].phase, "awaiting_upstream");
+    assert.equal(quiet.active[0].upstreamAttempts, 1);
+    assert.equal(quiet.active[0].lastEventAt, undefined);
+    const requestId = quiet.active[0].requestId;
+    // Presentation retention must not hide a still-pending operation.
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    assert.equal((await snapshot()).active[0].requestId, requestId);
+    upstreamResponse.writeHead(200, { "Content-Type": "text/event-stream" });
+    upstreamResponse.write('data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_live","output_index":0,"summary_index":0,"delta":"private-output-marker"}\n\n');
+    const generating = await until((s) => s.active[0]?.phase === "reasoning");
+    assert.equal(generating.active[0].receivedEvents, 1);
+    assert.ok(generating.active[0].lastByteAt >= quiet.active[0].startedAt);
+    assert.doesNotMatch(JSON.stringify(generating), /private-prompt-marker|private-output-marker/);
+    assert.equal((await fetch(`${base}/activity?threadId=other`).then((r) => r.json())).active.length, 0);
+    controller.abort();
+    await pending;
+    const settled = await until((s) => s.recent.some((r) => r.requestId === requestId));
+    assert.equal(settled.active.length, 0);
+    assert.equal(settled.recent[0].state, "canceled");
+    assert.equal(settled.recent[0].cancelReason, "client_disconnected");
+    const closeDeadline = Date.now() + 1_000;
+    while (!upstreamClosed && Date.now() < closeDeadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(upstreamClosed, true);
+    assert.equal(requestCount, 1);
+  } finally {
+    controller.abort();
+    await pending;
+    await stopChild(router);
+    gateway.server.closeAllConnections?.();
+    await closeServer(gateway.server);
+  }
+});

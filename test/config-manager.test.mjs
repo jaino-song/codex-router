@@ -15,6 +15,8 @@ import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { privateFileIsProtected } from "../src/file-security.mjs";
+import { refreshCodexCallerCapabilityContents } from "../src/caller-key-client-refresh.mjs";
+import { CODEX_PATCH_HOOK_BASE_PATH } from "../src/codex-patch-hook-endpoint.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const manager = path.join(root, "src", "config-manager.mjs");
@@ -132,6 +134,37 @@ await import(${JSON.stringify(pathToFileURL(manager).href)} + "?blocked-write=" 
     },
   );
 }
+
+test("explicit hook endpoint survives enable and caller refresh; disable preserves user features", () => {
+  const codexHome = mkdtempSync(path.join(os.tmpdir(), "codex-hook-config-"));
+  const stateDir = path.join(codexHome, "router-state");
+  const configPath = path.join(codexHome, "config.toml");
+  const original = 'model = "gpt-5.6-sol"\n[features]\nhooks = true\n';
+  try {
+    writeFileSync(configPath, original, { mode: 0o600 });
+    run("enable", codexHome, stateDir);
+    const activated = refreshCodexCallerCapabilityContents(readFileSync(configPath, "utf8"),
+      `http://127.0.0.1:46192${CODEX_PATCH_HOOK_BASE_PATH}`, { port: 46192 });
+    writeFileSync(configPath, activated, { mode: 0o600 });
+    assert.equal(run("status", codexHome, stateDir).mode, "router");
+    run("enable", codexHome, stateDir);
+    assert.equal(readFileSync(configPath, "utf8"), activated);
+    run("caller-capability-refresh", codexHome, stateDir);
+    assert.equal(readFileSync(configPath, "utf8"), activated);
+    const legacyBase = `http://127.0.0.1:4102/_codex-router/${CALLER_KEY}${CODEX_PATCH_HOOK_BASE_PATH}`;
+    const legacy = activated.replaceAll(`http://127.0.0.1:46192${CODEX_PATCH_HOOK_BASE_PATH}`, legacyBase);
+    writeFileSync(configPath, legacy, { mode: 0o600 });
+    run("caller-capability-refresh", codexHome, stateDir);
+    assert.equal(readFileSync(configPath, "utf8"), activated);
+    run("disable", codexHome, stateDir);
+    const disabled = readFileSync(configPath, "utf8");
+    assert.equal(disabled.includes(CODEX_PATCH_HOOK_BASE_PATH), false);
+    assert.match(disabled, /hooks = true/);
+    assert.match(disabled, /model = "gpt-5.6-sol"/);
+  } finally {
+    rmSync(codexHome, { recursive: true, force: true });
+  }
+});
 
 test("config manager preserves Codex defaults and profiles", () => {
   const codexHome = mkdtempSync(path.join(os.tmpdir(), "codex-router-config-"));

@@ -3,11 +3,19 @@ import { providerAccountUsageSnapshot } from "./provider-account-usage.mjs";
 import { canonicalProviderId, readProviderSelection } from "./provider-selection.mjs";
 import { allUsageEvents } from "./usage-events.mjs";
 
+// OpenAI's account stream reports dailyUsageBuckets keyed by UTC calendar day.
+// These router-derived buckets were keyed by the machine's local day, so the
+// two day spaces were merged by string in mergeAccountUsageBuckets() and drawn
+// on one chart as if they described the same window. East of UTC that silently
+// misattributed every bar by the zone's offset, and the current local day had
+// no account bucket to match at all until the offset elapsed -- a Pro account
+// mid-session showed "today: 0" every morning. One day space, and it has to be
+// the one the authoritative stream already uses.
 function dateKey(value) {
   const date = new Date(value);
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(date.getUTCDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
 }
 
@@ -223,12 +231,14 @@ export function aggregateProviderUsage(events, { days = 90, now = Date.now() } =
     // 426-token one at 69 on the same model.
     const firstTokenMs = optionalNonnegative(event.firstTokenMs);
     const generationDurationMs = durationMs - (firstTokenMs ?? durationMs);
-    // Industry TTFT measures time to first *visible* token. Reasoning tokens
-    // are generated during silent thinking before any visible output. When the
-    // provider reports the split, subtract reasoning from output to get the
-    // tok/s numerator. Provider totals still count full output for billing.
-    const reasoningTokens = optionalNonnegative(event.reasoningTokens) ?? 0;
-    const speedOutputTokens = Math.max(0, selectedOutputTokens - reasoningTokens);
+    // The numerator must count exactly the tokens generated inside that
+    // window. Reasoning tokens are generated inside it when the provider
+    // streamed reasoning deltas (the clock started on the first of them), and
+    // before it when the provider thought in silence until the first visible
+    // token. Only the second case subtracts them; without the marker (rows
+    // written before it existed) the inclusive count is the closer answer on
+    // every route seen so far. Provider totals still count full output.
+    const speedOutputTokens = tokensGeneratedAfterFirstToken(event, selectedOutputTokens);
     // A long Codex turn can trip the empty-completion hold budget and still
     // finish as a normal 200 with streamed tokens. That flag means "we
     // stopped waiting to classify emptiness", not "this rate is unusable".
@@ -323,6 +333,19 @@ export function aggregateProviderUsage(events, { days = 90, now = Date.now() } =
         ),
     })),
   };
+}
+
+// Some providers report output tokens that already exclude reasoning (a
+// reasoning count larger than the output count proves it), so the inclusive
+// total is rebuilt before deciding whether to subtract.
+export function tokensGeneratedAfterFirstToken(event, outputTokens) {
+  const reasoningTokens = optionalNonnegative(event.reasoningTokens) ?? 0;
+  const inclusiveOutputTokens =
+    reasoningTokens > outputTokens ? outputTokens + reasoningTokens : outputTokens;
+  if (event.reasoningStreamed === false) {
+    return Math.max(0, inclusiveOutputTokens - reasoningTokens);
+  }
+  return inclusiveOutputTokens;
 }
 
 export async function providerUsageSnapshot(options = {}) {

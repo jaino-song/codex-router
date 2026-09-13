@@ -8,6 +8,7 @@ import {
   handleResponsesWebSocketUpgrade,
   RESPONSES_WEBSOCKET_BETA,
 } from "../src/responses-websocket.mjs";
+import { unroutedModelError } from "../src/unrouted-model.mjs";
 
 const CALLER_KEY = "test-responses-websocket-caller-capability-0123456789abcdef";
 const WS_KEY = Buffer.from("0123456789abcdef").toString("base64");
@@ -867,6 +868,35 @@ test("wraps HTTP failures and serializes requests on a reused connection", async
   peer.close();
 });
 
+// The WebSocket has no model resolution of its own: it re-enters the HTTP
+// Responses route, which refuses an unrouted provider-prefixed slug (#689).
+// Codex must receive that refusal as a terminal 400 with its code intact.
+test("relays a local unrouted_model refusal with its status and code", async (t) => {
+  const refusal = unroutedModelError("unorouter/gpt-6-astra", {});
+  let calls = 0;
+  const { server, port } = await startServer(async (request, response) => {
+    for await (const _chunk of request) {
+      // Drain the body before answering, like the real HTTP route.
+    }
+    calls += 1;
+    response.writeHead(400, { "content-type": "application/json" });
+    response.end(JSON.stringify(refusal));
+  });
+  t.after(() => server.close());
+  const { peer } = await connect(port);
+  peer.sendJson(createRequest({ model: "unorouter/gpt-6-astra" }));
+  const error = await peer.nextJson();
+  assert.equal(error.type, "error");
+  assert.equal(error.status, 400);
+  assert.deepEqual(error.error, {
+    type: "invalid_request_error",
+    code: "unrouted_model",
+    message: refusal.error.message,
+  });
+  assert.equal(calls, 1);
+  peer.close();
+});
+
 test("projects an active limit only when it names a validated projected family", async (t) => {
   const cases = [
     {
@@ -1210,6 +1240,29 @@ test("drops oversized continuation state so Codex retries the full request", asy
   assert.equal(retry.status, 409);
   assert.equal(retry.error.code, "previous_response_not_found");
   assert.equal(calls, 1, "the missing baseline must fail before another provider request");
+  peer.close();
+});
+
+test("streamed errors carry an HTTP failure status so native WebSocket clients terminate the turn", async (t) => {
+  const statuses = [undefined, 429, 503, "502", 200];
+  let calls = 0;
+  const { server, port } = await startServer(async (request, response) => {
+    for await (const _chunk of request) {}
+    const status = statuses[calls++];
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.end(`data: ${JSON.stringify({ type: "error", ...(status === undefined ? {} : { status }), error: { type: "local_router_stream_failed", message: "fixture stream interrupted" } })}\n\n`);
+  });
+  t.after(() => server.close());
+  const { peer } = await connect(port);
+  t.after(() => peer.socket.destroy());
+  for (const status of statuses) {
+    peer.sendJson(createRequest());
+    const error = await peer.nextJson();
+    assert.equal(error.type, "error");
+    assert.equal(error.status, Number.isInteger(status) && status >= 400 && status <= 599 ? status : 502);
+    assert.deepEqual(error.error, { type: "local_router_stream_failed", message: "fixture stream interrupted" });
+  }
+  assert.equal(calls, statuses.length, "the bridge must not replay failed requests");
   peer.close();
 });
 

@@ -12,6 +12,8 @@ import {
   createLoopbackProbeDispatcher,
   fetchDispatcherOptions,
   installStableFetchTransport,
+  longIdleStreamDispatcher,
+  longIdleStreamFetch,
   loopbackProbeDispatcher,
   loopbackProbeFetch,
 } from "../src/fetch-transport.mjs";
@@ -59,6 +61,101 @@ test("the router disables HTTP/2 on its process-wide fetch dispatcher", () => {
   assert.deepEqual(created[0].options, { allowH2: false, pipelining: 1 });
   assert.equal(dispatcher, created[0]);
   assert.deepEqual(installed, [dispatcher]);
+});
+
+test("a Grok long-idle pool raises only the body idle bound and keeps the proxy decision", () => {
+  const { created } = installFakeTransport({});
+  assert.equal("bodyTimeout" in created[0].options, false, "the shared pool keeps undici's default");
+
+  class FakeAgent {
+    constructor(options) {
+      this.kind = "direct";
+      this.options = options;
+    }
+  }
+  class FakeEnvHttpProxyAgent {
+    constructor(options) {
+      this.kind = "environment-proxy";
+      this.options = options;
+    }
+  }
+  const forwarderPool = installStableFetchTransport({
+    AgentClass: FakeAgent,
+    EnvHttpProxyAgentClass: FakeEnvHttpProxyAgent,
+    environment: {},
+    execArgv: [],
+    bodyTimeoutMs: 660_000,
+    setDispatcher() {},
+  });
+  assert.deepEqual(forwarderPool.options, { allowH2: false, pipelining: 1, bodyTimeout: 660_000 });
+
+  const classes = { AgentClass: FakeAgent, EnvHttpProxyAgentClass: FakeEnvHttpProxyAgent, execArgv: [] };
+  const direct = longIdleStreamDispatcher(660_001, { ...classes, environment: {} });
+  assert.equal(direct.kind, "direct");
+  assert.deepEqual(direct.options, {
+    allowH2: false,
+    pipelining: 1,
+    headersTimeout: 660_001,
+    bodyTimeout: 660_001,
+  });
+  assert.equal(longIdleStreamDispatcher(660_001), direct, "one pool per bound, not one per request");
+  const proxied = longIdleStreamDispatcher(660_002, {
+    ...classes,
+    environment: { NODE_USE_ENV_PROXY: "1", HTTPS_PROXY: "http://proxy.example:8080" },
+  });
+  assert.equal(proxied.kind, "environment-proxy");
+});
+
+test("the long-idle fetch honors its body idle bound on a real socket", async () => {
+  // Undici checks body timeouts on a coarse (about half-second) timer wheel,
+  // so the pause is several ticks longer than the short bound.
+  const server = http.createServer((_request, response) => {
+    response.writeHead(200, { "Content-Type": "text/plain" });
+    response.write("first");
+    const timer = setTimeout(() => response.end("second"), 2_500);
+    response.once("close", () => clearTimeout(timer));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const url = `http://127.0.0.1:${server.address().port}/`;
+  try {
+    const patient = await longIdleStreamFetch(url, {}, { bodyTimeoutMs: 10_000 });
+    assert.equal(await patient.text(), "firstsecond");
+    // Negative control: the same pause trips a shorter bound, so the option
+    // reaches the dispatcher rather than being silently ignored.
+    const impatient = await longIdleStreamFetch(url, {}, { bodyTimeoutMs: 100 });
+    await assert.rejects(impatient.text(), (error) =>
+      [error?.code, error?.cause?.code].includes("UND_ERR_BODY_TIMEOUT"));
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("the long-idle fetch honors the same bound for response headers", async () => {
+  // A non-streaming Grok compaction receives its headers only after the whole
+  // generation, so a pause before the head must be bounded like a pause
+  // between body chunks rather than by Undici's 300s headers default.
+  const server = http.createServer((_request, response) => {
+    const timer = setTimeout(() => {
+      response.writeHead(200, { "Content-Type": "text/plain" });
+      response.end("late head");
+    }, 2_500);
+    response.once("close", () => clearTimeout(timer));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const url = `http://127.0.0.1:${server.address().port}/`;
+  try {
+    const patient = await longIdleStreamFetch(url, {}, { bodyTimeoutMs: 10_000 });
+    assert.equal(await patient.text(), "late head");
+    // Negative control: the same delay before the head trips a shorter bound.
+    await assert.rejects(
+      longIdleStreamFetch(url, {}, { bodyTimeoutMs: 100 }),
+      (error) => [error?.code, error?.cause?.code].includes("UND_ERR_HEADERS_TIMEOUT"),
+    );
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise((resolve) => server.close(resolve));
+  }
 });
 
 // Every outbound provider request shares this pool. Holding idle sockets
@@ -239,8 +336,11 @@ test("every long-lived server process installs the stable transport", () => {
 
   for (const name of serverEntryPoints) {
     const source = readFileSync(path.join(SRC_DIR, name), "utf8");
-    assert.ok(
-      source.includes("installStableFetchTransport()"),
+    // A process may pass options (the Grok forwarder raises its body idle
+    // bound), but it must still install the transport.
+    assert.match(
+      source,
+      /installStableFetchTransport\((?:\{[\s\S]*?\})?\);/,
       `${name} creates a server but never installs the stable fetch transport`,
     );
   }

@@ -1,8 +1,9 @@
-import { mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { protectPrivateFile } from "./file-security.mjs";
+import { grokGatewayStreamTimeoutSeconds } from "./grok-stream-timeouts.mjs";
 import { LITELLM_CONFIG_PATH } from "./paths.mjs";
 import { MODELS, protocolForModel, providerForModel } from "./model-registry.mjs";
 import { assertStateOwnership } from "./state-owner.mjs";
@@ -70,11 +71,23 @@ export function renderLiteLlmConfig() {
       // Loopback delivery is reliable and Codex owns the user-visible retry,
       // so this deployment must remain single-shot just like local Ollama.
       ...(model.requestProfile === "qwen38-mlx" ? ["      num_retries: 0"] : []),
+      // A Grok OAuth turn can be silent for minutes while it reasons, so its
+      // stream timeout outlasts the router's stall guard. Compaction reaches
+      // the same deployment without streaming, where `timeout` applies
+      // instead, so it gets the same bound. Every other deployment keeps the
+      // global request_timeout below.
+      ...(model.provider === "grok-oauth"
+        ? [
+            `      stream_timeout: ${grokGatewayStreamTimeoutSeconds()}`,
+            `      timeout: ${grokGatewayStreamTimeoutSeconds()}`,
+          ]
+        : []),
       "",
     );
   }
   lines.push(
     "litellm_settings:",
+    "  callbacks: [grok_service_tier_callback.grok_service_tier_callback]",
     "  drop_params: true",
     "  request_timeout: 600",
     "",
@@ -111,6 +124,14 @@ export function writeLiteLlmConfig(target = LITELLM_CONFIG_PATH) {
     assertStateOwnership("write the gateway routing config");
   }
   mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+  // LiteLLM resolves configured callbacks beside its YAML. Publish only this
+  // repository-owned module, atomically and privately, before referencing it.
+  const callbackPath = path.join(path.dirname(target), "grok_service_tier_callback.py");
+  const callbackTemp = `${callbackPath}.tmp.${process.pid}`;
+  writeFileSync(callbackTemp, readFileSync(new URL("./grok_service_tier_callback.py", import.meta.url)), { mode: 0o600 });
+  protectPrivateFile(callbackTemp);
+  renameSync(callbackTemp, callbackPath);
+  protectPrivateFile(callbackPath);
   const temporary = `${target}.tmp.${process.pid}`;
   writeFileSync(temporary, renderLiteLlmConfig(), { encoding: "utf8", mode: 0o600 });
   protectPrivateFile(temporary);

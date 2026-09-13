@@ -358,6 +358,21 @@ test("registry merges valid user models and skips collisions", async () => {
   assert.ok(registry.USER_MODEL_WARNINGS.some((warning) => (
     /opencode-go\/grok-4\.5/.test(warning) && /collides with an existing model alias/.test(warning)
   )));
+  // The router cites why a slug has no route (#689), so each skipped entry's
+  // reason is kept by slug, including the ones dropped after the merge settles.
+  assert.match(
+    registry.USER_MODELS_SKIPPED.get("deepseek/deepseek-self-certified"),
+    /may not declare multiAgentVersion v2/,
+  );
+  assert.match(
+    registry.USER_MODELS_SKIPPED.get("no-such-provider/x-model"),
+    /references unknown provider no-such-provider/,
+  );
+  assert.match(
+    registry.USER_MODELS_SKIPPED.get("deepseek/deepseek-bad-upgrade"),
+    /upgrades to unknown model no-such\/model/,
+  );
+  assert.equal(registry.USER_MODELS_SKIPPED.has("deepseek/deepseek-user-test"), false);
   const merged = registry.MODEL_BY_SLUG.get("deepseek/deepseek-user-test");
   assert.equal(merged.listed, true);
   assert.equal(merged.availabilityNux, "Now available through your DeepSeek key.");

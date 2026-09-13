@@ -1157,6 +1157,13 @@ class ResponsesWebSocketPeer {
           // connection reuse, but never graft a provider trailer onto the next
           // continuation baseline.
           if (terminalSeen) return true;
+          // Native Codex maps WebSocket `error` events only when they carry
+          // an HTTP failure status. SSE can instead signal failure by ending
+          // its body; the persistent socket has no such turn boundary.
+          if (event.type === "error" &&
+              !(Number.isInteger(event.status) && event.status >= 400 && event.status <= 599)) {
+            event = { ...event, status: 502 };
+          }
           if (!(await this.sendJsonWithBackpressure(event))) return false;
           if (event.type === "response.output_item.done" && event.item) {
             const itemBytes = Buffer.byteLength(JSON.stringify(event.item), "utf8");
@@ -1175,6 +1182,10 @@ class ResponsesWebSocketPeer {
           if (["error", "response.failed", "response.incomplete"].includes(event.type)) {
             terminalFailure = true;
             terminalSeen = true;
+            // Codex ends the turn on this event and may send its retry on the
+            // same socket, where it queues behind this drain. A gateway that
+            // holds the stream open after a failure must not stall that retry.
+            setTimeout(() => controller.abort(), 5_000).unref?.();
             return true;
           }
           return true;

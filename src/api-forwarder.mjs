@@ -1,4 +1,10 @@
 import http from "node:http";
+import { usesNativeChatReasoning } from "./chat-reasoning.mjs";
+import {
+  deepSeekResponsesEffort,
+  deepSeekResponsesInput,
+  usesDeepSeekResponses,
+} from "./deepseek-responses.mjs";
 
 import {
   applyKeepAliveTimeouts,
@@ -80,6 +86,7 @@ import {
 import { requestGenericProvider } from "./generic-providers.mjs";
 import { genericProviderConfigured } from "./generic-provider-readiness.mjs";
 import { localTransportHost, providerTransportError } from "./transport-failure.mjs";
+import { withoutInputMessagePhase } from "./message-phase.mjs";
 import {
   endpointCapabilityError,
   supportsOpenAIModelEndpoint,
@@ -250,7 +257,7 @@ function coalesceAssistantMessages(messages) {
   return coalesced;
 }
 
-function restoreGlmReasoningContent(messages) {
+function restoreNativeReasoningContent(messages) {
   if (!Array.isArray(messages)) return messages;
   return messages.map((message) => {
     if (message?.role !== "assistant" || !Array.isArray(message.content)) return message;
@@ -734,7 +741,24 @@ function normalizeBody(buffer, contentType, route) {
   // Responses request, but legacy aliases are normalized before any provider
   // sees it and the original payload remains available for retries.
   if (modelProtocol === "openai-responses") {
+    if (usesDeepSeekResponses(model)) {
+      // Codex subagent overrides may supply both spellings. Responses uses
+      // the nested effort and must not inherit the Chat thinking parameters.
+      const effort = payload.reasoning?.effort ?? payload.reasoning_effort ??
+        (model.requestProfile === "deepseek-nonthinking" ? "none" : undefined);
+      payload.reasoning = { effort: deepSeekResponsesEffort(effort) };
+      payload.input = deepSeekResponsesInput(payload.input);
+      delete payload.reasoning_effort;
+      delete payload.thinking;
+    }
     payload = normalizeOpenAIRequest(payload);
+    // The router labels routed assistant messages with Codex's `phase`, and
+    // Codex replays it on every later turn. An operator-configured Responses
+    // endpoint is an unknown validator, so it gets the pre-label history
+    // shape. Built-in Responses providers keep the field.
+    if (provider.generic === true) {
+      payload.input = withoutInputMessagePhase(payload.input);
+    }
   }
 
   // OpenAI Chat Completions providers place terminal usage in a final empty
@@ -813,6 +837,9 @@ function normalizeBody(buffer, contentType, route) {
   }
   if (Array.isArray(payload.messages)) {
     payload.messages = sanitizeChatToolHistory(payload.messages, provider, model);
+    if (usesNativeChatReasoning(model)) {
+      payload.messages = restoreNativeReasoningContent(payload.messages);
+    }
   }
   if (provider.authProfile === "github-copilot") {
     // This is native ChatGPT account metadata, not an upstream scheduling
@@ -869,7 +896,7 @@ function normalizeBody(buffer, contentType, route) {
     if (effort) payload.reasoning_effort = effort;
     else delete payload.reasoning_effort;
     delete payload.thinking;
-  } else if (model.requestProfile === "deepseek-thinking") {
+  } else if (model.requestProfile === "deepseek-thinking" && !usesDeepSeekResponses(model)) {
     payload.thinking = { type: "enabled" };
     payload.reasoning_effort = deepSeekEffort(payload.reasoning_effort);
     delete payload.temperature;
@@ -884,7 +911,7 @@ function normalizeBody(buffer, contentType, route) {
     if (payload.tool_choice !== undefined && payload.tool_choice !== "none") {
       payload.tool_choice = "auto";
     }
-  } else if (model.requestProfile === "deepseek-nonthinking") {
+  } else if (model.requestProfile === "deepseek-nonthinking" && !usesDeepSeekResponses(model)) {
     payload.thinking = { type: "disabled" };
     delete payload.reasoning_effort;
   } else if (
@@ -960,7 +987,6 @@ function normalizeBody(buffer, contentType, route) {
     }
   } else if (model.requestProfile === "glm-thinking") {
     payload.thinking = { type: "enabled", clear_thinking: false };
-    payload.messages = restoreGlmReasoningContent(payload.messages);
     // Each GLM entry declares exactly the tiers Z.ai documents for it, and the
     // requested effort is clamped onto them. Models whose registry entry offers
     // a single level (GLM-5-Turbo, GLM-4.7) do not support the parameter at
@@ -1198,10 +1224,11 @@ async function relayUpstreamResponse(
   const responsesJson = normalized.responseAdapter === "responses" &&
     upstream.ok && upstreamContentType.toLowerCase().includes("application/json");
   
-  // Build namespace lookups from the flattened tools in the request payload
-  // to restore namespaced function calls (e.g., "multi_agent_v1__spawn_agent" 
-  // back to { namespace: "multi_agent_v1", name: "spawn_agent" })
-  const flatToNative = (responsesStream || responsesJson)
+  // Direct DeepSeek calls arrive with an outer, authoritative namespace/custom
+  // map. Preserve their wire names here; guessing a namespace from a flattened
+  // name would restore it before the outer custom-tool bridge can consume it.
+  // Other native routes retain this forwarder's established namespace lookup.
+  const flatToNative = (responsesStream || responsesJson) && !usesDeepSeekResponses(normalized.model)
     ? buildNamespaceLookupsFromTools(normalized.payload?.tools)
     : new Map();
   

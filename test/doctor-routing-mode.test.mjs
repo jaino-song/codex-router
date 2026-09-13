@@ -48,10 +48,25 @@ esac
 }
 
 function child(script, args, env) {
+  const childEnv = {
+    ...env,
+    // This test redirects Codex/router state, but service status is read from
+    // the machine, not from that state: launchd on macOS, systemd on Linux and
+    // Task Scheduler on Windows all answer for the developer's real install.
+    // A maintainer with the router running therefore made the fixture report a
+    // loaded service, and doctor waits 30s rather than 2s for a router that
+    // will never appear on the fixture's port -- past this child's own bound,
+    // leaving empty stdout for the JSON parse below. CI has no service
+    // installed, so it only ever reproduced locally.
+    ...(script === "doctor.mjs" ? { CODEX_ROUTER_SERVICE_PLATFORM: "test-fixture" } : {}),
+  };
   return spawnSync(process.execPath, [path.join(root, "src", script), ...args], {
     cwd: root,
-    env,
+    env: childEnv,
     encoding: "utf8",
+    // node:test cannot interrupt a synchronous child while the event loop is
+    // blocked, so bound the subprocess itself as the final isolation guard.
+    timeout: 20_000,
   });
 }
 
@@ -142,6 +157,7 @@ wire_api = "responses"
       writeFileSync(nativeCapturePath, `${JSON.stringify(nativeCapture)}\n`, { mode: 0o600 });
 
       const doctor = child("doctor.mjs", ["--json"], env);
+      assert.ifError(doctor.error);
       const report = JSON.parse(doctor.stdout);
       const byName = new Map(report.checks.map((check) => [check.name, check]));
       assert.deepEqual(byName.get("Merged catalog"), {
@@ -263,6 +279,7 @@ test(
       assert.equal(enabled.status, 0, enabled.stderr);
 
       const doctor = child("doctor.mjs", ["--json"], env);
+      assert.ifError(doctor.error);
       const report = JSON.parse(doctor.stdout);
       const byName = new Map(report.checks.map((check) => [check.name, check]));
       assert.deepEqual(byName.get("Codex model catalog"), {

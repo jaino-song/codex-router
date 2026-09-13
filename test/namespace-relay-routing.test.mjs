@@ -8,7 +8,15 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { GROK_PATCH_HOOK_PREFIX, GROK_PATCH_HOOK_HEADER, GROK_PATCH_HOOK_CAPABILITY } from "../src/grok-patch-hook-transport.mjs";
 import { callerBaseUrl } from "../src/caller-auth.mjs";
+import { GROK_STRUCTURED_PATCH_CODEC, serializeStructuredPatch } from "../src/grok-structured-patch.mjs";
+import {
+  APPLY_PATCH_TOOL_NAME,
+  GROK_APPLY_PATCH_CREATE_EXAMPLE,
+  GROK_APPLY_PATCH_GUIDANCE_MARKER,
+  GROK_APPLY_PATCH_UPDATE_EXAMPLE,
+} from "../src/grok-apply-patch-guidance.mjs";
 
 // End-to-end proof of the namespace relay through the REAL router: a routed
 // request carrying the client's namespace toolset must reach the (mock)
@@ -890,12 +898,14 @@ async function scenario(
     jsonBody = gatewayJsonBody,
     requestPayload = routedRequestPayload,
     routerEnv = {},
+    requestHeaders = {},
     prepareRouterEnv,
     visionJsonBody,
     expectedStatus = 200,
   } = {},
 ) {
   const gatewayBodies = [];
+  const gatewayHeaders = [];
   const visionBodies = [];
   const gateway = await mockServer(async (request, response) => {
     if (request.url === "/vision/v1/chat/completions" && visionJsonBody) {
@@ -911,6 +921,7 @@ async function scenario(
     if (request.url === "/v1/responses") {
       const gatewayBody = await bodyJson(request);
       gatewayBodies.push(gatewayBody);
+      gatewayHeaders.push(request.headers);
       if (gatewayBody.stream === false) {
         json(response, 200, jsonBody(gatewayBody));
         return;
@@ -943,12 +954,13 @@ async function scenario(
       headers: {
         Authorization: "Bearer CODEX_CALLER_SECRET",
         "Content-Type": "application/json",
+        ...requestHeaders,
       },
       body: JSON.stringify(requestPayload(stream, model)),
     });
     assert.equal(response.status, expectedStatus, `router status ${response.status}`);
     const clientBody = await response.text();
-    return { gatewayBodies, visionBodies, clientBody, router, status: response.status };
+    return { gatewayBodies, gatewayHeaders, visionBodies, clientBody, router, status: response.status };
   } finally {
     await stopChild(router);
     await closeServer(gateway.server);
@@ -1538,6 +1550,44 @@ test("Command Code models restore MCP calls Codex pre-flattened before the route
   }
 });
 
+test("Command Code forced tool choice uses the same bounded alias as its tool", async () => {
+  const longName =
+    "mcp__openai_api_key_local_confirmation__confirm_openai_api_key_local_destination";
+  assert.equal(longName.length, 80);
+
+  for (const model of [
+    "commandcode/deepseek-v4-flash",
+    "commandcode-messages/claude-fable-5.1",
+  ]) {
+    const result = await scenario(false, {
+      model,
+      requestPayload: (stream, routeModel) => ({
+        model: routeModel,
+        stream,
+        input: "Call the required tool.",
+        tools: [{
+          type: "function",
+          name: longName,
+          parameters: { type: "object", properties: {}, additionalProperties: false },
+        }],
+        tool_choice: { type: "function", name: longName },
+      }),
+      jsonBody: () => ({ id: "commandcode_choice", output: [] }),
+    });
+
+    assert.equal(result.gatewayBodies.length, 1, model);
+    const outgoing = result.gatewayBodies[0];
+    const providerTool = outgoing.tools.find((tool) => tool.name !== "web_search");
+    assert.ok(providerTool.name.length <= 64, model);
+    assert.notEqual(providerTool.name, longName, model);
+    assert.deepEqual(
+      outgoing.tool_choice,
+      { type: "function", name: providerTool.name },
+      model,
+    );
+  }
+});
+
 test("bounded routes preserve one alias for pre-flattened MCP definitions and history", async () => {
   const namespace = "mcp__neon__apm__production__snapshot__read_only";
   const name = "get_monitor_snapshot_with_complete_context";
@@ -1834,6 +1884,56 @@ test("routed tool_search history declares discovered tools and restores their ca
       call_id: "delete-1",
       arguments: '{"id":"evt-1"}',
     });
+  }
+});
+
+// Codex dispatches by the native identity whichever upstream answers, so a
+// route that forwards the flat declarations unchanged must still restore the
+// call. Without turn metadata nothing identifies an MCP tool, and the flat
+// name stays exactly as the provider returned it.
+test("Responses-native routes preserve pre-flattened tools and restore call identities", async () => {
+  for (const [stream, metadata] of [[true, true], [false, true], [true, false], [false, false]]) {
+    const payload = preflattenedCommandCodeMcpPayload(stream, "meta/muse-spark-1.2");
+    if (!metadata) delete payload.client_metadata;
+    const name = payload.tools[0].name;
+    const prior = { type: "function_call", name, call_id: "call_prior", arguments: "{}" };
+    payload.input = [
+      { type: "message", role: "user", content: "Call the monitor snapshot tool again." },
+      prior,
+      { type: "function_call_output", call_id: prior.call_id, output: "{}" },
+    ];
+    payload.tool_choice = { type: "function", name };
+    const call = { ...prior, call_id: "call_flat_response" };
+    const result = await scenario(stream, {
+      model: payload.model,
+      requestPayload: () => payload,
+      sseBody: () => [
+        sseEvent({ type: "response.output_item.done", item: call }),
+        sseEvent({ type: "response.completed" }),
+        "data: [DONE]\n\n",
+      ].join(""),
+      jsonBody: () => ({ id: "resp_flat_json", output: [call] }),
+    });
+    assert.equal(result.gatewayBodies.length, 1);
+    const outgoing = result.gatewayBodies[0];
+    assert.equal(outgoing.model, "meta-muse-spark-1-2");
+    assert.equal(
+      JSON.stringify(outgoing.tools),
+      JSON.stringify(payload.tools),
+      "do not synthesize namespace declarations",
+    );
+    assert.equal(JSON.stringify(outgoing.input), JSON.stringify(payload.input));
+    assert.equal(outgoing.tool_choice, "auto", "retain Meta's existing tool-choice policy");
+    const returned = stream
+      ? functionCallsFromSse(result.clientBody).get(call.call_id)
+      : JSON.parse(result.clientBody).output[0];
+    assert.deepEqual(
+      returned,
+      metadata
+        ? { ...call, namespace: "mcp__apmneonsnapshotro", name: "get_monitor_snapshot" }
+        : call,
+      metadata ? "restore the identity Codex dispatches by" : "never infer from a name prefix",
+    );
   }
 });
 
@@ -2304,4 +2404,399 @@ test("OpenCode Go compaction removes native tool history before the strict endpo
     outgoing.input.some((item) => item.call_id === "orphan-custom-output"),
     false,
   );
+});
+
+const GROK_V4A_GRAMMAR = [
+  "start: begin_patch hunk+ end_patch",
+  'begin_patch: "*** Begin Patch" LF',
+  'end_patch: "*** End Patch" LF?',
+  "",
+  "hunk: add_hunk | delete_hunk | update_hunk",
+  'add_hunk: "*** Add File: " filename LF add_line+',
+  "%import common.LF",
+].join("\n");
+
+const GROK_PATCH_UNICODE = [
+  "*** Begin Patch",
+  '*** Add File: café "quotes".txt',
+  "+hello “unicode”",
+  "*** End Patch",
+].join("\n");
+
+function grokApplyPatchPayload(stream, model) {
+  return {
+    model,
+    stream,
+    input: [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "patch notes" }] },
+      {
+        type: "custom_tool_call",
+        id: "ctc_history",
+        call_id: "call_history",
+        name: APPLY_PATCH_TOOL_NAME,
+        input: "*** Begin Patch\n*** Add File: seed.txt\n+before\n*** End Patch",
+      },
+      { type: "custom_tool_call_output", call_id: "call_history", output: "Done!" },
+    ],
+    tools: [
+      {
+        type: "custom",
+        name: APPLY_PATCH_TOOL_NAME,
+        description: "Apply a patch.",
+        format: { type: "grammar", syntax: "lark", definition: GROK_V4A_GRAMMAR },
+      },
+      {
+        type: "function",
+        name: APPLY_PATCH_TOOL_NAME,
+        description: "ordinary same-name function",
+        parameters: { type: "object", properties: { path: { type: "string" } } },
+      },
+      { type: "custom", name: "future_custom", description: "leave me" },
+    ],
+  };
+}
+
+function grokApplyPatchSseBody() {
+  return [
+    sseEvent({
+      type: "response.output_item.added",
+      item: {
+        type: "custom_tool_call",
+        id: "ctc_unicode",
+        call_id: "call_unicode",
+        name: APPLY_PATCH_TOOL_NAME,
+        input: "",
+      },
+    }),
+    sseEvent({
+      type: "response.custom_tool_call_input.delta",
+      item_id: "ctc_unicode",
+      delta: GROK_PATCH_UNICODE,
+    }),
+    sseEvent({
+      type: "response.output_item.done",
+      item: {
+        type: "custom_tool_call",
+        id: "ctc_unicode",
+        call_id: "call_unicode",
+        name: APPLY_PATCH_TOOL_NAME,
+        input: GROK_PATCH_UNICODE,
+      },
+    }),
+    sseEvent({ type: "response.completed" }),
+    "data: [DONE]\n\n",
+  ].join("");
+}
+
+test("Grok 4.6 OAuth annotates native custom apply_patch and leaves history, collisions, and other models alone", async () => {
+  const guided = await scenario(true, {
+    model: "grok-oauth/grok-4.6",
+    requestPayload: grokApplyPatchPayload,
+    sseBody: grokApplyPatchSseBody,
+  });
+  const outgoing = guided.gatewayBodies[0];
+  const custom = outgoing.tools.find((tool) => tool.type === "custom" && tool.name === APPLY_PATCH_TOOL_NAME);
+  const ordinary = outgoing.tools.find((tool) => tool.type === "function" && tool.name === APPLY_PATCH_TOOL_NAME);
+  const otherCustom = outgoing.tools.find((tool) => tool.type === "custom" && tool.name === "future_custom");
+  assert.ok(custom, "native custom apply_patch still reaches LiteLLM as a custom tool");
+  assert.equal(custom.description.startsWith("Apply a patch."), true);
+  assert.equal(custom.description.includes(GROK_APPLY_PATCH_GUIDANCE_MARKER), true);
+  assert.equal(custom.description.includes(GROK_APPLY_PATCH_CREATE_EXAMPLE), true);
+  assert.equal(custom.description.includes(GROK_APPLY_PATCH_UPDATE_EXAMPLE), true);
+  assert.doesNotMatch(custom.description, /```/);
+  assert.deepEqual(custom.format, {
+    type: "grammar",
+    syntax: "lark",
+    definition: GROK_V4A_GRAMMAR,
+  });
+  assert.deepEqual(ordinary.description, "ordinary same-name function");
+  assert.equal(ordinary.description.includes(GROK_APPLY_PATCH_GUIDANCE_MARKER), false);
+  assert.deepEqual(otherCustom.description, "leave me");
+  const history = outgoing.input.find((item) => item.call_id === "call_history");
+  assert.equal(history.type, "custom_tool_call");
+  assert.equal(history.id, "ctc_history");
+  assert.equal(history.name, APPLY_PATCH_TOOL_NAME);
+  assert.equal(history.input, "*** Begin Patch\n*** Add File: seed.txt\n+before\n*** End Patch");
+  const restoredByCallId = new Map();
+  for (const item of responseItemsFromSse(guided.clientBody)) {
+    if (item?.call_id) restoredByCallId.set(item.call_id, item);
+  }
+  const restored = restoredByCallId.get("call_unicode");
+  assert.equal(restored.type, "custom_tool_call");
+  assert.equal(restored.id, "ctc_unicode");
+  assert.equal(restored.input, GROK_PATCH_UNICODE);
+
+  const unguided = await scenario(true, {
+    model: "grok-oauth/grok-4.5",
+    requestPayload: grokApplyPatchPayload,
+    sseBody: grokApplyPatchSseBody,
+  });
+  const control = unguided.gatewayBodies[0].tools.find(
+    (tool) => tool.type === "custom" && tool.name === APPLY_PATCH_TOOL_NAME,
+  );
+  assert.equal(control.description, "Apply a patch.");
+  assert.deepEqual(control.format, {
+    type: "grammar",
+    syntax: "lark",
+    definition: GROK_V4A_GRAMMAR,
+  });
+  assert.equal(control.description.includes(GROK_APPLY_PATCH_GUIDANCE_MARKER), false);
+});
+
+const STRUCTURED_OPERATIONS = {
+  operations: [{ op: "add", path: 'café "quotes".txt', lines: ["hello “unicode”"] }],
+};
+function structuredPatchCall(body) {
+  const tool = body.tools.find((tool) => tool.parameters?.properties?.operations);
+  assert.ok(tool, "the Router must declare the structured tool to the gateway");
+  return {
+    type: "function_call", id: "fc_structured", call_id: "call_structured",
+    name: tool.name, arguments: JSON.stringify(STRUCTURED_OPERATIONS),
+  };
+}
+function structuredPatchSse(body) {
+  const call = structuredPatchCall(body);
+  return [
+    sseEvent({ type: "response.output_item.added", output_index: 0, item: { ...call, arguments: "" } }),
+    sseEvent({ type: "response.function_call_arguments.delta", item_id: call.id, output_index: 0, delta: call.arguments }),
+    sseEvent({ type: "response.function_call_arguments.done", item_id: call.id, output_index: 0, arguments: call.arguments }),
+    sseEvent({ type: "response.output_item.done", output_index: 0, item: call }),
+    sseEvent({ type: "response.completed", response: { output: [call] } }),
+    "data: [DONE]\n\n",
+  ].join("");
+}
+
+test("Grok structured patch opt-in crosses the real Router with collision, choice and historical identity intact", async () => {
+  for (const stream of [true, false]) {
+    const result = await scenario(stream, {
+      model: "grok-oauth/grok-4.6",
+      routerEnv: { CODEX_ROUTER_GROK_STRUCTURED_PATCH: "1" },
+      requestPayload: (stream, model) => ({ ...grokApplyPatchPayload(stream, model), tool_choice: { type: "custom", name: "apply_patch" } }),
+      sseBody: structuredPatchSse,
+      jsonBody: (body) => ({ id: "response_structured", output: [structuredPatchCall(body)] }),
+    });
+    assert.equal(result.gatewayBodies.length, 1, "one request, no hidden model retry");
+    const outgoing = result.gatewayBodies[0];
+    const tool = outgoing.tools.find((tool) => tool.parameters?.properties?.operations);
+    assert.deepEqual(tool.parameters, GROK_STRUCTURED_PATCH_CODEC.parameters);
+    assert.notEqual(tool.name, "apply_patch", "ordinary same-name function keeps its name");
+    assert.equal(outgoing.tools.find((tool) => tool.name === "apply_patch").description, "ordinary same-name function");
+    assert.deepEqual(outgoing.tools.find((tool) => tool.name === "future_custom"), { type: "custom", name: "future_custom", description: "leave me" });
+    assert.deepEqual(outgoing.tool_choice, { type: "function", name: tool.name });
+    const old = outgoing.input.find((item) => item.call_id === "call_history");
+    assert.equal(old.name, tool.name);
+    assert.equal(old.id, "ctc_history");
+    assert.equal(JSON.parse(old.arguments).input, grokApplyPatchPayload(stream, outgoing.model).input[1].input);
+    assert.deepEqual(outgoing.input.find((item) => item.type === "function_call_output"), { type: "function_call_output", call_id: "call_history", output: "Done!" });
+    const items = stream ? responseItemsFromSse(result.clientBody) : JSON.parse(result.clientBody).output;
+    const restored = items.filter((item) => item.call_id === "call_structured").at(-1);
+    assert.deepEqual(restored, { type: "custom_tool_call", id: "fc_structured", call_id: "call_structured", name: "apply_patch", input: serializeStructuredPatch(STRUCTURED_OPERATIONS) });
+    assert.equal(result.clientBody.includes('"operations"'), false);
+  }
+});
+
+test("the enabled flag leaves another route and undeclared native patch requests unchanged", async () => {
+  const control = await scenario(true, {
+    model: "grok-oauth/grok-4.5",
+    routerEnv: { CODEX_ROUTER_GROK_STRUCTURED_PATCH: "1" },
+    requestPayload: grokApplyPatchPayload,
+    sseBody: grokApplyPatchSseBody,
+  });
+  const disabled = await scenario(true, {
+    model: "grok-oauth/grok-4.5",
+    routerEnv: { CODEX_ROUTER_GROK_STRUCTURED_PATCH: "0" },
+    requestPayload: grokApplyPatchPayload,
+    sseBody: grokApplyPatchSseBody,
+  });
+  assert.deepEqual(control.gatewayBodies, disabled.gatewayBodies);
+  assert.equal(control.clientBody, disabled.clientBody);
+  const undeclared = await scenario(false, {
+    model: "grok-oauth/grok-4.6",
+    routerEnv: { CODEX_ROUTER_GROK_STRUCTURED_PATCH: "1" },
+    requestPayload: (stream, model) => {
+      const payload = grokApplyPatchPayload(stream, model);
+      payload.tools = payload.tools.filter((tool) => tool.type !== "custom" || tool.name !== "apply_patch");
+      return payload;
+    },
+    jsonBody: () => ({ id: "response_no_patch", output: [{ type: "message", content: [{ type: "output_text", text: "ok" }] }] }),
+  });
+  assert.equal(undeclared.gatewayBodies[0].tools.some((tool) => tool.parameters?.properties?.operations), false);
+  assert.equal(undeclared.gatewayBodies[0].input.find((item) => item.call_id === "call_history").type, "custom_tool_call");
+});
+
+test("negotiated hook crosses real Router with exact raw history and native framing", async () => {
+  for (const stream of [false, true]) {
+    const raw = ' \n{"operations":[],"number":1.0,"escaped":"\\u0061","unicode":"🧙"}\n';
+    const result = await scenario(stream, {
+      model: "grok-oauth/grok-4.6",
+      routerEnv: { CODEX_ROUTER_GROK_PATCH_HOOK: "1" },
+      requestHeaders: { [GROK_PATCH_HOOK_HEADER]: GROK_PATCH_HOOK_CAPABILITY },
+      requestPayload: (stream, model) => {
+        const payload = grokApplyPatchPayload(stream, model);
+        payload.input[1].input = GROK_PATCH_HOOK_PREFIX + raw;
+        payload.input[2].output = "Native hook denied invalid arguments";
+        payload.tool_choice = { type: "custom", name: "apply_patch" };
+        return payload;
+      },
+      jsonBody: body => ({ output: [{ ...structuredPatchCall(body), arguments: raw }] }),
+      sseBody: body => {
+        const call = { ...structuredPatchCall(body), arguments: raw };
+        return sseEvent({ type: "response.output_item.done", item: call }) + sseEvent({ type: "response.completed", response: { output: [call] } });
+      },
+    });
+    assert.equal(result.gatewayBodies.length, 1);
+    assert.equal(result.gatewayHeaders[0][GROK_PATCH_HOOK_HEADER], undefined, "client capability must not leak to provider");
+    const outgoing = result.gatewayBodies[0];
+    const declared = outgoing.tools.find(t => t.parameters?.properties?.operations);
+    assert.ok(declared);
+    assert.notEqual(declared.name, "apply_patch");
+    assert.equal(outgoing.input.find(i => i.call_id === "call_history").arguments, raw);
+    assert.deepEqual(outgoing.tool_choice, { type: "function", name: declared.name });
+    assert.deepEqual(outgoing.input.find(i => i.type === "function_call_output"), { type: "function_call_output", call_id: "call_history", output: "Native hook denied invalid arguments" });
+    const items = stream ? responseItemsFromSse(result.clientBody) : JSON.parse(result.clientBody).output;
+    assert.deepEqual(items.filter(i => i.call_id === "call_structured").at(-1), { type: "custom_tool_call", id: "fc_structured", call_id: "call_structured", name: "apply_patch", input: GROK_PATCH_HOOK_PREFIX + raw });
+  }
+});
+
+test("real Router requires both hook opt-ins and exact model, without affecting v2", async () => {
+  for (const [model, flag, declaration, old] of [
+    ["grok-oauth/grok-4.6", "1", undefined, false],
+    ["grok-oauth/grok-4.6", "0", GROK_PATCH_HOOK_CAPABILITY, false],
+    ["grok-oauth/grok-4.6", "1", "structured-patch-v2", false],
+    ["grok-oauth/grok-4.5", "1", GROK_PATCH_HOOK_CAPABILITY, false],
+    ["grok-oauth/grok-4.6", "1", undefined, true],
+  ]) {
+    const result = await scenario(false, {
+      model, routerEnv: { CODEX_ROUTER_GROK_PATCH_HOOK: flag, CODEX_ROUTER_GROK_STRUCTURED_PATCH: old ? "1" : "0" },
+      requestHeaders: declaration ? { [GROK_PATCH_HOOK_HEADER]: declaration } : {},
+      requestPayload: grokApplyPatchPayload,
+      jsonBody: body => ({ output: old ? [structuredPatchCall(body)] : [] }),
+    });
+    assert.equal(result.gatewayBodies[0].tools.some(t => t.parameters?.properties?.operations), old);
+    if (old) assert.equal(JSON.parse(result.clientBody).output[0].input, serializeStructuredPatch(STRUCTURED_OPERATIONS));
+  }
+});
+
+test("routed turns label assistant messages the way native turns do", async () => {
+  const assistantMessage = (id, text) => ({
+    id,
+    type: "message",
+    role: "assistant",
+    status: "completed",
+    content: [{ type: "output_text", text, annotations: [] }],
+  });
+  const messageEvents = (index, item) => [
+    sseEvent({ type: "response.output_item.added", output_index: index, item: { ...item, content: [] } }),
+    sseEvent({ type: "response.output_text.delta", output_index: index, item_id: item.id, delta: item.content[0].text }),
+    sseEvent({ type: "response.output_item.done", output_index: index, item }),
+  ];
+  const lastMessage = (body, id) =>
+    responseItemsFromSse(body).filter((item) => item.type === "message" && item.id === id).at(-1);
+
+  const toolTurn = await scenario(true, {
+    model: "opencode-go/deepseek-v4.1-flash",
+    sseBody: () => [
+      sseEvent({ type: "response.created", response: { id: "resp_note" } }),
+      ...messageEvents(0, assistantMessage("msg_note", "Checking the config.")),
+      sseEvent({
+        type: "response.output_item.added",
+        output_index: 1,
+        item: { type: "function_call", name: "exec_command", call_id: "call_exec", arguments: "" },
+      }),
+      sseEvent({
+        type: "response.output_item.done",
+        output_index: 1,
+        item: { type: "function_call", name: "exec_command", call_id: "call_exec", arguments: "{}" },
+      }),
+      sseEvent({ type: "response.completed", response: { id: "resp_note", output: [] } }),
+      "data: [DONE]\n\n",
+    ].join(""),
+  });
+  assert.equal(lastMessage(toolTurn.clientBody, "msg_note").phase, "commentary");
+  assert.equal(functionCallsFromSse(toolTurn.clientBody).get("call_exec").phase, undefined);
+
+  const answerTurn = await scenario(true, {
+    model: "opencode-go/deepseek-v4.1-flash",
+    sseBody: () => [
+      sseEvent({ type: "response.created", response: { id: "resp_answer" } }),
+      ...messageEvents(0, assistantMessage("msg_answer", "Done.")),
+      sseEvent({ type: "response.completed", response: { id: "resp_answer", output: [] } }),
+      "data: [DONE]\n\n",
+    ].join(""),
+  });
+  assert.equal(lastMessage(answerTurn.clientBody, "msg_answer").phase, "final_answer");
+});
+
+test("routed native apply_patch relays LiteLLM arguments that are not a leading content wrapper", async () => {
+  const patch = "*** Begin Patch\n*** Update File: src/a.js\n@@\n-const a = 1;\n+const re = /\\d+/;\n*** End Patch";
+  // What pinned LiteLLM 1.96 emits when the provider's arguments are not a
+  // leading {"content": ...} wrapper: legacy argument events carry the
+  // provider text verbatim, and the completed custom_tool_call carries
+  // unwrap_custom_tool_arguments() of it.
+  const calls = [
+    { id: "call_input_key", arguments: JSON.stringify({ input: patch }), input: JSON.stringify({ input: patch }) },
+    { id: "call_content_second", arguments: JSON.stringify({ path: "src/a.js", content: patch }), input: patch },
+  ];
+  const sseBody = () => [
+    sseEvent({ type: "response.created", response: { id: "resp_litellm_custom" } }),
+    ...calls.flatMap((call, index) => [
+      sseEvent({
+        type: "response.output_item.added",
+        output_index: index,
+        item: { type: "custom_tool_call", id: call.id, call_id: call.id, name: "apply_patch", input: "", status: "in_progress" },
+      }),
+      ...call.arguments.match(/[\s\S]{1,10}/g).map((delta) => sseEvent({
+        type: "response.function_call_arguments.delta",
+        output_index: index,
+        item_id: call.id,
+        delta,
+      })),
+      sseEvent({
+        type: "response.function_call_arguments.done",
+        output_index: index,
+        item_id: call.id,
+        arguments: call.arguments,
+      }),
+      sseEvent({
+        type: "response.output_item.done",
+        output_index: index,
+        item: { type: "custom_tool_call", id: call.id, call_id: call.id, name: "apply_patch", input: call.input, status: "completed" },
+      }),
+    ]),
+    sseEvent({ type: "response.completed", response: { id: "resp_litellm_custom", output: [] } }),
+    "data: [DONE]\n\n",
+  ].join("");
+  const result = await scenario(true, {
+    model: "opencode-go/deepseek-v4.1-flash",
+    requestPayload: (stream, model) => ({
+      model,
+      stream,
+      input: "Apply the patch.",
+      tools: [{
+        type: "custom",
+        name: "apply_patch",
+        description: "Apply a patch.",
+        format: { type: "grammar", syntax: "lark", definition: "start: /[\\s\\S]+/" },
+      }],
+    }),
+    sseBody,
+  });
+  assert.ok(
+    result.gatewayBodies[0].tools.some((tool) => tool.type === "custom" && tool.name === "apply_patch"),
+    "native apply_patch still reaches LiteLLM as a custom tool",
+  );
+  const events = result.clientBody.split(/\r?\n/)
+    .filter((line) => line.startsWith("data: {"))
+    .map((line) => JSON.parse(line.slice(6)));
+  assert.equal(events.some((event) => event.type === "error" || event.type === "response.failed"), false);
+  assert.ok(events.some((event) => event.type === "response.completed"), "the turn completes instead of aborting");
+  for (const call of calls) {
+    const inputDone = events.find((event) =>
+      event.type === "response.custom_tool_call_input.done" && event.item_id === call.id);
+    assert.equal(inputDone?.input, call.input, `${call.id} input.done`);
+    const closed = events.find((event) =>
+      event.type === "response.output_item.done" && event.item?.call_id === call.id);
+    assert.equal(closed.item.type, "custom_tool_call");
+    assert.equal(closed.item.input, call.input, `${call.id} item input`);
+  }
 });

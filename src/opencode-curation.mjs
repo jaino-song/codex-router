@@ -161,51 +161,6 @@ const OPENCODE_FREE_MODELS = Object.freeze({
 });
 
 const CURATION_ROUTES = Object.freeze({
-  "chatgpt-web": Object.freeze({
-    providers: Object.freeze(["chatgpt-web"]),
-    protocols: Object.freeze(["Responses"]),
-    messagesModels: Object.freeze([]),
-    responsesModels: Object.freeze([]),
-    primaryModels: Object.freeze([
-      "chatgpt-web/luna",
-      "chatgpt-web/think",
-      "chatgpt-web/light",
-      "chatgpt-web/medium",
-      "chatgpt-web/high",
-      "chatgpt-web/extra-high",
-      "chatgpt-web/pro",
-    ]),
-    models: Object.freeze({
-      "chatgpt-web/luna": Object.freeze({
-        reasoningLevels: Object.freeze(["low"]),
-        summary: "ChatGPT Web Luna through the account-bound local browser bridge.",
-      }),
-      "chatgpt-web/think": Object.freeze({
-        reasoningLevels: Object.freeze(["low"]),
-        summary: "ChatGPT Web Think through the account-bound local browser bridge.",
-      }),
-      "chatgpt-web/light": Object.freeze({
-        reasoningLevels: Object.freeze(["low"]),
-        summary: "ChatGPT Web Instant through the account-bound local browser bridge.",
-      }),
-      "chatgpt-web/medium": Object.freeze({
-        reasoningLevels: Object.freeze(["medium"]),
-        summary: "ChatGPT Web Medium through the account-bound local browser bridge.",
-      }),
-      "chatgpt-web/high": Object.freeze({
-        reasoningLevels: Object.freeze(["high"]),
-        summary: "ChatGPT Web High through the account-bound local browser bridge.",
-      }),
-      "chatgpt-web/extra-high": Object.freeze({
-        reasoningLevels: Object.freeze(["xhigh"]),
-        summary: "ChatGPT Web Extra High through the account-bound local browser bridge.",
-      }),
-      "chatgpt-web/pro": Object.freeze({
-        reasoningLevels: Object.freeze(["ultra"]),
-        summary: "ChatGPT Web Pro through the account-bound local browser bridge.",
-      }),
-    }),
-  }),
   "commandcode": Object.freeze({
     providers: Object.freeze(["commandcode", "commandcode-messages"]),
     protocols: Object.freeze(["Chat", "Messages"]),
@@ -230,6 +185,7 @@ const CURATION_ROUTES = Object.freeze({
       "Qwen/Qwen3.8-Max-0902",
       "deepseek/deepseek-v4-flash",
       "deepseek/deepseek-v4-pro",
+      "deepseek/deepseek-v4.1-flash",
       "google/gemini-3.5-flash",
       "google/gemini-3.7-flash",
       "google/gemini-3.8-flash",
@@ -238,6 +194,8 @@ const CURATION_ROUTES = Object.freeze({
       "gpt-5.6-sol",
       "gpt-5.6-terra",
       "meta/muse-spark-1.2",
+      "meta/muse-spark-1.3",
+      "meta/muse-spark-1.3-contributor",
       "moonshotai/Kimi-K2.7-Code",
       "moonshotai/Kimi-K2.7-Code-Highspeed",
       "moonshotai/Kimi-K3",
@@ -290,6 +248,7 @@ const CURATION_ROUTES = Object.freeze({
       "deepseek-v4-flash",
       "deepseek-v4-flash-vision-exp",
       "deepseek-v4-pro",
+      "deepseek-v4.1-flash",
       "glm-5",
       "glm-5.1",
       "glm-5.2",

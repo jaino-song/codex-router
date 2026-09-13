@@ -372,7 +372,10 @@ async function startBarrierOwningTree({ mode, rollbackMs, barrierMs, depth = 0 }
       CODEX_ROUTER_OWNER_SIGNAL_BUDGET_MS: "1500",
     },
   });
-  await waitForFile(readyPath);
+  // Bootstrap is outside the measured signal/rollback contract below. A
+  // nested fixture needs the same startup allowance as the depth tests when
+  // the full suite is spawning workers; retain the actual shutdown budgets.
+  await waitForFile(readyPath, 5_000);
   return {
     directory,
     readyPath,

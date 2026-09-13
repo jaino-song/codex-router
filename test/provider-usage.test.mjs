@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { aggregateProviderUsage } from "../src/provider-usage.mjs";
+import { aggregateProviderUsage, tokensGeneratedAfterFirstToken } from "../src/provider-usage.mjs";
 
 test("protocol variants never appear as separate usage providers", () => {
   const snapshot = aggregateProviderUsage([], { now: Date.parse("2026-07-21T18:00:00Z") });
@@ -170,13 +170,10 @@ test("reports a rolling 24-hour window separately from calendar-day buckets", ()
 });
 
 test("publishes prefix-cache telemetry for the dashboard without inflating it", () => {
-  const localDateKey = (value) => {
-    const date = new Date(value);
-    const year = date.getFullYear();
-    const month = String(date.getMonth() + 1).padStart(2, "0");
-    const day = String(date.getDate()).padStart(2, "0");
-    return `${year}-${month}-${day}`;
-  };
+  // Buckets are keyed by UTC calendar day, the same day space OpenAI's account
+  // stream uses, so a chart can merge the two without misattributing a bar by
+  // the machine's offset from UTC.
+  const utcDateKey = (value) => new Date(value).toISOString().slice(0, 10);
   const now = Date.parse("2026-07-21T18:00:00Z");
   const snapshot = aggregateProviderUsage(
     [
@@ -215,8 +212,8 @@ test("publishes prefix-cache telemetry for the dashboard without inflating it", 
     // request exactly one day earlier is still part of the window.
     last24hCachedInputTokens: 130,
     dailyCachedInputTokens: [
-      { startDate: localDateKey("2026-07-20T18:00:00Z"), cachedInputTokens: 80 },
-      { startDate: localDateKey("2026-07-21T17:00:00Z"), cachedInputTokens: 50 },
+      { startDate: utcDateKey("2026-07-20T18:00:00Z"), cachedInputTokens: 80 },
+      { startDate: utcDateKey("2026-07-21T17:00:00Z"), cachedInputTokens: 50 },
     ],
   });
   const deepseek = snapshot.providers.find((provider) => provider.id === "deepseek");
@@ -227,8 +224,8 @@ test("publishes prefix-cache telemetry for the dashboard without inflating it", 
   assert.equal(deepseek.last24hCachedInputTokens, 130);
   assert.equal(deepseek.regularInputTokens + deepseek.cachedInputTokens, deepseek.inputTokens);
   assert.deepEqual(deepseek.dailyUsageBuckets, [
-    { startDate: localDateKey("2026-07-20T18:00:00Z"), tokens: 100, requests: 1, inputTokens: 100, cachedInputTokens: 80, outputTokens: 0 },
-    { startDate: localDateKey("2026-07-21T17:00:00Z"), tokens: 50, requests: 2, inputTokens: 50, cachedInputTokens: 50, outputTokens: 0 },
+    { startDate: utcDateKey("2026-07-20T18:00:00Z"), tokens: 100, requests: 1, inputTokens: 100, cachedInputTokens: 80, outputTokens: 0 },
+    { startDate: utcDateKey("2026-07-21T17:00:00Z"), tokens: 50, requests: 2, inputTokens: 50, cachedInputTokens: 50, outputTokens: 0 },
   ]);
 });
 
@@ -423,51 +420,49 @@ test("uses only the latest 20 clean generation timings for observed speed", () =
   assert.equal(model.observedTokensPerSecond, 50);
 });
 
-test("excludes reasoning tokens from speed numerator while keeping totals", () => {
+test("tok/s counts reasoning tokens exactly when they were generated inside the timed window", () => {
   const now = Date.parse("2026-07-21T18:00:00Z");
-  // Two events: same duration/firstToken/output, but one has reasoning tokens.
+  // Every event: 4 s total, first token at 1 s, so a 3 s generation window.
+  const base = (model, extra) => ({
+    meteringVersion: 1,
+    at: new Date(now).toISOString(),
+    provider: "opencode-go",
+    model,
+    status: 200,
+    durationMs: 4_000,
+    firstTokenMs: 1_000,
+    ...extra,
+  });
   const events = [
-    {
-      meteringVersion: 1,
-      at: new Date(now - 60_000).toISOString(),
-      provider: "opencode-go",
-      model: "opencode-go/glm-5.3-flash",
-      status: 200,
-      durationMs: 4_000,
-      firstTokenMs: 1_000,
-      outputTokens: 404,
-      totalTokens: 504,
-    },
-    {
-      meteringVersion: 1,
-      at: new Date(now).toISOString(),
-      provider: "opencode-go",
-      model: "opencode-go/glm-5.3-flash",
-      status: 200,
-      durationMs: 4_000,
-      firstTokenMs: 1_000,
-      outputTokens: 502,
-      reasoningTokens: 98,
-      totalTokens: 602,
-    },
+    // Reasoning deltas were relayed: the clock started on them, so the 98
+    // reasoning tokens were produced inside the window and stay in the count.
+    base("opencode-go/streamed", { outputTokens: 502, reasoningTokens: 98, totalTokens: 602, reasoningStreamed: true }),
+    // No reasoning delta was relayed: the model thought in silence before the
+    // first visible token, so those 98 tokens belong to TTFT, not the rate.
+    base("opencode-go/silent", { outputTokens: 502, reasoningTokens: 98, totalTokens: 602, reasoningStreamed: false }),
+    // Rows written before the marker existed use the inclusive count.
+    base("opencode-go/legacy", { outputTokens: 502, reasoningTokens: 98, totalTokens: 602 }),
+    // A reasoning count above the output count proves the provider reports
+    // visible tokens only; the inclusive total is rebuilt before deciding.
+    base("opencode-go/exclusive-streamed", { outputTokens: 150, reasoningTokens: 499, totalTokens: 150, reasoningStreamed: true }),
+    base("opencode-go/exclusive-silent", { outputTokens: 150, reasoningTokens: 499, totalTokens: 150, reasoningStreamed: false }),
   ];
   const snapshot = aggregateProviderUsage(events, { days: 7, now });
-  const model = snapshot.providers
-    .find((provider) => provider.id === "opencode-go")
-    .models[0];
-  
-  // Provider totals still count full output (404 + 502 = 906).
-  assert.equal(
-    snapshot.providers.find((provider) => provider.id === "opencode-go").outputTokens,
-    906,
-  );
-  // Model totals also count full output.
-  assert.equal(model.outputTokens, 906);
-  // But speed uses non-reasoning output: (404 + (502-98)) / 2 = 404 tok per 3s = 134.7 tok/s.
-  // First event: 404 tok / 3000 ms = 134.7 tok/s.
-  // Second event: (502-98) tok / 3000 ms = 404 tok / 3000 ms = 134.7 tok/s.
-  // Median of [134.7, 134.7] = 134.7.
-  assert.equal(model.observedTokensPerSecond, 134.7);
+  const provider = snapshot.providers.find((candidate) => candidate.id === "opencode-go");
+  const rate = (slug) => provider.models.find((model) => model.slug === slug).observedTokensPerSecond;
+  assert.equal(rate("opencode-go/streamed"), 167.3); // 502 / 3 s
+  assert.equal(rate("opencode-go/silent"), 134.7); // (502 - 98) / 3 s
+  assert.equal(rate("opencode-go/legacy"), 167.3); // 502 / 3 s
+  assert.equal(rate("opencode-go/exclusive-streamed"), 216.3); // (150 + 499) / 3 s
+  assert.equal(rate("opencode-go/exclusive-silent"), 50); // 150 / 3 s
+  // Provider totals still count the reported output, not the speed numerator.
+  assert.equal(provider.outputTokens, 502 * 3 + 150 * 2);
+});
+
+test("tokensGeneratedAfterFirstToken treats a missing reasoning count as zero", () => {
+  assert.equal(tokensGeneratedAfterFirstToken({}, 40), 40);
+  assert.equal(tokensGeneratedAfterFirstToken({ reasoningStreamed: false }, 40), 40);
+  assert.equal(tokensGeneratedAfterFirstToken({ reasoningTokens: 0, reasoningStreamed: false }, 40), 40);
 });
 
 test("accepts a response that starts within the first measured millisecond", () => {

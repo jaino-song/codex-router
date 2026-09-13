@@ -703,6 +703,139 @@ test("resolves held lifecycles before failure terminals", async () => {
   ]);
 });
 
+const GATEWAY_ERROR = {
+  error: {
+    message: "list index out of range; private upstream payload",
+    type: "None", param: "None", code: "500",
+    stack: "private gateway stack",
+  },
+};
+
+function pendingGatewayMessage(newline = "\n", { reasoning = true } = {}) {
+  return [
+    block({ type: "response.created", sequence_number: 0, response: { id: "resp_gateway_error", status: "in_progress", output: [] } }, newline),
+    block({ type: "response.output_item.added", sequence_number: 1, output_index: 0, item: { id: "msg_gateway_error", type: "message", role: "assistant", status: "in_progress", content: [] } }, newline),
+    block({ type: "response.content_part.added", sequence_number: 2, item_id: "msg_gateway_error", output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } }, newline),
+    ...(reasoning ? [block({ type: "response.reasoning_summary_text.delta", sequence_number: 3, item_id: "rs_gateway_error", output_index: 0, delta: "Проверка ещё идёт." }, newline)] : []),
+  ].join("");
+}
+
+function assertCanonicalGatewayError(raw, { reasoning = true } = {}) {
+  const output = events(raw);
+  const failures = output.filter((event) => event.type === "error");
+  assert.equal(failures.length, 1);
+  assert.equal(output.at(-1), failures[0]);
+  assert.equal(failures[0].code, "local_router_stream_failed");
+  assert.equal(failures[0].message, "The Grok gateway could not complete the upstream response stream.");
+  assert.equal(failures[0].param, null);
+  assert.match(raw, /event: error\r?\ndata:/u);
+  assert.doesNotMatch(raw, /private upstream payload|list index out of range|private gateway stack|msg_gateway_error|response.completed|\[DONE\]/u);
+  assert.equal(output.some((event) => event.item?.type === "message"), false);
+  const reasoningDone = output.filter((event) => event.type === "response.output_item.done");
+  assert.equal(reasoningDone.length, reasoning ? 1 : 0);
+  if (reasoning) {
+    assert.equal(reasoningDone[0].item.status, "incomplete");
+    assert.deepEqual(reasoningDone[0].item.summary, [{ type: "summary_text", text: "Проверка ещё идёт." }]);
+  }
+  return output;
+}
+
+test("normalizes fragmented Grok gateway error envelopes and drops every later frame", async () => {
+  for (const newline of ["\n", "\r\n"]) {
+    for (const chunkSize of [0, 1, 17]) {
+      const input = [
+        pendingGatewayMessage(newline),
+        block(GATEWAY_ERROR, newline),
+        block({ type: "response.output_text.done", item_id: "msg_gateway_error", output_index: 0, text: "" }, newline),
+        block({ type: "response.output_item.done", output_index: 0, item: { id: "msg_gateway_error", type: "message", status: "completed", content: [] } }, newline),
+        block({ type: "response.completed", response: { status: "completed", output: [] } }, newline),
+        block(GATEWAY_ERROR, newline),
+        `data: [DONE]${newline}${newline}`,
+        'data: {"unterminated":"pending gateway tail"}',
+      ].join("");
+      const raw = await transformed(input, chunkSize);
+      const output = assertCanonicalGatewayError(raw);
+      assert.deepEqual(output.map((event) => event.sequence_number), output.map((_event, index) => index));
+      if (newline === "\r\n") assert.equal(raw.replaceAll("\r\n", "").includes("\n"), false);
+    }
+  }
+});
+
+test("normalizes an unterminated gateway error and never flushes its pending message", async () => {
+  for (const newline of ["\n", "\r\n"]) {
+    for (const reasoning of [false, true]) {
+      const input = pendingGatewayMessage(newline, { reasoning })
+        + `event: message${newline}data: ${JSON.stringify(GATEWAY_ERROR)}`;
+      const raw = await transformed(input, 1);
+      assertCanonicalGatewayError(raw, { reasoning });
+      assert.ok(raw.endsWith(`${newline}${newline}`), "the canonical error must be a dispatchable SSE frame");
+    }
+  }
+});
+
+test("emits a gated gateway error before EOF and ignores later invalid or oversized bytes", async () => {
+  const stream = new GrokReasoningSummaryCompatTransform({ maxFrameBytes: 256, maxCommittedFrameBytes: 1024 });
+  let raw = "";
+  stream.setEncoding("utf8");
+  stream.on("data", (chunk) => { raw += chunk; });
+  const ended = once(stream, "end");
+  stream.write(pendingGatewayMessage());
+  assert.match(raw, /Проверка ещё идёт/u);
+  assert.doesNotMatch(raw, /event: error/u);
+  stream.write(`data: ${JSON.stringify(GATEWAY_ERROR)}\n`);
+  assert.doesNotMatch(raw, /event: error/u);
+  stream.write("\n");
+  assertCanonicalGatewayError(raw);
+  const terminal = raw;
+  stream.write(Buffer.from([0xff, 0xfe]));
+  stream.write("x".repeat(2048));
+  stream.end(block(GATEWAY_ERROR) + "data: [DONE]\n\n");
+  await ended;
+  assert.equal(raw, terminal);
+});
+
+test("does not mistake error-shaped prose, nested data, or typed events for gateway errors", async () => {
+  const input = [
+    block({ type: "response.output_text.delta", delta: JSON.stringify(GATEWAY_ERROR) }),
+    block({ type: "response.output_text.done", text: JSON.stringify(GATEWAY_ERROR), error: { code: "annotation" } }),
+    block({ content: GATEWAY_ERROR }),
+    block({ text: JSON.stringify(GATEWAY_ERROR) }),
+    block({ error: "plain text" }),
+    block({ error: null }),
+    block({ error: [GATEWAY_ERROR] }),
+    block([{ error: { code: "nested" } }]),
+    block({ type: null, error: { code: "not an untyped envelope" } }),
+    block({ type: "error", code: "already_canonical", message: "known error", param: null }),
+    block({ type: "response.failed", response: { status: "failed", error: { code: "typed_failure" } } }),
+    "data: [DONE]\n\n",
+  ].join("");
+  assert.equal(await transformed(input, 1), input);
+});
+
+test("gateway error recognition retains invalid UTF-8 and frame-limit safety", async () => {
+  const invalid = Buffer.concat([
+    Buffer.from('data: {"error":{"message":"'), Buffer.from([0xff]), Buffer.from('"}}\n\n'),
+  ]);
+  const stream = new GrokReasoningSummaryCompatTransform();
+  const chunks = [];
+  stream.on("data", (chunk) => chunks.push(chunk));
+  const ended = once(stream, "end");
+  const raw = Buffer.concat([invalid, Buffer.from(block(GATEWAY_ERROR))]);
+  stream.end(raw);
+  await ended;
+  assert.deepEqual(Buffer.concat(chunks), raw, "invalid pre-mutation UTF-8 must still disable repair without changing bytes");
+  await assert.rejects(
+    transformed(Buffer.concat([Buffer.from(pendingGatewayMessage()), invalid]), 1),
+    /failed after stream mutation: invalid UTF-8/u,
+  );
+  const oversized = block({ error: { message: "x".repeat(2048) } });
+  assert.equal(await transformed(oversized + block(GATEWAY_ERROR), 1, { maxFrameBytes: 256 }), oversized + block(GATEWAY_ERROR));
+  await assert.rejects(
+    transformed(pendingGatewayMessage() + oversized, 1, { maxFrameBytes: 256, maxCommittedFrameBytes: 1024 }),
+    /failed after stream mutation: SSE frame byte limit/u,
+  );
+});
+
 test("an oversized unterminated frame fails open without unbounded buffering", async () => {
   const input = `${block({ type: "response.output_item.added", output_index: 0, item: { id: "msg_limit", type: "message", role: "assistant", status: "in_progress", content: [] } })}data: ${"x".repeat(512)}`;
   assert.equal(await transformed(input, 1, { maxFrameBytes: 256 }), input);

@@ -1472,11 +1472,32 @@ export function selectedChatGPTUsageProfile({
   if (!selection || selection === AUTO || selection === LEGACY_PRIMARY) return { selection: selection || AUTO, home: undefined, pending: profile.pending };
   const account = pool.accounts[selection];
   if (!account || account.state !== "active") return { selection, home: undefined, pending: profile.pending };
+  const pending = profile.pending && profile.desired === selection;
+  // A pooled login profile is a copy of auth.json taken when the account was
+  // adopted, and only an actual switch re-syncs it -- syncAuthProfile() runs
+  // behind `target !== active`. A single-account install never switches, so its
+  // copy stays frozen while CODEX_HOME keeps rotating refresh tokens. Once the
+  // frozen refresh token is spent, every account read 401s, and the empty
+  // buckets that failure produces render as a legitimate-looking zero across
+  // the tray, the Usage page, and the desktop widget. The active selection's
+  // live credentials are the primary home, so read those instead of the copy.
+  // Reading the primary home is only correct while it actually holds the
+  // selected account. `codex login` writes CODEX_HOME directly, without going
+  // through the switch, so an active marker is a claim about this pool rather
+  // than proof about that file. Verify the identity before trusting it, and
+  // fall back to the account's own copy when it does not match -- reporting one
+  // account's usage under another's name is a worse failure than a stale read.
+  const boundAccountId = account.identity?.accountId;
+  const primaryHoldsSelection = Boolean(boundAccountId)
+    && authIdentity(primaryAuthPath(primaryHome))?.accountId === boundAccountId;
+  const home = profile.active === selection && !pending && primaryHoldsSelection
+    ? primaryHome
+    : path.dirname(chatGPTSubscriptionAccountAuthPath(selection, { homesDir }));
   return {
     selection,
-    home: path.dirname(chatGPTSubscriptionAccountAuthPath(selection, { homesDir })),
+    home,
     email: chatGPTSubscriptionAccountStatus(selection, { homesDir }).email,
-    pending: profile.pending && profile.desired === selection,
+    pending,
   };
 }
 

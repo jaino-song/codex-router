@@ -191,14 +191,7 @@ export function supportsImageInput(model) {
 }
 
 export function visionCapableModels(models) {
-  // A direct bridge is a visible, account-bound browser turn, not a generic
-  // caption backend. Its own selected route may still accept images, but it
-  // must never be recruited indirectly to read one for another provider.
-  return (Array.isArray(models) ? models : []).filter(
-    (model) =>
-      supportsImageInput(model) &&
-      PROVIDERS.get(String(model?.provider || ""))?.directResponses !== true,
-  );
+  return (Array.isArray(models) ? models : []).filter((model) => supportsImageInput(model));
 }
 
 function engineCostRank(model) {

@@ -59,7 +59,7 @@ user.
 4. Determine which provider IDs the user requested: `anthropic-api`,
     `kimi-oauth`, `antigravity-oauth`, `kimi-api`, `kimi-api-cn`, `deepseek`, `grok-oauth`, `grok-api`, `qwen-plan`,
     `zai-coding`, `ollama-cloud`, `minimax-token-plan`, `meta`, `clinepass`,
-    `venice`, `nousresearch`, `chatgpt-web`, and/or
+    `venice`, `nousresearch`, and/or
    `opencode-go`
    (shown to users as "opencode Go/Zen"; its `opencode-go-messages`,
    `opencode-go-responses`, and `opencode-zen` variants share its stored key
@@ -96,12 +96,6 @@ user.
    enabling it asks for nothing and curating it is unnecessary. All three must
    be selected explicitly; never select one on the user's behalf just because
    it can authenticate without a key.
-   `chatgpt-web` is also explicit and catalog-only, but local: it requires the
-   separately installed codex-chatgpt-web launcher, an in-launcher ChatGPT
-   sign-in, its browser smoke test, and `bin/curate-models chatgpt-web`. Never
-   run that launcher's Install models action, because Codex Router alone owns
-   `openai_base_url`; leave the launcher running as the loopback browser
-   sidecar. It is Codex-only and must not be published into DSH or Gemini.
    `kimi-api` and `kimi-api-cn` are two different Moonshot platforms, not a
    fallback pair: the global console at platform.moonshot.ai and the mainland
    one at platform.moonshot.cn have separate accounts, separate billing, and
@@ -731,6 +725,16 @@ and every client saw a bare "Connection error" naming nothing.
    contract. Keep the streamed-input fingerprint check and fail closed when the
    delta, terminal arguments, or output-item close disagree. The focused
    namespace-relay test and Z.ai router fixture hold both sides of this boundary.
+   The wrapper is a request, not a guarantee: models put `content` after another
+   key, answer `{ "input": ... }` or `{}`, or send raw patch text, and LiteLLM
+   relays those rather than rejecting them. For a native custom call the relay
+   therefore derives the input exactly as LiteLLM's
+   `unwrap_custom_tool_arguments` does -- a string `content` from a JSON
+   object, otherwise the arguments verbatim -- and never a stricter reading;
+   rejecting a shape LiteLLM accepted aborts a committed stream and Codex
+   retries the identical turn until it fails. A present non-string `content`
+   stays unsupported, and the delta check is skipped only when the decoder
+   emitted no input text for the client to contradict.
 11. **Do not answer a gateway crash by moving the litellm pin.** The pin is a
    security floor and a wheel-availability decision (see the lock section
    above), any change to it has to be proven by booting the proxy rather than by
@@ -1933,6 +1937,50 @@ cheap plans means speaking that route.
    and it is why the note stays on the registry entry now that the plan no
    longer blocks access outright.
 
+## DeepSeek Responses and Chat reasoning replay
+
+Only direct provider `deepseek` with upstream model `deepseek-flash` uses the
+existing API forwarder's native `/responses` route, including compaction.
+Legacy aliases and resellers retain Chat. LiteLLM 1.96's unknown-model fallback
+removes upstream streaming and synthesizes SSE; setting its protocol alone is
+insufficient. Keep credentials, transport, usage, cancellation and pre-byte
+retry rules on the shared path.
+
+- Replay native reasoning once as a `reasoning.content` array of `reasoning_text`
+  parts; convert legacy summaries there, never into visible messages. Preserve
+  typed image/tool outputs and `input_image.file_id`, without uploading files.
+- Convert recovered `agent_message` handoffs with `agentMessagesAsUserMessages`
+  on ordinary and compaction requests: task text in an unsupported item type
+  is not delivered. Flatten namespaces/deferred tools through the existing
+  adapters; retain native top-level `apply_patch` and bridge other custom tools.
+  Restore exact namespace/name identities, including plain-name collisions.
+- Codex can flatten native and MCP function/custom declarations before sending
+  them to a routed provider. Restore namespaces only for live, directly exposed
+  tools identified by the request's canonical turn metadata. Rewrite declarations
+  only on routes that flatten tools. Responses-native routes that skip
+  flattening send the client's declarations unchanged, but build their response
+  lookup from the restored inventory so a returned flat call still reaches Codex
+  under its `{namespace, name}` identity. Restore before app expansion and
+  normal flattening so client schemas, custom formats and collaboration model
+  constraints use the existing adapters. Never infer tools from name prefixes or
+  create declarations from metadata alone; ambiguous and ordinary-name
+  collisions remain unchanged.
+- GLM thinking, legacy DeepSeek thinking and Command Code's DeepSeek Flash Chat
+  route carry reasoning through LiteLLM as assistant `thinking` parts, restored
+  by the forwarder to `reasoning_content`. Remove only successfully carried
+  reasoning runs so plaintext cannot also become a user message. Do not mutate
+  source items or change other native Responses routes. Keep this policy shared
+  between hops without applying direct DeepSeek sampling parameters to resellers.
+  Command Code's schema-strict `/alpha/generate` fallback remains separate.
+
+Regression coverage lives in `test/deepseek-responses-routing.test.mjs`,
+`test/namespace-relay-custom.test.mjs`, `test/chat-reasoning.test.mjs` and the
+Chat replay cases in `test/routing.test.mjs`. For the optional offline proof,
+set `MODEL_ROUTER_TEST_LITELLM_PYTHON` to a Python interpreter with the repository's
+pinned LiteLLM and run `node --test test/chat-reasoning.test.mjs`. It uses only
+loopback services and synthetic credentials, with duplicate negative controls.
+See the provider's [Responses contract](https://api-docs.deepseek.com/guides/responses_api/).
+
 ## Substituting a prompt-token count a provider reported as zero
 
 Codex decides when to compact from the `input_tokens` each response reports, so
@@ -1970,6 +2018,96 @@ purpose.
 6. Regression coverage lives in `test/response-usage.test.mjs` and the
    `prompt-token estimate` cases in `test/routing.test.mjs`. A change to the
    predicate, the ratio, or the telemetry needs a test there.
+7. Actual image references may use a documented provider/model token bound
+   instead of charging their base64 bytes as text. Direct DeepSeek Flash and
+   its retired Flash aliases use the documented 1,024-token maximum per image
+   (verified 10 September 2026). File references still contribute image tokens.
+   Do not extend this bound to resellers or other models without evidence, or
+   discount pasted image JSON, tool schemas, or unknown content shapes. The
+   estimate must not mutate or upload the caller's image data.
+
+## A silent Grok stream is kept alive, never replayed
+
+Grok OAuth can reason for minutes with nothing to send, and every layer between
+xAI and Codex has its own idle limit. The router's post-prologue stall guard
+(`CODEX_ROUTER_GROK_STREAM_STALL_MS`, ten minutes) is the one meant to decide.
+
+1. **Every transport hop outlasts the guard.** `src/grok-stream-timeouts.mjs`
+   sizes the router's Grok gateway pool (its headers and body bounds), the
+   gateway's per-deployment `stream_timeout` and non-streaming `timeout`, and
+   the forwarder's xAI pool from that one value. Compaction is a hop too: it is
+   not streamed, so its headers arrive only after the whole generation, and it
+   uses the same pool and deployment bound as a turn. A new hop on the Grok path
+   takes its bound from there. The shared Undici pool keeps its default for
+   every other provider.
+2. **Codex's idle timer is fed a lifecycle event, never a comment.** Codex
+   abandons a stream after five minutes without a parsed data event and sends
+   the whole turn again, which bills the provider twice; an SSE comment or a
+   WebSocket ping does not reset that timer. `src/responses-heartbeat.mjs`
+   relays `response.in_progress` carrying only the response's id, model, and
+   creation time -- only after `response.created`, only at an event boundary,
+   never after a terminal event, and as the last pipeline stage so no router
+   transform parses it. It never carries text, reasoning, or a tool item: the
+   rule against router-authored transcript content stands.
+3. **Only Grok OAuth routes get either.** Other providers keep their stall bound
+   and receive no heartbeat. Widening either needs the same proof: a router test
+   that a silent stream survives, and one that another route is unchanged.
+4. Coverage lives in `test/grok-stream-timeouts.test.mjs`,
+   `test/responses-heartbeat.test.mjs`, `test/fetch-transport.test.mjs`, and the
+   Grok cases in `test/empty-completion-router.test.mjs`.
+
+## Routed assistant messages carry a phase label
+
+Native models label every assistant message `commentary` or `final_answer`.
+Codex folds commentary into its "Worked for ..." group, renders the final
+answer below it, and finds a thread's answer with
+`json_extract(item_json, '$.phase') = 'final_answer'`. Routed providers send no
+label, so `src/message-phase.mjs` assigns one.
+
+1. **The rule is the one native turns follow, read from item order.** A message
+   that a tool call or another message follows is commentary; the last message
+   of a `response.completed` or `response.done` is the final answer, even when
+   reasoning items follow it. Reasoning decides nothing: labelling that message
+   commentary left the turn without an answer, and Codex's thread-history
+   fallback reads only messages whose phase is null. `response.failed`,
+   `response.incomplete` (a stream error to Codex), and `error` leave the last
+   message unlabelled. Never infer the label from the text.
+2. **A provider's phase always wins.** Only an absent or null phase is filled,
+   so a Responses provider that already labels messages passes through
+   unchanged.
+3. **Hold one message frame, briefly.** Only the message's `output_item.done`
+   waits, until a tool call or message opens or the response settles. A
+   reasoning item in between is held with it, deltas included, inside the
+   1 MiB bound; text deltas before the done frame stream live, and everything
+   held is replayed in order. A failed, incomplete, errored, or
+   `[DONE]`-terminated response, a clean end of stream without a terminal,
+   invalid UTF-8, or an exhausted hold bound releases the original bytes
+   unlabelled. An upstream error does not: `pipeResponse` destroys the stage, a
+   destroyed stream cannot push, and the held frames are lost with the stream
+   -- as they are in the item-lifecycle normalizer and the other holding stages
+   -- before the router ends the body with `local_router_stream_failed`.
+4. **It is metadata, not transcript, but Codex replays it.** It adds no text and
+   costs no model tokens. Codex stores the label and sends it back with the
+   message on every later turn. Chat-translated routes drop it: LiteLLM
+   rebuilds chat history from role and content, Anthropic-protocol routes are
+   rebuilt the same way, and Antigravity builds its messages from text and tool
+   calls. Providers with `protocol: "openai-responses"` receive it. Their
+   `openai/responses/<model>` deployments pass input items through, as do
+   `normalizeRoutedInput`, `normalizeResponsesRequest`,
+   `deepSeekResponsesInput`, and WebSocket continuation state. That covers Meta,
+   OpenCode, OpenCode free, GitHub Copilot, and DeepSeek Responses. OpenAI's
+   Responses schema defines the field, and native passthrough keeps it. Local
+   rollouts show OpenCode's Responses surface accepting it (Muse Spark emits it
+   itself); the other built-in Responses providers are unverified. An
+   operator-configured `--adapter openai-responses` endpoint is an unknown
+   validator, so `src/api-forwarder.mjs` omits `phase` from its message input
+   items with `withoutInputMessagePhase`. A built-in provider shown to reject
+   the field needs the same narrow input strip and a test, not a change to the
+   label.
+5. **Routed streams only, after the item-lifecycle normalizer**, so items are
+   already sequential. Coverage lives in `test/message-phase.test.mjs`, the
+   routed case in `test/namespace-relay-routing.test.mjs`, and the generic
+   Responses input case in `test/generic-routing.test.mjs`.
 
 ## Routed subagent regression prevention
 
@@ -1994,6 +2132,16 @@ purpose.
   value that passes byte-identical. Do not gate this on a router-written
   sentinel: the router never authors these items, and a marker would strand
   the already-broken conversations this recovers.
+- The native endpoint also checks an optional item `id` against the prefix it
+  mints for that item type: `fc` for function calls, `ctc` for custom tool
+  calls, `msg` for messages. Codex saves and replays the IDs routed providers
+  minted (`call_...`, `tool_...`, `chatcmpl-...`), so a conversation moved back
+  to a native model fails with "Expected an ID that begins with 'fc'" once one
+  is in its history. `normalizeNativeInput` omits only a string `id` without
+  that prefix, on `/responses` and `/responses/compact` alike. `call_id` still
+  pairs each call with its result, a native-only history is forwarded
+  unchanged, and routed requests keep their IDs. The `native replay omits
+  incompatible item IDs` case in `test/routing.test.mjs` holds both sides.
 - Never log relay response bodies, decrypted task text, or exception messages
   that can echo either. Regressions require fragmented/mislabeled SSE tests and
   real marker-return probes through every installed routed agent plus a
@@ -2163,6 +2311,39 @@ the same OS user to sign in or authorize once per harness buys nothing.
   reads as expired.
 - `doctor` reports it as its own line, because "open Codex once" is the fix and
   nothing else would say so.
+
+## A provider-prefixed slug is never forwarded to ChatGPT
+
+`handleResponses` treats a model it has no route for as native GPT traffic and
+forwards it to chatgpt.com. That is correct only for native slugs, and no native
+slug contains a `/`: not the captured account catalog, not the context variants
+in `src/native-context-variants.mjs`, not the native-alias keys or the
+native-redirect sources. Every routed slug is `provider/model`.
+
+So a slug containing `/` that resolves to no route — exact slug, migration or
+curation alias, or native alias — is refused locally with HTTP 400,
+`invalid_request_error`, code `unrouted_model` (`src/unrouted-model.mjs`),
+before native redirect or native passthrough can take it. Issue #689 is why: a
+user model added to `user-models.json` after the service started reached the
+Codex picker (the catalog is rebuilt in another process) but not the live
+router's `MODEL_BY_SLUG`, went to ChatGPT, and came back as "The 'vendor/model'
+model is not supported when using Codex with a ChatGPT account" — which reads
+as an OpenAI restriction and sent the user's prompt to OpenAI besides.
+
+- Keep the check ahead of `readNativeRedirect()`. The redirect exists for
+  Codex's background sessions on native slugs; it must not quietly serve a
+  mistyped or unloaded routed model with some other model.
+- The message names the slug, whether its prefix is a registered and enabled
+  provider, and the reason `mergeUserModels` skipped a user model with that slug
+  (`USER_MODELS_SKIPPED`), and points at `bin/control service restart` and
+  `user-models.json`. It never carries a credential, caller key, base URL, or
+  path. It does not probe credentials: that spawns keychain lookups.
+- Client surfaces already resolve their own prefixes before re-entering this
+  path — Claude strips `codex_router/anthropic/`, Cursor maps its neutral ids to
+  the slug, Gemini, DeepSeek Harness, and OpenClaw send the router slug — and the
+  Responses WebSocket re-enters over HTTP, so this one check covers them.
+- If a native namespace with a `/` ever appears, narrow the rule to prefixes
+  that are not that namespace; do not drop it.
 
 ## A client the tray cannot watch keeps the router on
 

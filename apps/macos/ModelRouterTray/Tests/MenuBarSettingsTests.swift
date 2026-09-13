@@ -188,21 +188,87 @@ struct MenuBarSettingsTests {
     #expect(settings.customIconPath == nil)
   }
 
-  @Test("standard mode keeps a reserved width even when the name is hidden")
-  func standardWidthIsReserved() {
+  @Test("standard mode sizes to its content instead of reserving the full slot")
+  func standardWidthTracksContent() {
     #expect(MenuBarLayoutMetrics.standardIconSize == 15)
     #expect(MenuBarLayoutMetrics.iconOnlyIconSize == MenuBarLayoutMetrics.standardIconSize)
-    #expect(MenuBarLayoutMetrics.statusItemWidth(displayMode: .standard) == 180)
-    #expect(MenuBarLayoutMetrics.statusItemWidth(displayMode: .iconOnly) == 22)
     #expect(MenuBarLayoutMetrics.statusItemHeight(displayMode: .standard) == 22)
     #expect(MenuBarLayoutMetrics.statusItemHeight(displayMode: .iconOnly) == 22)
+    #expect(MenuBarLayoutMetrics.statusItemWidth(displayMode: .iconOnly) == 22)
+
+    // Hiding the model name is the case issue #646 called out: the slot used to
+    // stay 180 points wide around a single 15pt mark.
+    let iconOnlyContent = MenuBarLayoutMetrics.standardContentWidth(
+      iconStyle: .router,
+      showModelName: false,
+      nameText: "Sonnet",
+      detailText: ""
+    )
+    #expect(iconOnlyContent < MenuBarLayoutMetrics.standardMaximumWidth)
+    #expect(iconOnlyContent >= MenuBarLayoutMetrics.standardMinimumWidth)
+
+    // A short label must still be narrower than a long one.
+    let short = MenuBarLayoutMetrics.standardContentWidth(
+      iconStyle: .router,
+      showModelName: true,
+      nameText: "GPT",
+      detailText: ""
+    )
+    let long = MenuBarLayoutMetrics.standardContentWidth(
+      iconStyle: .router,
+      showModelName: true,
+      nameText: "Claude Opus 4.1 Extended Thinking",
+      detailText: "88% · 4h"
+    )
+    #expect(short > iconOnlyContent)
+    #expect(long > short)
+
+    // ...and an overlong one still truncates rather than growing without bound.
+    #expect(long == MenuBarLayoutMetrics.standardMaximumWidth)
+    #expect(
+      MenuBarLayoutMetrics.statusItemWidth(
+        displayMode: .standard,
+        standardContentWidth: long
+      ) == MenuBarLayoutMetrics.standardMaximumWidth
+    )
+
+    // A caller that cannot measure yet keeps the historical full slot.
+    #expect(MenuBarLayoutMetrics.statusItemWidth(displayMode: .standard) == 180)
+  }
+
+  @Test("the indicator style measures its dot, not the full mark")
+  func indicatorStyleMeasuresTheDot() {
+    let indicator = MenuBarLayoutMetrics.standardContentWidth(
+      iconStyle: .indicator,
+      showModelName: true,
+      nameText: "GPT",
+      detailText: ""
+    )
+    let mark = MenuBarLayoutMetrics.standardContentWidth(
+      iconStyle: .router,
+      showModelName: true,
+      nameText: "GPT",
+      detailText: ""
+    )
+    #expect(indicator < mark)
+    // A pulse scales the glyph in place, so the slot has to grow with it.
+    let pulsing = MenuBarLayoutMetrics.standardContentWidth(
+      iconStyle: .indicator,
+      showModelName: true,
+      nameText: "GPT",
+      detailText: "",
+      pulsing: true
+    )
+    #expect(pulsing > indicator)
   }
 
   @Test("the icon-only mark stays inside the native square during a pulse")
   func iconOnlyPulseKeepsScaledContentInsideBounds() {
     #expect(MenuBarLayoutMetrics.statusItemWidth(displayMode: .iconOnly, pulsing: true) == 22)
     #expect(MenuBarLayoutMetrics.statusItemHeight(displayMode: .iconOnly, pulsing: true) == 22)
-    #expect(MenuBarLayoutMetrics.statusItemWidth(displayMode: .standard, pulsing: true) == 180)
+    #expect(
+      MenuBarLayoutMetrics.statusItemWidth(displayMode: .standard, pulsing: true) == 180
+    )
     #expect(MenuBarLayoutMetrics.statusItemHeight(displayMode: .standard, pulsing: true) == 22)
   }
 

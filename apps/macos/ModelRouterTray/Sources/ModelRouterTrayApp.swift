@@ -458,7 +458,10 @@ final class TrayMenuController: NSObject {
 
   init(store: RouterStore) {
     self.store = store
-    let length = MenuBarLayoutMetrics.statusItemWidth(displayMode: store.menuBarDisplayMode)
+    let length = MenuBarLayoutMetrics.statusItemWidth(
+      displayMode: store.menuBarDisplayMode,
+      standardContentWidth: store.menuBarStandardWidth()
+    )
     statusItem = NSStatusBar.system.statusItem(withLength: length)
     let hosting = NSHostingView(rootView: StatusItemLabel(store: store))
     hosting.sizingOptions = []
@@ -476,11 +479,19 @@ final class TrayMenuController: NSObject {
     super.init()
     configureStatusItem()
     configurePanel()
-    displayModeCancellable = store.$menuBarDisplayMode
+    // Standard mode is measured from the label, so the slot has to follow the
+    // provider name, the usage text and the icon style -- not just the display
+    // mode. objectWillChange fires before the store mutates, and hopping to the
+    // main queue lands after it, so the measurement reads the new values.
+    // applyStatusItemMetrics() is a no-op when the width is unchanged.
+    displayModeCancellable = store.objectWillChange
       .receive(on: DispatchQueue.main)
       .sink { [weak self] _ in
         guard let self else { return }
-        self.applyStatusItemMetrics()
+        // Only a slot that actually resized can have moved the panel's anchor.
+        // Repositioning on every store tick would drag AppKit through a window
+        // frame change once a second while the panel is open.
+        guard self.applyStatusItemMetrics() else { return }
         if self.panel.isVisible {
           self.reposition()
         }
@@ -555,11 +566,24 @@ final class TrayMenuController: NSObject {
     panel.setContentSize(TrayPanelPlacement.panelSize)
   }
 
-  private func applyStatusItemMetrics() {
-    let width = MenuBarLayoutMetrics.statusItemWidth(displayMode: store.menuBarDisplayMode)
+  /// Returns whether the slot actually changed size.
+  @discardableResult
+  private func applyStatusItemMetrics() -> Bool {
+    let width = MenuBarLayoutMetrics.statusItemWidth(
+      displayMode: store.menuBarDisplayMode,
+      standardContentWidth: store.menuBarStandardWidth()
+    )
     let height = MenuBarLayoutMetrics.statusItemHeight(displayMode: store.menuBarDisplayMode)
+    // Standard mode is now content-sized, so this runs on every label change,
+    // not just a mode switch. Assigning an unchanged length still makes AppKit
+    // relayout the menu bar, and the activity poll ticks once a second.
+    guard statusItem.length != width
+      || statusHostingView.frame.width != width
+      || statusHostingView.frame.height != height
+    else { return false }
     statusItem.length = width
     statusHostingView.frame = NSRect(x: 0, y: 0, width: width, height: height)
+    return true
   }
 
   @objc private func statusItemClicked(_ sender: Any?) {
@@ -1692,6 +1716,26 @@ final class RouterStore: ObservableObject {
     return "\(names[0]) +\(names.count - 1)"
   }
 
+  // The exact strings StatusItemLabel draws. The status item is sized from
+  // these, so the measurement and the render cannot drift apart.
+  var menuBarNameText: String {
+    hasConcurrentActivity ? activitySummaryLabel : selectedUsageProvider.shortName
+  }
+
+  var menuBarDetailText: String {
+    hasConcurrentActivity ? compactActivityProvidersLabel : (selectedUsageText ?? "")
+  }
+
+  func menuBarStandardWidth(pulsing: Bool = false) -> CGFloat {
+    MenuBarLayoutMetrics.standardContentWidth(
+      iconStyle: menuBarIconStyle,
+      showModelName: menuBarShowModelName,
+      nameText: menuBarNameText,
+      detailText: menuBarDetailText,
+      pulsing: pulsing
+    )
+  }
+
   var uniqueActiveProviderShortNames: [String] {
     var seen = Set<String>()
     var names: [String] = []
@@ -1904,6 +1948,19 @@ final class RouterStore: ObservableObject {
         return
       }
     }
+  }
+
+  // Reopening the panel does not need a new snapshot. `bin/control --json`
+  // spawns a Node process per target and costs seconds of CPU, while the
+  // registry it reports changes far more slowly than the tray is opened; the
+  // background poll and every mutation still refresh unconditionally. Activity
+  // and health are not covered by this: they have their own native probe.
+  // nonisolated so the default argument below can read it off the main actor.
+  nonisolated static let openSnapshotMaxAge: TimeInterval = 60
+
+  func refreshIfStale(maxAge: TimeInterval = RouterStore.openSnapshotMaxAge) async {
+    if let lastUpdated, Date().timeIntervalSince(lastUpdated) < maxAge { return }
+    await refresh()
   }
 
   func refresh() async {
@@ -2358,7 +2415,7 @@ final class RouterStore: ObservableObject {
         )
       } ?? []
     }
-    let calendar = Calendar.current
+    let calendar = usageDayCalendar
     return dailyUsagePoints(
       from: buckets,
       days: days,
@@ -2373,7 +2430,7 @@ final class RouterStore: ObservableObject {
 
   func localUsageTotals(for providerID: String, days: Int) -> (tokens: Double, requests: Int) {
     guard providerID != "openai", let usage = providerUsage(for: providerID) else { return (0, 0) }
-    let calendar = Calendar.current
+    let calendar = usageDayCalendar
     return sumLocalUsageTotals(
       from: usage.dailyUsageBuckets,
       days: days,
@@ -3264,11 +3321,10 @@ final class RouterStore: ObservableObject {
 
   private func refreshActivity() async {
     do {
-      // `control health` uses the protected health leaf and projects away the
-      // forwarders' credential metadata. The public `/health` endpoint is
-      // intentionally too small for the service rows below.
-      let data = try await runControl(arguments: ["health", "--json"])
-      let health = try JSONDecoder().decode(RouterHealth.self, from: data)
+      // The protected health leaf, read natively. The public `/health` endpoint
+      // is intentionally too small for the service rows below, and this poll
+      // runs once a second, so it must not spawn a process: see RouterHealthProbe.
+      let health = try await RouterHealthProbe.read()
       let previousActivityState = activityState
       let nextActiveRequests = health.activity.active ?? []
       let nextActiveRequestCount = health.activity.activeCount ?? nextActiveRequests.count
@@ -3830,21 +3886,10 @@ final class RouterStore: ObservableObject {
   }
 
   private func recordedInstallSourceRoot() -> URL? {
-    let environment = ProcessInfo.processInfo.environment
-    let home = FileManager.default.homeDirectoryForCurrentUser
-    let stateDirectory: URL
-    if let configured = environment["MODEL_ROUTER_STATE_DIR"]
-      ?? environment["CODEX_ROUTER_STATE_DIR"]
-      ?? environment["KIMI_CODEX_STATE_DIR"],
-      !configured.isEmpty
-    {
-      stateDirectory = URL(fileURLWithPath: configured, isDirectory: true)
-    } else {
-      let codexHome = environment["CODEX_HOME"].flatMap { $0.isEmpty ? nil : $0 }
-        .map { URL(fileURLWithPath: $0, isDirectory: true) }
-        ?? home.appendingPathComponent(".codex", isDirectory: true)
-      stateDirectory = codexHome.appendingPathComponent("codex-router", isDirectory: true)
-    }
+    let stateDirectory = RouterStateDirectory.resolve(
+      environment: ProcessInfo.processInfo.environment,
+      home: FileManager.default.homeDirectoryForCurrentUser
+    )
     return RouterInstallManifestPolicy.sourceRoot(stateDirectory: stateDirectory)
   }
 }
@@ -3863,6 +3908,97 @@ private struct RouterHealth: Decodable, Equatable {
 private struct RouterServiceHealth: Decodable, Equatable {
   let reachable: Bool?
   let enabled: Bool?
+}
+
+// paths.mjs: MODEL_ROUTER_STATE_DIR, then the managed aliases, then
+// `$CODEX_HOME/codex-router` with CODEX_HOME defaulting to `~/.codex`. An empty
+// value falls through exactly as `||` does in Node.
+enum RouterStateDirectory {
+  static func resolve(environment: [String: String], home: URL) -> URL {
+    let configured = ["MODEL_ROUTER_STATE_DIR", "CODEX_ROUTER_STATE_DIR", "KIMI_CODEX_STATE_DIR"]
+      .compactMap { environment[$0] }
+      .first { !$0.isEmpty }
+    if let configured {
+      return URL(fileURLWithPath: configured, isDirectory: true)
+    }
+    let codexHome = environment["CODEX_HOME"].flatMap { $0.isEmpty ? nil : $0 }
+      .map { URL(fileURLWithPath: $0, isDirectory: true) }
+      ?? home.appendingPathComponent(".codex", isDirectory: true)
+    return codexHome.appendingPathComponent("codex-router", isDirectory: true)
+  }
+}
+
+// The tray polls health once a second. `bin/control health --json` boots Node
+// and control.mjs's whole module graph to make one loopback GET: about a second
+// of CPU per call, so the poll alone kept a core busy for as long as the tray
+// ran. This is the same GET against the same protected leaf, natively, in about
+// a millisecond. control-health.mjs stays the contract for the CLI and the
+// Control Center; RouterHealth's Decodable keys are that same projection, so the
+// forwarders' credential metadata still never reaches tray state.
+enum RouterHealthProbe {
+  private static let session: URLSession = {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.timeoutIntervalForRequest = 3
+    configuration.timeoutIntervalForResource = 3
+    // The caller key is a path segment. This request never leaves loopback, so
+    // never hand it to a system proxy that claims 127.0.0.1.
+    configuration.connectionProxyDictionary = [kCFNetworkProxiesHTTPEnable as AnyHashable: 0]
+    return URLSession(configuration: configuration)
+  }()
+
+  // paths.mjs `port()`: the first non-empty alias wins, and an invalid value is
+  // an error rather than a fallback to the default. Node parses the value with
+  // `Number()`, which accepts surrounding whitespace, `4202.0`, and `4.202e3`;
+  // parse as a Double first so a port the router accepted is accepted here.
+  static func routerPort(environment: [String: String]) throws -> Int {
+    let value = ["MODEL_ROUTER_PORT", "CODEX_ROUTER_PORT", "KIMI_ROUTER_PORT"]
+      .compactMap { environment[$0] }
+      .first { !$0.isEmpty } ?? "4202"
+    guard let number = Double(value.trimmingCharacters(in: .whitespacesAndNewlines)),
+      number.isFinite, number == number.rounded(), number >= 1, number <= 65_535
+    else {
+      throw RouterError("MODEL_ROUTER_PORT must be a TCP port between 1 and 65535.")
+    }
+    return Int(number)
+  }
+
+  // caller-auth.mjs `validCallerSecret`: at least 32 characters of [A-Za-z0-9_-].
+  static func callerSecret(stateDirectory: URL) -> String? {
+    let path = stateDirectory.appendingPathComponent("caller-secret", isDirectory: false)
+    guard let secret = (try? String(contentsOf: path, encoding: .utf8))?
+        .trimmingCharacters(in: .whitespacesAndNewlines),
+      secret.range(of: "^[A-Za-z0-9_-]{32,}$", options: .regularExpression) != nil
+    else { return nil }
+    return secret
+  }
+
+  static func healthURL(environment: [String: String], home: URL) throws -> URL {
+    let port = try routerPort(environment: environment)
+    let stateDirectory = RouterStateDirectory.resolve(environment: environment, home: home)
+    guard let secret = callerSecret(stateDirectory: stateDirectory) else {
+      throw RouterError("The local router caller key is missing or invalid; run ./bin/doctor --fix.")
+    }
+    guard let url = URL(string: "http://127.0.0.1:\(port)/_codex-router/\(secret)/v1/health") else {
+      throw RouterError("The local router health URL could not be built.")
+    }
+    return url
+  }
+
+  fileprivate static func read() async throws -> RouterHealth {
+    var request = URLRequest(
+      url: try healthURL(
+        environment: ProcessInfo.processInfo.environment,
+        home: FileManager.default.homeDirectoryForCurrentUser
+      )
+    )
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    // A 503 still carries the degraded list and the service rows, so decode
+    // every response and let the body's own `ok` say whether the router is
+    // ready. Transport failures throw, which the caller records as a health
+    // failure exactly as it did when `control health` could not run.
+    let (data, _) = try await session.data(for: request)
+    return try JSONDecoder().decode(RouterHealth.self, from: data)
+  }
 }
 
 private enum TrayServiceHealthState: Equatable {
@@ -4442,13 +4578,42 @@ struct DailyUsageDisplayBucket: Equatable {
   let isRouterFallback: Bool
 }
 
+// Usage days are UTC days. OpenAI's account stream reports dailyUsageBuckets on
+// UTC calendar boundaries and the router keys its own buckets the same way, so
+// this formatter has to read and write that one day space. Leaving it on the
+// device zone made every key mean "the local day of the same name", which east
+// of UTC is a different window than the bucket measured -- and left the current
+// local day with no account bucket to match until the offset elapsed, so an
+// account mid-session reported "today: 0" every morning.
+let usageDayTimeZone = TimeZone(secondsFromGMT: 0) ?? .gmt
+
 let dailyUsageDayKeyFormatter: DateFormatter = {
   let formatter = DateFormatter()
   formatter.locale = Locale(identifier: "en_US_POSIX")
   formatter.calendar = Calendar(identifier: .gregorian)
+  formatter.timeZone = usageDayTimeZone
   formatter.dateFormat = "yyyy-MM-dd"
   return formatter
 }()
+
+/// The calendar every usage-day walk and label must use, so a point's date, the
+/// key it looks up, and the day it is labelled with all name the same window.
+var usageDayCalendar: Calendar = {
+  var calendar = Calendar(identifier: .gregorian)
+  calendar.timeZone = usageDayTimeZone
+  return calendar
+}()
+
+/// Day labels for a usage chart. A usage point's date is the start of a UTC
+/// day, so formatting it in the device zone can name the day before or after
+/// the one the bucket measured. Label the day the number is actually from.
+extension Date {
+  func usageDayLabel(_ style: Date.FormatStyle) -> String {
+    var dayStyle = style
+    dayStyle.timeZone = usageDayTimeZone
+    return formatted(dayStyle)
+  }
+}
 
 func mergeAccountUsageBuckets(
   account: [CodexDailyUsageBucket],
@@ -4477,7 +4642,7 @@ func dailyUsagePoints(
   from buckets: [DailyUsageDisplayBucket],
   days: Int,
   today: Date,
-  calendar: Calendar = .current
+  calendar: Calendar = usageDayCalendar
 ) -> [DailyUsagePoint] {
   let indexed = Dictionary(uniqueKeysWithValues: buckets.map { ($0.startDate, $0) })
   return (0..<days).map { offset in
@@ -4492,11 +4657,14 @@ func dailyUsagePoints(
 }
 
 /// Pure 7/30-day total. Safe to call from SwiftUI view bodies.
+/// The window boundaries have to be UTC days like the keys they are compared
+/// against; a local window against UTC-parsed keys drops or admits one day at
+/// the edge, by the machine's offset.
 func sumLocalUsageTotals(
   from buckets: [ProviderDailyUsageBucket],
   days: Int,
   today: Date,
-  calendar: Calendar = .current
+  calendar: Calendar = usageDayCalendar
 ) -> (tokens: Double, requests: Int) {
   let firstDay = calendar.date(byAdding: .day, value: -(days - 1), to: today) ?? today
   return buckets.reduce(into: (tokens: 0.0, requests: 0)) { totals, bucket in
@@ -5053,20 +5221,94 @@ struct MenuBarSettings: Equatable {
 }
 
 enum MenuBarLayoutMetrics {
-  static let standardReservedWidth: CGFloat = 180
+  // A cap, not a reservation. Standard mode used to hand this width back for
+  // every state, so a short label -- or a hidden model name -- left the unused
+  // remainder as blank menu-bar space before the next item. The slot is now
+  // measured from what is actually drawn and only clamped here, which keeps
+  // long labels truncating exactly as they did.
+  static let standardMaximumWidth: CGFloat = 180
+  // Below this the item is too small to be a comfortable click target, and an
+  // icon that touches both edges reads as clipped rather than compact.
+  static let standardMinimumWidth: CGFloat = 30
   static let standardHeight: CGFloat = 22
   static let standardIconSize: CGFloat = 15
+  // The indicator style draws a 6pt dot instead of the 15pt mark.
+  static let standardIndicatorSize: CGFloat = 6
+  // Mirrors the HStack spacing and the breathing room the fixed slot used to
+  // provide incidentally; measuring has to agree with StatusItemLabel or the
+  // text clips one glyph early.
+  static let standardContentSpacing: CGFloat = 5
+  static let standardHorizontalInset: CGFloat = 6
   static let iconOnlyWidth: CGFloat = standardHeight
   static let iconOnlyHeight: CGFloat = 22
   static let iconOnlyIconSize: CGFloat = standardIconSize
   static let attentionPulseScale: CGFloat = 1.4
   static let standardIndicatorPulseScale: CGFloat = 2.1
 
-  nonisolated static func statusItemWidth(
-    displayMode: TrayMenuBarDisplayMode,
+  // SwiftUI renders these with `.system(size:weight:design:)`; measuring with a
+  // different face would size the slot for text the menu bar never draws.
+  nonisolated static func standardNameFont() -> NSFont {
+    let base = NSFont.systemFont(ofSize: 11, weight: .medium)
+    guard let descriptor = base.fontDescriptor.withDesign(.rounded),
+      let rounded = NSFont(descriptor: descriptor, size: 11)
+    else { return base }
+    return rounded
+  }
+
+  nonisolated static func standardDetailFont() -> NSFont {
+    NSFont.monospacedSystemFont(ofSize: 10, weight: .medium)
+  }
+
+  nonisolated static func standardTextWidth(_ text: String, font: NSFont) -> CGFloat {
+    guard !text.isEmpty else { return 0 }
+    return ceil((text as NSString).size(withAttributes: [.font: font]).width)
+  }
+
+  /// The width Standard mode needs for the content it is about to draw, capped
+  /// at `standardMaximumWidth` so an overlong label still truncates instead of
+  /// pushing every other menu-bar item aside.
+  nonisolated static func standardContentWidth(
+    iconStyle: TrayMenuBarIconStyle,
+    showModelName: Bool,
+    nameText: String,
+    detailText: String,
     pulsing: Bool = false
   ) -> CGFloat {
-    guard displayMode == .iconOnly else { return standardReservedWidth }
+    var segments: [CGFloat] = [standardLeadingGlyphWidth(iconStyle: iconStyle, pulsing: pulsing)]
+    if showModelName, !nameText.isEmpty {
+      segments.append(standardTextWidth(nameText, font: standardNameFont()))
+    }
+    if !detailText.isEmpty {
+      segments.append(standardTextWidth(detailText, font: standardDetailFont()))
+    }
+    let spacing = standardContentSpacing * CGFloat(max(0, segments.count - 1))
+    let content = segments.reduce(0, +) + spacing + standardHorizontalInset * 2
+    return min(standardMaximumWidth, max(standardMinimumWidth, ceil(content)))
+  }
+
+  // A pulse scales the glyph in place. The slot has to grow with it or the
+  // animation is clipped against its own status item.
+  nonisolated static func standardLeadingGlyphWidth(
+    iconStyle: TrayMenuBarIconStyle,
+    pulsing: Bool
+  ) -> CGFloat {
+    if iconStyle == .indicator {
+      let size = pulsing ? standardIndicatorSize * standardIndicatorPulseScale : standardIndicatorSize
+      return ceil(size)
+    }
+    let size = pulsing ? standardIconSize * attentionPulseScale : standardIconSize
+    return ceil(size)
+  }
+
+  nonisolated static func statusItemWidth(
+    displayMode: TrayMenuBarDisplayMode,
+    pulsing: Bool = false,
+    standardContentWidth: CGFloat? = nil
+  ) -> CGFloat {
+    // No measurement supplied means the caller cannot know the label yet, so
+    // fall back to the historical full slot rather than guessing small and
+    // clipping.
+    guard displayMode == .iconOnly else { return standardContentWidth ?? standardMaximumWidth }
     guard pulsing else { return iconOnlyWidth }
     let iconWidth = iconOnlyIconSize * attentionPulseScale
     return max(iconOnlyWidth, ceil(iconWidth))
@@ -5368,12 +5610,18 @@ private struct StatusItemLabel: View {
         }
       }
       .frame(
-        width: MenuBarLayoutMetrics.statusItemWidth(displayMode: store.menuBarDisplayMode, pulsing: pulsing),
+        width: MenuBarLayoutMetrics.statusItemWidth(
+          displayMode: store.menuBarDisplayMode,
+          pulsing: pulsing,
+          standardContentWidth: store.menuBarStandardWidth(pulsing: pulsing)
+        ),
         height: MenuBarLayoutMetrics.statusItemHeight(
           displayMode: store.menuBarDisplayMode,
           pulsing: pulsing
         ),
-        alignment: .leading
+        // The slot is measured from this content now, so centring it keeps the
+        // inset even on both sides instead of banking it all as a trailing gap.
+        alignment: .center
       )
       .clipped()
       .help(tooltipText)
@@ -5416,7 +5664,10 @@ enum TrayTab: String, CaseIterable, Identifiable {
 private struct TrayView: View {
   @ObservedObject var store: RouterStore
   @AppStorage("trayTab") private var tab: TrayTab = .usage
-  @State private var providersExpanded = true
+  // The heavy settings sections all start closed. Each one builds tens to
+  // hundreds of rows, and opening the tray or switching to Settings paid for
+  // every one of them at once even though a given visit usually touches one.
+  @State private var providersExpanded = false
   @State private var providerFilter = ""
   @State private var savingsRange: SavingsRange = .day
   @State private var savingsRangeSelectedByUser = false
@@ -5618,7 +5869,7 @@ private struct TrayView: View {
     }
     .foregroundStyle(routerText)
     .task {
-      await store.refresh()
+      await store.refreshIfStale()
       selectInitialSavingsRange()
     }
     .onChange(of: savingsRangeDataFingerprint) { _ in
@@ -5686,7 +5937,10 @@ private struct TrayView: View {
       .id(store.language)
 
       ScrollView(showsIndicators: false) {
-        VStack(alignment: .leading, spacing: 14) {
+        // Lazy, because this column is the whole tab: a plain VStack lays out
+        // every section before the first frame, so the sections below the fold
+        // cost the same as the one being read.
+        LazyVStack(alignment: .leading, spacing: 14) {
           switch tab {
           case .usage: usageTab
           case .status: statusTab
@@ -6542,13 +6796,14 @@ private struct TrayView: View {
   private struct ModelSettingsAccordion: View {
     @ObservedObject var store: RouterStore
     let target: RouterTarget
-    @State private var subagentsExpanded = true
-    @State private var pickerExpanded = true
-    @State private var providerCatalogsExpanded = true
-    @State private var visionExpanded = true
-    // Local models are a first-class install surface. Keep this section open
-    // on launch so the catalog is not hidden behind the other settings cards.
-    @State private var localLlmExpanded = true
+    @State private var subagentsExpanded = false
+    @State private var pickerExpanded = false
+    @State private var providerCatalogsExpanded = false
+    @State private var visionExpanded = false
+    // Local models are a first-class install surface, but the catalog it draws
+    // is one of the most expensive sections in the panel. The header keeps it
+    // discoverable; opening it is one click and now only costs when asked for.
+    @State private var localLlmExpanded = false
     @State private var localDetailsExpanded = false
     @State private var expandedLocalFamilies = Set<String>()
     @State private var expandedLocalVariants = Set<String>()
@@ -6562,7 +6817,12 @@ private struct TrayView: View {
     // the tag rather than a Bool so the alert can name the model.
     @State private var pendingOversizedInstall: String?
     @State private var quickPicksExpanded = false
-    @State private var collapsedProviders = Set<String>()
+    // Opt-in rather than opt-out. Every group defaulting to expanded meant a
+    // tap on Settings built every model row the registry knows about -- the
+    // subagent and picker panels list the same 185 models, so roughly 450
+    // toggle rows -- before the tab could draw. The set now names only the
+    // groups the operator actually opened.
+    @State private var expandedProviders = Set<String>()
 
     private struct ProviderModels: Identifiable {
       let provider: String
@@ -6653,12 +6913,12 @@ private struct TrayView: View {
     private func providerBinding(_ section: String, _ provider: String) -> Binding<Bool> {
       let key = "\(section):\(provider)"
       return Binding(
-        get: { !collapsedProviders.contains(key) },
+        get: { expandedProviders.contains(key) },
         set: { expanded in
           if expanded {
-            collapsedProviders.remove(key)
+            expandedProviders.insert(key)
           } else {
-            collapsedProviders.insert(key)
+            expandedProviders.remove(key)
           }
         }
       )
@@ -10067,13 +10327,13 @@ struct UsageBarChart: View {
 
   private func axisLabel(for point: DailyUsagePoint) -> String {
     if points.count <= 7 {
-      return point.date.formatted(.dateTime.weekday(.abbreviated))
+      return point.date.usageDayLabel(.dateTime.weekday(.abbreviated))
     }
-    return point.date.formatted(.dateTime.month(.defaultDigits).day())
+    return point.date.usageDayLabel(.dateTime.month(.defaultDigits).day())
   }
 
   private func hoverText(for point: DailyUsagePoint) -> String {
-    let date = point.date.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day())
+    let date = point.date.usageDayLabel(.dateTime.weekday(.abbreviated).month(.abbreviated).day())
     let tokens = self.tokenDisplayUnit.format(point.tokens)
     let text = RouterLanguage.isSimplifiedChinese ? "\(date) · \(tokens) token" : "\(date) · \(tokens) tokens"
     guard point.isRouterFallback else { return text }

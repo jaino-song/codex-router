@@ -492,6 +492,7 @@ test("a marked provider transport failure moves a subagent to a checked-in v2 ro
 
     assert.deepEqual(seen.map((body) => body.model), [
       V2_PRIMARY.gatewayModel,
+      V2_PRIMARY.gatewayModel,
       V2_FALLBACK.gatewayModel,
     ]);
     assert.equal(result.status, 200);
@@ -528,9 +529,210 @@ test("subagent transport failover preserves search history execution mode", asyn
       { headers: { "x-openai-subagent": "review-child" } },
     );
 
-    assert.deepEqual(seen.map((body) => body.model), [V2_THIRD.gatewayModel]);
+    assert.deepEqual(seen.map((body) => body.model), [
+      V2_THIRD.gatewayModel,
+      V2_THIRD.gatewayModel,
+    ]);
     assert.equal(result.status, 502);
     assert.match(child.testErrors(), /reason=transport -> none outcome=no-candidate/);
+  } finally {
+    await stopChild(child);
+    await closeServer(gw.server);
+  }
+});
+
+test("a marked provider transport failure retries the same ordinary route once", async () => {
+  const seen = [];
+  const gw = await gateway(async (request, response) => {
+    const body = await bodyJson(request);
+    seen.push(body);
+    if (seen.length === 1) {
+      response.writeHead(502, { "Content-Type": "application/json" });
+      response.end(TRANSPORT_BODY);
+      return;
+    }
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.end(contentSse("same-route-transport-retry"));
+  });
+  const routerPort = await openPort();
+  const child = run(routerEnv(gw.port, routerPort), {
+    chain: [V2_FALLBACK.slug],
+    v2Credentials: true,
+  });
+  try {
+    await waitFor(`http://127.0.0.1:${routerPort}/health`, child);
+    const result = await readRouted(routerPort, { ...TURN_BODY, model: V2_PRIMARY.slug });
+
+    assert.deepEqual(seen.map((body) => body.model), [
+      V2_PRIMARY.gatewayModel,
+      V2_PRIMARY.gatewayModel,
+    ]);
+    assert.equal(result.status, 200);
+    assert.match(result.body, /answered-by-same-route-transport-retry/);
+    assert.match(child.testErrors(), /routed transport retry 1\/1/);
+    const [event] = await waitForUsageEvents(child.stateDir, 1, child);
+    assert.equal(event.model, V2_PRIMARY.slug);
+    assert.equal(event.status, 200);
+    assert.equal(event.retries, 1);
+    // The retry is a second upstream attempt and must be observed as one.
+    const activity = await fetch(`${callerBaseUrl(routerPort, CALLER_KEY)}/activity`).then((r) => r.json());
+    const settled = activity.recent.find((entry) => entry.requestId === event.requestId);
+    assert.ok(settled, `no settled activity for ${event.requestId}: ${JSON.stringify(activity)}`);
+    assert.equal(settled.upstreamAttempts, 2);
+    assert.equal(settled.state, "completed");
+  } finally {
+    await stopChild(child);
+    await closeServer(gw.server);
+  }
+});
+
+function quotaResponse(response) {
+  const payload = Buffer.from(QUOTA_BODY, "utf8");
+  response.writeHead(429, {
+    "Content-Type": "application/json",
+    "Content-Length": String(payload.length),
+  });
+  response.end(payload);
+}
+
+test("a Fast Grok turn never reaches a failover candidate at priority, and activity names the candidate", async () => {
+  const seen = [];
+  let releaseCandidate = () => {};
+  const candidateHeld = new Promise((resolve) => {
+    releaseCandidate = resolve;
+  });
+  let candidateArrived;
+  const arrived = new Promise((resolve) => {
+    candidateArrived = resolve;
+  });
+  const gw = await gateway(async (request, response) => {
+    seen.push(await bodyJson(request));
+    if (seen.length === 1) {
+      quotaResponse(response);
+      return;
+    }
+    candidateArrived();
+    await candidateHeld;
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.end(contentSse("fallback"));
+  });
+  const routerPort = await openPort();
+  const child = run(routerEnv(gw.port, routerPort));
+  try {
+    await waitFor(`http://127.0.0.1:${routerPort}/health`, child);
+    const pending = readRouted(routerPort, {
+      ...TURN_BODY,
+      model: "grok-oauth/grok-4.6",
+      service_tier: "priority",
+    });
+    await arrived;
+    // The candidate is holding its headers: activity must credit that wait
+    // to the candidate, not to the provider that already failed.
+    const activity = await fetch(`${callerBaseUrl(routerPort, CALLER_KEY)}/activity`).then((r) => r.json());
+    assert.equal(activity.active.length, 1, JSON.stringify(activity));
+    assert.equal(activity.active[0].model, FALLBACK.slug);
+    assert.equal(activity.active[0].phase, "awaiting_upstream");
+    assert.equal(activity.active[0].upstreamAttempts, 2);
+    releaseCandidate();
+    const result = await pending;
+    assert.equal(result.status, 200, result.body);
+    assert.match(result.body, /answered-by-fallback/);
+    assert.equal(seen.length, 2);
+    // Grok 4.6 advertises priority, so its own body keeps the tier (and the
+    // extra_body copy the locked gateway needs).
+    assert.equal(seen[0].service_tier, "priority");
+    assert.equal(seen[0].extra_body?.service_tier, "priority");
+    assert.equal(seen[1].model, FALLBACK.gatewayModel);
+    assert.equal("service_tier" in seen[1], false, JSON.stringify(seen[1]));
+    assert.equal(seen[1].extra_body?.service_tier, undefined);
+  } finally {
+    releaseCandidate();
+    await stopChild(child);
+    await closeServer(gw.server);
+  }
+});
+
+test("a curated route that advertises a service tier still receives it", async () => {
+  const seen = [];
+  const gw = await gateway(async (request, response) => {
+    seen.push(await bodyJson(request));
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.end(contentSse("curated-tier"));
+  });
+  const routerPort = await openPort();
+  const child = run(routerEnv(gw.port, routerPort), {
+    userModels: [{
+      ...GROQ_CANDIDATE,
+      serviceTiers: [{ id: "priority", name: "Fast", description: "Fixture priority tier." }],
+    }],
+  });
+  try {
+    await waitFor(`http://127.0.0.1:${routerPort}/health`, child);
+    const advertised = await readRouted(routerPort, {
+      ...TURN_BODY,
+      model: GROQ_CANDIDATE.slug,
+      service_tier: "priority",
+    });
+    assert.equal(advertised.status, 200, advertised.body);
+    const unadvertised = await readRouted(routerPort, {
+      ...TURN_BODY,
+      model: GROQ_CANDIDATE.slug,
+      service_tier: "flex",
+    });
+    assert.equal(unadvertised.status, 200, unadvertised.body);
+    assert.equal(seen.length, 2);
+    assert.equal(seen[0].service_tier, "priority");
+    assert.equal(seen[0].extra_body?.service_tier, undefined, "only Grok 4.6 needs the extra_body copy");
+    assert.equal("service_tier" in seen[1], false, JSON.stringify(seen[1]));
+  } finally {
+    await stopChild(child);
+    await closeServer(gw.server);
+  }
+});
+
+test("a failover chain that finds no taker reports the model that failed", async () => {
+  const seen = [];
+  const gw = await gateway(async (request, response) => {
+    seen.push(await bodyJson(request));
+    quotaResponse(response);
+  });
+  const routerPort = await openPort();
+  const child = run(routerEnv(gw.port, routerPort));
+  try {
+    await waitFor(`http://127.0.0.1:${routerPort}/health`, child);
+    const result = await readRouted(routerPort, TURN_BODY);
+    assert.equal(seen.length, 2, "the candidate was tried");
+    assert.notEqual(result.status, 200);
+    const [event] = await waitForUsageEvents(child.stateDir, 1, child);
+    const activity = await fetch(`${callerBaseUrl(routerPort, CALLER_KEY)}/activity`).then((r) => r.json());
+    const settled = activity.recent.find((entry) => entry.requestId === event.requestId);
+    assert.ok(settled, JSON.stringify(activity));
+    assert.equal(settled.model, PRIMARY.slug);
+  } finally {
+    await stopChild(child);
+    await closeServer(gw.server);
+  }
+});
+
+test("an unmarked provider 502 is never retried", async () => {
+  const seen = [];
+  const gw = await gateway(async (request, response) => {
+    seen.push(await bodyJson(request));
+    response.writeHead(502, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ error: { message: "provider unavailable" } }));
+  });
+  const routerPort = await openPort();
+  const child = run(routerEnv(gw.port, routerPort), {
+    chain: [V2_FALLBACK.slug],
+    v2Credentials: true,
+  });
+  try {
+    await waitFor(`http://127.0.0.1:${routerPort}/health`, child);
+    const result = await readRouted(routerPort, { ...TURN_BODY, model: V2_PRIMARY.slug });
+
+    assert.deepEqual(seen.map((body) => body.model), [V2_PRIMARY.gatewayModel]);
+    assert.equal(result.status, 502);
+    assert.doesNotMatch(child.testErrors(), /routed transport retry/);
   } finally {
     await stopChild(child);
     await closeServer(gw.server);
@@ -553,7 +755,10 @@ test("a marked provider transport failure does not move an ordinary turn", async
     await waitFor(`http://127.0.0.1:${routerPort}/health`, child);
     const result = await readRouted(routerPort, { ...TURN_BODY, model: V2_PRIMARY.slug });
 
-    assert.deepEqual(seen.map((body) => body.model), [V2_PRIMARY.gatewayModel]);
+    assert.deepEqual(seen.map((body) => body.model), [
+      V2_PRIMARY.gatewayModel,
+      V2_PRIMARY.gatewayModel,
+    ]);
     assert.equal(result.status, 502);
     assert.match(child.testErrors(), /reason=transport -> none outcome=no-candidate/);
   } finally {
@@ -582,7 +787,10 @@ test("a subagent header cannot grant fallback authority to an unverified route",
       { headers: { "x-openai-subagent": "caller-claimed-child" } },
     );
 
-    assert.deepEqual(seen.map((body) => body.model), [PRIMARY.gatewayModel]);
+    assert.deepEqual(seen.map((body) => body.model), [
+      PRIMARY.gatewayModel,
+      PRIMARY.gatewayModel,
+    ]);
     assert.equal(result.status, 502);
     assert.match(child.testErrors(), /reason=transport -> none outcome=no-candidate/);
   } finally {
@@ -623,6 +831,7 @@ test("subagent transport failover stops on the first application response", asyn
     );
 
     assert.deepEqual(seen.map((body) => body.model), [
+      V2_PRIMARY.gatewayModel,
       V2_PRIMARY.gatewayModel,
       V2_FALLBACK.gatewayModel,
     ]);

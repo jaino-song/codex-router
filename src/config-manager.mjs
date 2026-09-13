@@ -21,8 +21,10 @@ import { findCodexBinary, spawnableCommand } from "./codex-binary.mjs";
 import {
   assertCallerSecret,
   isManagedCallerBaseUrl,
+  isManagedCodexBaseUrl,
   redactCallerUrl,
 } from "./caller-auth.mjs";
+import { CODEX_PATCH_HOOK_BASE_PATH } from "./codex-patch-hook-endpoint.mjs";
 import {
   privateFileIsProtected,
   protectPrivateFile,
@@ -159,14 +161,21 @@ function configuredRouterBaseUrl() {
     throw new Error("The local router caller key is missing; run ./bin/doctor --fix.");
   }
   assertCallerSecret(readFileSync(CALLER_SECRET_PATH, "utf8").trim());
+  // Keep an explicitly activated client capability during repair, catalog
+  // refresh, port migration and caller-key rotation. Fresh installs stay /v1.
+  const existingBase = rootValue(splitRoot(current).rootLines, "openai_base_url");
+  if (isManagedRouterBaseUrl(existingBase) &&
+      new URL(existingBase).pathname.replace(/\/$/, "").endsWith(CODEX_PATCH_HOOK_BASE_PATH)) {
+    return loopback(PORTS.router, CODEX_PATCH_HOOK_BASE_PATH);
+  }
   return loopback(PORTS.router, "/v1");
 }
 
 function isManagedRouterBaseUrl(value) {
   return (
     managedRouterBaseUrls.has(value) ||
-    isManagedCallerBaseUrl(value, PORTS.router) ||
-    isManagedCallerBaseUrl(value, LEGACY_PORTS.router)
+    isManagedCodexBaseUrl(value, PORTS.router) ||
+    isManagedCodexBaseUrl(value, LEGACY_PORTS.router)
   );
 }
 

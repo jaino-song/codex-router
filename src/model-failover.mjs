@@ -82,9 +82,10 @@ function isoOrUndefined(value) {
 // request all produce the same answer from every other provider too, so a swap
 // would spend two more round trips to reprint the same failure with a different
 // model's name on it -- and for a credential in particular it would hide the one
-// fact the operator needs. A 5xx is excluded because upstream-retry.mjs already
-// absorbs the transient shapes and because masking a provider outage costs the
-// operator an incident they would want to see.
+// fact the operator needs. A generic 5xx is excluded because the routed turn
+// path retries only the forwarder's reserved pre-response transport marker;
+// masking any other provider outage costs the operator an incident they would
+// want to see.
 export function classifyRoutedFailure({ status, bodyText, retryAfterSeconds, now } = {}) {
   const code = Number(status);
   if (!Number.isFinite(code) || code < 400) return { swap: false };
@@ -462,7 +463,6 @@ export function rankFailoverCandidates(
   const cooled = new Set(Object.keys(readProviderCooldowns({ now })));
   const available = (Array.isArray(models) ? models : []).filter(
     (model) =>
-      PROVIDERS.get(model.provider)?.directResponses !== true &&
       model.slug !== from?.slug &&
       eligible(model, {
         fromProvider,

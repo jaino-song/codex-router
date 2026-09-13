@@ -160,9 +160,16 @@ test("the POSIX dispatcher covers the Windows command set", () => {
   assert.ok(commands.length >= 16, `only found ${commands.length} Windows commands`);
   const posixAliases = {
     "signed-routing": "control",
+    activity: "control",
     tray: "model-router-tray",
     companion: "model-router-tray",
   };
+  // `activity` is a focused spelling of `control activity`; routed-worker
+  // guidance names it on both platforms, so Windows must dispatch it there.
+  assert.match(
+    windows,
+    /"activity"\s*\{\s*Invoke-RouterNode "src\\control\.mjs" \(@\("activity"\) \+ \$Arguments\)\s*\}/,
+  );
   for (const command of commands) {
     // `install` is refused on both sides of the packaged boundary; the Windows
     // wrapper only still offers it because it is also the checkout installer.

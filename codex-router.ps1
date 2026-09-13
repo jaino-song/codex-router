@@ -16,7 +16,7 @@ $Commands = @(
   "setup", "install", "doctor", "status", "providers", "provider-key", "caller-key", "key-pool", "search-sidecar", "enable",
   "disable", "chatgpt-session", "skills", "uninstall", "update", "rollback", "support-bundle",
   "smoke-test", "start", "stop", "test-model", "discover-models", "local-mlx",
-  "signed-routing", "refresh-catalog", "media", "tray", "panel", "companion"
+  "signed-routing", "refresh-catalog", "media", "tray", "panel", "companion", "activity"
 )
 if ($Command -notin $Commands) {
   throw "Unknown command '$Command'. Choose: $($Commands -join ', ')."
@@ -880,6 +880,7 @@ switch ($Command) {
   "provider-key" { Invoke-RouterNode "src\provider-key.mjs" $Arguments }
   "caller-key" { Invoke-RouterNode "src\caller-key.mjs" $Arguments }
   "key-pool" { Invoke-RouterNode "src\control.mjs" (@("key-pool") + $Arguments) }
+  "activity" { Invoke-RouterNode "src\control.mjs" (@("activity") + $Arguments) }
   "search-sidecar" { Invoke-RouterNode "src\search-sidecar-control.mjs" $Arguments }
   "chatgpt-session" { Invoke-RouterNode "src\chatgpt-session.mjs" $Arguments }
   "skills" { Invoke-RouterNode "src\skills-install.mjs" $Arguments }

@@ -183,18 +183,55 @@ export function readCodexAccountUsage({
       else resolve(value);
     };
     const send = (message) => {
-      processHandle.stdin.write(`${JSON.stringify(message)}\n`);
+      try {
+        if (!processHandle.stdin || processHandle.stdin.destroyed) return false;
+        return processHandle.stdin.write(`${JSON.stringify(message)}\n`);
+      } catch {
+        return false;
+      }
     };
+    // An absent answer is the same class of event as a refused one, and the
+    // refused case is already tolerated below. Waiting for both meant one read
+    // that never came back discarded the other one's answer: on a machine where
+    // account/rateLimits/read hung and account/usage/read returned a full daily
+    // ledger, this rejected, the caller had no account usage at all, and every
+    // surface fell back to publishing zero. Keep whatever arrived; only a window
+    // that produced nothing is a failure.
+    const emptyResponse = (id) => (
+      id === 2 ? { rateLimits: {} } : { summary: {}, dailyUsageBuckets: [] }
+    );
+    const partialUsage = () => normalizeCodexAccountUsage(
+      responses.get(2) ?? emptyResponse(2),
+      responses.get(3) ?? emptyResponse(3),
+    );
     const timer = setTimeout(
-      () => finish(new Error("Codex account usage request timed out.")),
+      () => {
+        if (responses.size === 0) {
+          finish(new Error("Codex account usage request timed out."));
+          return;
+        }
+        finish(undefined, partialUsage());
+      },
       timeoutMs,
     );
 
     processHandle.once("error", () => {
       finish(new Error("The Codex app-server could not be started."));
     });
-    processHandle.once("exit", (code) => {
-      if (!settled) finish(new Error(`Codex app-server exited before replying (${code ?? "signal"}).`));
+    // An app-server that dies after answering one account read is the absent
+    // answer above arriving early, so it keeps the half that arrived. That exit
+    // used to reject, and Control Center painted the Node stack as "Some router
+    // data could not load" over an otherwise healthy snapshot. Settle on
+    // `close`, not `exit`: Node can report the exit while the last reply is
+    // still in the stdout pipe, and closing the reader there discards an answer
+    // the app-server had already written.
+    processHandle.once("close", (code) => {
+      if (settled) return;
+      if (responses.size > 0) {
+        finish(undefined, partialUsage());
+        return;
+      }
+      finish(new Error(`Codex app-server exited before replying (${code ?? "signal"}).`));
     });
     lines.on("line", (line) => {
       let message;
@@ -219,15 +256,12 @@ export function readCodexAccountUsage({
       // app-server races). Hard-failing rateLimits used to paint the whole
       // Models page with a stack trace while the snapshot itself was fine.
       if (message.error) {
-        responses.set(
-          message.id,
-          message.id === 2 ? { rateLimits: {} } : { summary: {}, dailyUsageBuckets: [] },
-        );
+        responses.set(message.id, emptyResponse(message.id));
       } else {
         responses.set(message.id, message.result);
       }
       if (responses.size === 2) {
-        finish(undefined, normalizeCodexAccountUsage(responses.get(2), responses.get(3)));
+        finish(undefined, partialUsage());
       }
     });
 

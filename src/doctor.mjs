@@ -19,6 +19,7 @@ import {
   providerNeedsNoKey,
   RUNTIME_PROVIDERS,
   RUNTIME_PROVIDER_WARNINGS,
+  USER_MODELS_SKIPPED,
 } from "./model-registry.mjs";
 import { grokOAuthStatus } from "./grok-oauth-status.mjs";
 import {
@@ -1040,6 +1041,20 @@ for (const warning of RUNTIME_PROVIDER_WARNINGS) {
     "Generic provider registry",
     warning,
     "Repair or remove the malformed generic provider descriptor, then rerun the doctor.",
+  );
+}
+
+// A skipped user model is still in the picker catalog, but the router has no
+// route for its slug and refuses it with `unrouted_model` (#689). A skipped
+// entry whose slug survives as an alias of a checked-in route is a migration,
+// not a problem, so only slugs that ended up with no route are reported.
+for (const [slug, reason] of USER_MODELS_SKIPPED) {
+  if (MODEL_BY_SLUG.has(slug)) continue;
+  add(
+    "warn",
+    `User model ${slug}`,
+    `skipped when the model registry loaded: ${reason}`,
+    "Fix or remove the entry in user-models.json, then restart the router with bin/control service restart.",
   );
 }
 

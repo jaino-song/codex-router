@@ -464,106 +464,6 @@ test("plain Codex provider routes accept the caller key as a bearer token", asyn
   }
 });
 
-test("ChatGPT Web routes bypass the gateway and preserve the native Codex envelope", async () => {
-  const testRoot = mkdtempSync(path.join(os.tmpdir(), "chatgpt-web-direct-route-"));
-  const userModelsPath = path.join(testRoot, "user-models.json");
-  writeFileSync(userModelsPath, JSON.stringify({
-    version: 1,
-    models: [{
-      slug: "chatgpt-web/light",
-      gatewayModel: "chatgpt-web-light",
-      upstreamModel: "chatgpt-web/light",
-      provider: "chatgpt-web",
-      listed: true,
-      displayName: "ChatGPT Web — Instant",
-      description: "Test ChatGPT Web direct Responses route.",
-      priority: 100,
-      reasoningLevels: [{ effort: "low", description: "Quick reasoning" }],
-      defaultEffort: "low",
-      contextWindow: 41_000,
-      autoCompact: 32_000,
-      inputModalities: ["text", "image"],
-      compHash: "chatgpt-web-light-routing-test-v1"
-    }],
-  }));
-  const bridgeRequests = [];
-  const exactTurnResponse = '{ "id": "resp_chatgpt_web_test", "object": "response", "status": "completed", "model": "chatgpt-web/light", "output": [], "usage": { "input_tokens": 12, "output_tokens": 3, "total_tokens": 15 } }\n';
-  const bridge = await mockServer(async (request, response) => {
-    const body = await bodyJson(request);
-    bridgeRequests.push({ url: request.url, headers: request.headers, body });
-    if (request.url.startsWith("/v1/responses/compact")) {
-      json(response, 409, {
-        error: {
-          type: "invalid_request_error",
-          message: "browser bridge retained-source compaction is unavailable",
-        },
-      });
-      return;
-    }
-    response.writeHead(200, { "Content-Type": "application/json" });
-    response.end(exactTurnResponse);
-  });
-  const gatewayRequests = [];
-  const gateway = await mockServer(async (request, response) => {
-    gatewayRequests.push(request.url);
-    json(response, 200, { object: "response", status: "completed", output: [] });
-  });
-  const routerPort = await openPort();
-  const router = run("router.mjs", {
-    CODEX_ROUTER_PORT: String(routerPort),
-    CODEX_ROUTER_STATE_DIR: path.join(testRoot, "state"),
-    MODEL_ROUTER_USER_MODELS: userModelsPath,
-    MODEL_ROUTER_CHATGPT_WEB_BASE_URL: `http://127.0.0.1:${bridge.port}/v1`,
-    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
-    CODEX_ROUTER_QUIET: "1",
-  });
-
-  try {
-    await waitFor(`${routerBase(routerPort)}/models`, router);
-    const turnPayload = {
-      model: "chatgpt-web/light",
-      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] }],
-      tools: [{ type: "function", name: "workspace_tool", parameters: { type: "object" } }],
-      client_metadata: { "x-codex-turn-metadata": "body-turn-authority" },
-      stream: false,
-    };
-    const turn = await fetch(`${routerBase(routerPort)}/responses`, {
-      method: "POST",
-      headers: {
-        Authorization: "Bearer CHATGPT_SESSION_MUST_NOT_LEAK",
-        "Content-Type": "application/json",
-        "X-Codex-Turn-Metadata": "header-turn-authority",
-      },
-      body: JSON.stringify(turnPayload),
-    });
-    const turnText = await turn.text();
-    assert.equal(turn.status, 200, turnText);
-    assert.equal(turnText, exactTurnResponse);
-    assert.equal(bridgeRequests.length, 1);
-    assert.equal(bridgeRequests[0].url, "/v1/responses");
-    assert.equal(bridgeRequests[0].headers.authorization, "Bearer local");
-    assert.equal(bridgeRequests[0].headers["x-codex-turn-metadata"], "header-turn-authority");
-    assert.deepEqual(bridgeRequests[0].body, turnPayload);
-    assert.deepEqual(gatewayRequests, []);
-
-    const compact = await fetch(`${routerBase(routerPort)}/responses/compact`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ...turnPayload, stream: false }),
-    });
-    assert.equal(compact.status, 409);
-    assert.match(await compact.text(), /retained-source compaction is unavailable/);
-    assert.equal(bridgeRequests.length, 2, "a failed browser compaction was sent more than once");
-    assert.equal(bridgeRequests[1].url, "/v1/responses/compact");
-    assert.deepEqual(gatewayRequests, []);
-  } finally {
-    await stopChild(router);
-    await closeServer(bridge.server);
-    await closeServer(gateway.server);
-    rmSync(testRoot, { recursive: true, force: true });
-  }
-});
-
 test("plain signed Codex routes accept the current Codex API key", async () => {
   const testRoot = mkdtempSync(path.join(os.tmpdir(), "signed-codex-api-key-route-"));
   const authPath = path.join(testRoot, "auth.json");
@@ -915,6 +815,103 @@ test("a routed Grok terminal SSE error is recorded as a failed turn", async () =
     assert.equal("streamAborted" in event, false);
   } finally {
     await stopChild(router);
+    await closeServer(gateway.server);
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("a Grok terminal SSE error stays a failed turn when the client leaves the still-open stream", { timeout: 30_000 }, async () => {
+  let gatewayRequests = 0;
+  const gateway = await mockServer(async (request, response) => {
+    await bodyJson(request);
+    gatewayRequests += 1;
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.write(
+      'event: response.reasoning_summary_text.delta\n' +
+        'data: {"type":"response.reasoning_summary_text.delta","delta":"Checking the tool result."}\n\n',
+    );
+    if (gatewayRequests === 1) {
+      response.write(
+        'event: error\n' +
+          'data: {"type":"error","code":"local_router_stream_failed","message":"Grok stopped after a tool result and its repair request failed upstream.","param":null}\n\n',
+      );
+    }
+    // A gateway can keep the stream open after its terminal; the WebSocket
+    // edge then aborts it. Hold it until the router lets go.
+    await new Promise((resolve) => {
+      request.once("close", resolve);
+      response.once("close", resolve);
+    });
+  });
+  const routerPort = await openPort();
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "codex-router-grok-open-error-"));
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_STATE_DIR: stateDir,
+    CODEX_ROUTER_QUIET: "1",
+  });
+  const request = (signal) =>
+    fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer CODEX_CALLER_SECRET",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "grok-oauth/grok-4.6",
+        input: "continue after the tool result",
+        stream: true,
+      }),
+      signal,
+    });
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+
+    // The terminal error reaches the client, which then leaves the open stream.
+    const leaver = new AbortController();
+    const failed = await request(leaver.signal);
+    assert.equal(failed.status, 200);
+    const reader = failed.body.getReader();
+    const decoder = new TextDecoder();
+    let body = "";
+    while (!body.includes("local_router_stream_failed")) {
+      const { value, done } = await reader.read();
+      assert.equal(done, false, `the stream ended before its terminal error: ${body}`);
+      body += decoder.decode(value, { stream: true });
+    }
+    leaver.abort();
+    const [failure] = await waitForUsageEvents(stateDir, 1, router);
+    assert.equal(failure.model, "grok-oauth/grok-4.6");
+    assert.equal(failure.status, 502);
+
+    // Negative control: leaving an open Grok stream that reported no failure
+    // is still a cancellation, not a provider failure. Leave only once the
+    // stream is flowing, the same point the failed turn above was left at;
+    // reasoning is liveness, so it reaches the client without a terminal.
+    const within = (promise, label) => {
+      let timer;
+      return Promise.race([
+        promise,
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`${label} did not arrive`)), 10_000);
+        }),
+      ]).finally(() => clearTimeout(timer));
+    };
+    const canceler = new AbortController();
+    const flowing = await within(request(canceler.signal), "the open stream's head");
+    assert.equal(flowing.status, 200);
+    const firstChunk = await within(flowing.body.getReader().read(), "the open stream's reasoning");
+    assert.equal(firstChunk.done, false);
+    canceler.abort();
+    const events = await waitForUsageEvents(stateDir, 2, router);
+    assert.equal(events[1].model, "grok-oauth/grok-4.6", JSON.stringify(events));
+    assert.equal(events[1].status, 0, JSON.stringify(events));
+    assert.equal(gatewayRequests, 2);
+  } finally {
+    await stopChild(router);
+    gateway.server.closeAllConnections?.();
     await closeServer(gateway.server);
     rmSync(stateDir, { recursive: true, force: true });
   }
@@ -1595,8 +1592,10 @@ test("router relays encrypted Codex subagent payloads before external routing", 
   }
 });
 
-test("router fails closed when an encrypted subagent payload cannot be relayed", async () => {
+test("router preserves relay 401 so Codex can refresh authentication", async () => {
+  let nativeRequests = 0;
   const native = await mockServer(async (_request, response) => {
+    nativeRequests += 1;
     json(response, 401, { error: { message: "native sign-in required" } });
   });
   let gatewayRequests = 0;
@@ -1633,7 +1632,107 @@ test("router fails closed when an encrypted subagent payload cannot be relayed",
         ],
       }),
     });
-    assert.equal(response.status, 502);
+    assert.equal(response.status, 401);
+    const body = await response.json();
+    assert.equal(body.error.code, "ERR_NATIVE_AGENT_RELAY_UNAUTHORIZED");
+    assert.doesNotMatch(JSON.stringify(body), /native sign-in required/u);
+    assert.equal(nativeRequests, 1);
+    assert.equal(gatewayRequests, 0);
+
+    const retry = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer refreshed-session",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "grok-oauth/grok-4.5",
+        input: [
+          {
+            type: "agent_message",
+            content: [
+              { type: "input_text", text: "Message Type: MESSAGE\nPayload:\n" },
+              { type: "encrypted_content", encrypted_content: "gAAAAA-unreadable=" },
+            ],
+          },
+        ],
+      }),
+    });
+    assert.equal(retry.status, 401);
+    assert.equal(nativeRequests, 2, "401 must not enter the 429 anti-storm cache");
+    assert.equal(gatewayRequests, 0);
+  } finally {
+    await stopChild(router);
+    await Promise.all([closeServer(native.server), closeServer(gateway.server)]);
+  }
+});
+
+test("router preserves relay 429 and suppresses repeated native attempts per account", async () => {
+  let nativeRequests = 0;
+  const native = await mockServer(async (request, response) => {
+    nativeRequests += 1;
+    await bodyJson(request);
+    json(response, 429, { error: { message: "native relay quota exhausted" } });
+  });
+  let gatewayRequests = 0;
+  const gateway = await mockServer(async (_request, response) => {
+    gatewayRequests += 1;
+    json(response, 200, { route: "external" });
+  });
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${native.port}/backend-api/codex`,
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_AGENT_RELAY_FAILURE_BACKOFF_MS: "250",
+    CODEX_ROUTER_QUIET: "1",
+  });
+
+  const relayRequest = (account) =>
+    fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer CHATGPT_SESSION_TOKEN",
+        "ChatGPT-Account-Id": account,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "kimi-oauth/k3",
+        stream: false,
+        input: [
+          {
+            type: "agent_message",
+            content: [
+              { type: "input_text", text: "Message Type: NEW_TASK\nPayload:\n" },
+              { type: "encrypted_content", encrypted_content: "gAAAAA-rate-limited=" },
+            ],
+          },
+        ],
+      }),
+    });
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    const first = await relayRequest("account-a");
+    assert.equal(first.status, 429);
+    const firstBody = await first.json();
+    assert.equal(firstBody.error.code, "ERR_NATIVE_AGENT_RELAY_RATE_LIMITED");
+    assert.doesNotMatch(JSON.stringify(firstBody), /native relay quota exhausted/u);
+    assert.equal(nativeRequests, 1);
+    assert.equal(gatewayRequests, 0);
+
+    const repeated = await relayRequest("account-a");
+    assert.equal(repeated.status, 429);
+    assert.equal(nativeRequests, 1, "same account and ciphertext should use the backoff cache");
+
+    const otherAccount = await relayRequest("account-b");
+    assert.equal(otherAccount.status, 429);
+    assert.equal(nativeRequests, 2, "relay failures must stay partitioned by native account");
+
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const afterBackoff = await relayRequest("account-a");
+    assert.equal(afterBackoff.status, 429);
+    assert.equal(nativeRequests, 3, "relay should retry native after the short backoff expires");
     assert.equal(gatewayRequests, 0);
   } finally {
     await stopChild(router);
@@ -2596,6 +2695,179 @@ test("compaction never treats reasoning as final text and falls back to chat con
   } finally {
     await stopChild(router);
     await closeServer(gateway.server);
+  }
+});
+
+// ------------------------------------------------------------
+// Saved external calls must remain replayable on native turns and compaction.
+// The optional item ID is separate from the call_id that pairs each result.
+// ------------------------------------------------------------
+
+test("native replay omits incompatible item IDs without changing call-result pairs", async (t) => {
+  const nativeRequests = [];
+  const gatewayRequests = [];
+  const nativePrefixes = { function_call: "fc", custom_tool_call: "ctc", message: "msg" };
+  const native = await mockServer(async (request, response) => {
+    const body = await bodyJson(request);
+    nativeRequests.push({ url: request.url, headers: request.headers, body });
+    const invalid = body.input.find((item) =>
+      Object.hasOwn(nativePrefixes, item?.type) &&
+      typeof item.id === "string" &&
+      !item.id.startsWith(nativePrefixes[item.type])
+    );
+    if (invalid) {
+      json(response, 400, {
+        error: {
+          type: "invalid_request_error",
+          message: `Expected an ID that begins with '${nativePrefixes[invalid.type]}'.`,
+        },
+      });
+      return;
+    }
+    json(response, 200, { route: "native" });
+  });
+  const gateway = await mockServer(async (request, response) => {
+    gatewayRequests.push(await bodyJson(request));
+    json(response, 200, { route: "external" });
+  });
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "native-function-call-ids-"));
+  const authPath = path.join(testRoot, "auth.json");
+  writeFileSync(authPath, JSON.stringify({
+    auth_mode: "chatgpt",
+    tokens: { access_token: "test-native-session-token", account_id: "test-native-account" },
+  }), { mode: 0o600 });
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${native.port}/backend-api/codex`,
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_NATIVE_SESSION_FALLBACK: "1",
+    MODEL_ROUTER_CODEX_AUTH: authPath,
+    MODEL_ROUTER_STATE_DIR: path.join(testRoot, "state"),
+    CODEX_HOME: path.join(testRoot, "codex"),
+    CODEX_ROUTER_QUIET: "1",
+  });
+
+  // ------------------------------------------------------------
+  // Explicit expected fields keep the test independent of the prefix check.
+  // Non-string IDs are outside this repair, not accepted by a full validator.
+  // ------------------------------------------------------------
+
+  const idCases = [
+    { input: { id: "tool_example_foreign" }, expected: {} },
+    { input: { id: "call_example_foreign" }, expected: {} },
+    { input: { id: "" }, expected: {} },
+    { input: { id: "fc_native_example" }, expected: { id: "fc_native_example" } },
+    { input: { id: "fcFutureFormat" }, expected: { id: "fcFutureFormat" } },
+    { input: {}, expected: {} },
+    { input: { id: null }, expected: { id: null } },
+    { input: { id: 42 }, expected: { id: 42 } },
+  ];
+  const input = [];
+  const expected = [];
+  for (const [index, fields] of idCases.entries()) {
+    const call = {
+      type: "function_call",
+      call_id: index === 0 ? "tool_example_foreign" : `call_pair_${index}`,
+      name: "read_fixture",
+      namespace: "functions",
+      arguments: JSON.stringify({ path: `fixture-${index}.txt` }),
+      status: "completed",
+    };
+    const output = {
+      type: "function_call_output",
+      id: `fco_result_${index}`,
+      call_id: call.call_id,
+      output: `fixture contents ${index}`,
+    };
+    input.push({ ...call, ...fields.input }, output);
+    expected.push({ ...call, ...fields.expected }, output);
+  }
+  // Custom tool calls and messages are validated against their own prefixes.
+  // Outputs and item references are not, and must stay byte-identical.
+  const withoutId = ({ id: _id, ...item }) => item;
+  const customCall = { type: "custom_tool_call", call_id: "custom_pair", name: "custom_fixture", input: "fixture" };
+  const nativeCustomCall = { ...customCall, id: "ctc_native_example", call_id: "custom_native" };
+  const userMessage = { type: "message", id: "tool_message", role: "user", content: [{ type: "input_text", text: "continue" }] };
+  const routedReply = { type: "message", id: "chatcmpl-example", role: "assistant", content: [{ type: "output_text", text: "routed" }] };
+  const nativeReply = { ...routedReply, id: "msg_native_example", content: [{ type: "output_text", text: "native" }] };
+  const otherItems = [
+    [{ ...customCall, id: "tool_custom" }, customCall],
+    [{ type: "custom_tool_call_output", id: "custom_result", call_id: "custom_pair", output: "fixture result" }],
+    [nativeCustomCall],
+    [{ type: "custom_tool_call_output", id: "custom_native_result", call_id: "custom_native", output: "native result" }],
+    [{ type: "item_reference", id: "tool_reference" }],
+    [routedReply, withoutId(routedReply)],
+    [nativeReply],
+    [userMessage, withoutId(userMessage)],
+  ];
+  for (const [original, normalized = original] of otherItems) {
+    input.push(original);
+    expected.push(normalized);
+  }
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+
+    // ------------------------------------------------------------
+    // Each caller and endpoint receives old full history with no prior turn.
+    // Replaying the normalized result must not change the history again.
+    // ------------------------------------------------------------
+
+    for (const suppliedCredential of [true, false]) {
+      for (const [label, endpoint, trigger] of [
+        ["continuation", "/responses", []],
+        ["compaction V1", "/responses/compact", []],
+        ["compaction V2", "/responses", [{ type: "compaction_trigger" }]],
+      ]) {
+        await t.test(`${suppliedCredential ? "caller session" : "substituted session"}: ${label}`, async () => {
+          const expectedInput = [...expected, ...trigger];
+          for (const history of [[...input, ...trigger], expectedInput]) {
+            const requestCount = nativeRequests.length;
+            const response = await fetch(`${routerBase(routerPort)}${endpoint}`, {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${suppliedCredential ? "test-caller-session" : CALLER_KEY}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({ model: "gpt-5.6-sol", input: history, previous_response_id: "resp_previous" }),
+            });
+            const result = await response.json();
+            assert.equal(nativeRequests.length, requestCount + 1);
+            assert.equal(response.status, 200, JSON.stringify(result));
+            const sent = nativeRequests.at(-1);
+            assert.equal(sent.url, `/backend-api/codex${endpoint}`);
+            assert.equal(sent.headers.authorization, `Bearer ${suppliedCredential ? "test-caller-session" : "test-native-session-token"}`);
+            assert.deepEqual(sent.body.input, expectedInput);
+            assert.equal(sent.body.previous_response_id, endpoint === "/responses/compact" ? "resp_previous" : undefined);
+          }
+        });
+      }
+    }
+
+    // ------------------------------------------------------------
+    // Native preparation must not rewrite history sent to an external model.
+    // Use the original full call, not the already-normalized native result.
+    // ------------------------------------------------------------
+
+    await t.test("external replay preserves its provider item ID", async () => {
+      const nativeCount = nativeRequests.length;
+      const response = await fetch(`${routerBase(routerPort)}/responses`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${CALLER_KEY}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "kimi-oauth/k3", input: input.slice(0, 2) }),
+      });
+      await response.json();
+      assert.equal(response.status, 200);
+      assert.equal(nativeRequests.length, nativeCount);
+      assert.equal(gatewayRequests.length, 1);
+      assert.deepEqual(gatewayRequests[0].input, input.slice(0, 2));
+    });
+  } finally {
+    await stopChild(router);
+    await closeServer(native.server);
+    await closeServer(gateway.server);
+    rmSync(testRoot, { recursive: true, force: true });
   }
 });
 
@@ -5806,10 +6078,10 @@ test("API forwarder routes GLM coding-plan models with thinking enabled", async 
   }
 });
 
-test("API forwarder restores bridged GLM thinking as native reasoning_content", async () => {
+["zai-coding-glm-5-3", "deepseek-v4-flash", "commandcode-deepseek-v4-flash"].forEach((gatewayModel) => test(`API forwarder restores ${gatewayModel} thinking as native reasoning_content`, async () => {
   const upstreamRequests = [];
   const upstream = await mockServer(async (request, response) => {
-    upstreamRequests.push({ headers: request.headers, body: await bodyJson(request) });
+    upstreamRequests.push({ url: request.url, headers: request.headers, body: await bodyJson(request) });
     json(response, 200, { choices: [] });
   });
   const forwarderPort = await openPort();
@@ -5817,6 +6089,10 @@ test("API forwarder restores bridged GLM thinking as native reasoning_content", 
     CODEX_ROUTER_API_PORT: String(forwarderPort),
     ZAI_CODING_BASE_URL: `http://127.0.0.1:${upstream.port}`,
     ZAI_API_KEY: "TEST_ZAI_API_KEY",
+    DEEPSEEK_API_BASE_URL: `http://127.0.0.1:${upstream.port}/v1`,
+    DEEPSEEK_API_KEY: "TEST_DEEPSEEK_API_KEY",
+    COMMANDCODE_BASE_URL: `http://127.0.0.1:${upstream.port}/provider/v1`,
+    COMMAND_CODE_API_KEY: "TEST_COMMANDCODE_API_KEY",
     CODEX_ROUTER_QUIET: "1",
   });
 
@@ -5833,7 +6109,7 @@ test("API forwarder restores bridged GLM thinking as native reasoning_content", 
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          model: "zai-coding-glm-5-3",
+          model: gatewayModel,
           messages: [
             { role: "user", content: "first" },
             {
@@ -5856,12 +6132,20 @@ test("API forwarder restores bridged GLM thinking as native reasoning_content", 
     const assistant = request.messages[1];
     assert.equal(assistant.reasoning_content, "reason one\nreason two");
     assert.deepEqual(assistant.content, [{ type: "text", text: "visible answer" }]);
-    assert.deepEqual(request.thinking, { type: "enabled", clear_thinking: false });
+    if (gatewayModel === "zai-coding-glm-5-3") {
+      assert.deepEqual(request.thinking, { type: "enabled", clear_thinking: false });
+    } else if (gatewayModel === "deepseek-v4-flash") {
+      assert.deepEqual(request.thinking, { type: "enabled" });
+    } else {
+      assert.equal(upstreamRequests[0].url, "/provider/v1/chat/completions");
+      assert.equal(request.thinking, undefined, "history preservation must not enable a new thinking parameter");
+      assert.equal(request.reasoning_effort, undefined);
+    }
   } finally {
     await stopChild(forwarder);
     await closeServer(upstream.server);
   }
-});
+}));
 
 test("API forwarder preserves Z.ai cached-token telemetry before the LiteLLM bridge", async () => {
   const upstream = await mockServer(async (request, response) => {
@@ -7002,6 +7286,69 @@ test("router replays verified search history without exposing a new search tool"
   }
 });
 
+test("checked-in opencode Muse Responses routes replay completed search history without advertising search", async () => {
+  const gatewayRequests = [];
+  const gateway = await mockServer(async (request, response) => {
+    gatewayRequests.push(await bodyJson(request));
+    json(response, 200, {
+      id: `resp-${gatewayRequests.length}`,
+      object: "response",
+      status: "completed",
+      output: [{
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "ok" }],
+      }],
+    });
+  });
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_QUIET: "1",
+  });
+  const history = [{
+    type: "web_search_call",
+    id: "completed-search-history",
+    status: "completed",
+    action: { type: "search", query: "router contract" },
+  }];
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    for (const slug of [
+      "opencode-go-responses/muse-spark-1.2-contributor",
+      "opencode-go-responses/muse-spark-1.3-contributor",
+    ]) {
+      const response = await fetch(`${routerBase(routerPort)}/responses`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${CALLER_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ model: slug, input: history }),
+      });
+      assert.equal(response.status, 200, router.testErrors());
+    }
+
+    assert.deepEqual(
+      gatewayRequests.map((request) => request.model),
+      [
+        "opencode-go-responses-muse-spark-1-2-contributor",
+        "opencode-go-responses-muse-spark-1-3-contributor",
+      ],
+    );
+    assert.ok(gatewayRequests.every((request) => (
+      Array.isArray(request.input) &&
+      request.input.some((item) => item.type === "web_search_call") &&
+      (!Array.isArray(request.tools) || request.tools.every((tool) => tool.type !== "web_search"))
+    )));
+  } finally {
+    await stopChild(router);
+    await closeServer(gateway.server);
+  }
+});
+
 test("API forwarder strips web_search_options for Fireworks", async () => {
   const upstreamRequests = [];
   const upstream = await mockServer(async (request, response) => {
@@ -7405,6 +7752,8 @@ test("router normalizes forced tool choices before LiteLLM for auto-tool-choice 
     // LiteLLM does its Responses -> Chat Completions translation after the
     // router, so this must already be auto when it reaches the gateway.
     for (const [slug, gatewayModel] of [
+      ["opencode-go/deepseek-v4.1-flash", "opencode-go-deepseek-v4-1-flash"],
+      ["openrouter/deepseek-v4.1-flash", "openrouter-deepseek-v4-1-flash"],
       ["ollama-cloud/minimax-m3", "ollama-cloud-minimax-m3"],
       ["commandcode/muse-spark-1.2", "commandcode-muse-spark-1-2"],
       [
@@ -7606,6 +7955,154 @@ test("native redirect falls back to native when the target cannot route", async 
   } finally {
     await stopChild(router);
     await closeServer(native.server);
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("router refuses a provider-prefixed slug it has no route for instead of forwarding it to ChatGPT (#689)", async () => {
+  const nativeRequests = [];
+  const native = await mockServer(async (request, response) => {
+    nativeRequests.push({ url: request.url, body: await bodyJson(request) });
+    json(response, 200, { route: "native" });
+  });
+  const gatewayRequests = [];
+  const gateway = await mockServer(async (request, response) => {
+    gatewayRequests.push(await bodyJson(request));
+    json(response, 200, { route: "external" });
+  });
+  const routerPort = await openPort();
+  const testRoot = mkdtempSync(path.join(os.tmpdir(), "codex-router-unrouted-slug-"));
+  const stateDir = path.join(testRoot, "state");
+  mkdirSync(stateDir, { recursive: true });
+  const genericProviders = path.join(testRoot, "generic-providers.json");
+  writeFileSync(genericProviders, `${JSON.stringify({
+    version: 1,
+    providers: [{
+      id: "unorouter",
+      displayName: "UnoRouter",
+      baseUrl: "https://unorouter.example.test/v1",
+      adapter: "openai-chat",
+      headers: {},
+      allowPrivate: false,
+      enabled: true,
+    }],
+  })}\n`);
+  const userModel = (upstreamModel, extra = {}) => ({
+    slug: `unorouter/${upstreamModel}`,
+    gatewayModel: `unorouter-${upstreamModel}`,
+    upstreamModel,
+    provider: "unorouter",
+    listed: true,
+    displayName: `${upstreamModel} (curated)`,
+    description: "Test fixture.",
+    priority: 500,
+    defaultEffort: "medium",
+    reasoningLevels: [{ effort: "medium", description: "Balanced reasoning" }],
+    contextWindow: 131072,
+    autoCompact: 110000,
+    inputModalities: ["text"],
+    compHash: `unorouter-${upstreamModel}-user-v1`,
+    ...extra,
+  });
+  const userModels = path.join(testRoot, "user-models.json");
+  writeFileSync(userModels, `${JSON.stringify({
+    version: 1,
+    models: [
+      // A sibling that loads, as in the report: other unorouter/* models work.
+      userModel("uno-mini"),
+      // The reported slug, skipped at load. Its picker entry would still
+      // exist, but the live router has no route for it.
+      userModel("gpt-6-astra", { multiAgentVersion: "v2" }),
+    ],
+  })}\n`);
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_NATIVE_BASE_URL: `http://127.0.0.1:${native.port}/backend-api/codex`,
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    CODEX_ROUTER_STATE_DIR: stateDir,
+    MODEL_ROUTER_GENERIC_PROVIDERS: genericProviders,
+    MODEL_ROUTER_USER_MODELS: userModels,
+    CODEX_ROUTER_QUIET: "1",
+  });
+  const post = (pathname, model, input = "turn") =>
+    fetch(`${routerBase(routerPort)}${pathname}`, {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer CODEX_CALLER_SECRET",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ model, input }),
+    });
+
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+
+    const refused = await post("/responses", "unorouter/gpt-6-astra");
+    assert.equal(refused.status, 400);
+    const refusal = (await refused.json()).error;
+    assert.equal(refusal.type, "invalid_request_error");
+    assert.equal(refusal.code, "unrouted_model");
+    assert.equal(refusal.param, "model");
+    assert.match(refusal.message, /"unorouter\/gpt-6-astra" has no route in this running router/);
+    assert.match(refusal.message, /Provider "unorouter" is registered and enabled/);
+    assert.match(refusal.message, /skipped the user model with this slug: .*multiAgentVersion v2/);
+    assert.match(refusal.message, /bin\/control service restart/);
+    assert.doesNotMatch(refusal.message, /unorouter\.example\.test|CODEX_CALLER_SECRET|_codex-router/);
+    assert.equal(nativeRequests.length, 0, "an unrouted prefixed slug must not reach ChatGPT");
+    assert.equal(gatewayRequests.length, 0);
+
+    // Compaction V1 enters through the same handler and must refuse the same way.
+    const compact = await post("/responses/compact", "unorouter/gpt-6-astra", [
+      { type: "message", role: "user", content: [{ type: "input_text", text: "compact" }] },
+    ]);
+    assert.equal(compact.status, 400);
+    assert.equal((await compact.json()).error.code, "unrouted_model");
+
+    const unknownProvider = await post("/responses", "nosuch/model");
+    assert.equal(unknownProvider.status, 400);
+    assert.match((await unknownProvider.json()).error.message, /No enabled provider named "nosuch"/);
+    assert.equal(nativeRequests.length, 0);
+
+    // A registered prefixed slug still routes to the gateway.
+    const routed = await post("/responses", "unorouter/uno-mini");
+    assert.equal(routed.status, 200);
+    assert.equal(gatewayRequests.at(-1).model, "unorouter-uno-mini");
+
+    // An unprefixed native slug -- even one sharing the upstream id above --
+    // is still native passthrough, unchanged.
+    const nativeTurn = await post("/responses", "gpt-6-astra");
+    assert.equal(nativeTurn.status, 200);
+    assert.equal(nativeRequests.length, 1);
+    assert.equal(nativeRequests[0].body.model, "gpt-6-astra");
+    assert.equal(gatewayRequests.length, 1);
+
+    // Native aliases and the native redirect are read per request and keep
+    // serving unprefixed slugs; the redirect does not swallow an unrouted
+    // prefixed slug.
+    writeFileSync(
+      path.join(stateDir, "native-aliases.json"),
+      `${JSON.stringify({ version: 1, aliases: { "gpt-5.5": "unorouter/uno-mini" } })}\n`,
+    );
+    writeFileSync(
+      path.join(stateDir, "native-redirect.json"),
+      `${JSON.stringify({ version: 1, model: "kimi-oauth/k3" })}\n`,
+    );
+    const aliased = await post("/responses", "gpt-5.5");
+    assert.equal(aliased.status, 200);
+    assert.equal(gatewayRequests.at(-1).model, "unorouter-uno-mini");
+    const redirected = await post("/responses", "gpt-5.6-luna");
+    assert.equal(redirected.status, 200);
+    assert.equal(gatewayRequests.at(-1).model, "kimi-oauth-k3");
+    const stillRefused = await post("/responses", "unorouter/gpt-6-astra");
+    assert.equal(stillRefused.status, 400);
+    assert.equal((await stillRefused.json()).error.code, "unrouted_model");
+    assert.equal(gatewayRequests.length, 3);
+    assert.equal(nativeRequests.length, 1);
+    assert.ok(nativeRequests.every((entry) => !String(entry.body.model).includes("/")));
+  } finally {
+    await stopChild(router);
+    await closeServer(native.server);
+    await closeServer(gateway.server);
     rmSync(testRoot, { recursive: true, force: true });
   }
 });
@@ -7853,6 +8350,82 @@ test("routed compaction resolves subagent handoffs before summarizing", async ()
   } finally {
     await stopChild(router);
     await Promise.all([closeServer(native.server), closeServer(gateway.server)]);
+  }
+});
+
+test("direct DeepSeek screenshots do not saturate the prompt-token estimate", async () => {
+  let reportedInputTokens = 0;
+  const gatewayBodies = [];
+  const gateway = await mockServer(async (request, response) => {
+    gatewayBodies.push(await bodyJson(request));
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.end(`data: ${JSON.stringify({ type: "response.output_text.delta", delta: "ok" })}\n\ndata: ${JSON.stringify({
+      type: "response.completed",
+      response: { id: "resp_image", usage: {
+        input_tokens: reportedInputTokens, output_tokens: 12, total_tokens: reportedInputTokens + 12,
+      } },
+    })}\n\ndata: [DONE]\n\n`);
+  });
+  const stateDir = mkdtempSync(path.join(os.tmpdir(), "routing-image-estimate-"));
+  // The canonical name is currently a curated route; keep the checked-in
+  // legacy vision route as the fixture's capability baseline.
+  const legacy = JSON.parse(readFileSync(
+    path.join(root, "config/deepseek/deepseek-v4-flashvision-exp.json"), "utf8",
+  )).models[0];
+  const userModels = path.join(stateDir, "user-models.json");
+  writeFileSync(userModels, JSON.stringify({ version: 1, models: [{
+    ...legacy,
+    slug: "deepseek/deepseek-v4.1-flash",
+    gatewayModel: "deepseek-v4-1-flash",
+    upstreamModel: "deepseek-flash",
+    compHash: "deepseek-flash-image-estimate-fixture",
+  }] }));
+  const routerPort = await openPort();
+  const router = run("router.mjs", {
+    CODEX_ROUTER_PORT: String(routerPort),
+    CODEX_ROUTER_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+    MODEL_ROUTER_STATE_DIR: stateDir,
+    MODEL_ROUTER_USER_MODELS: userModels,
+    CODEX_ROUTER_API_BASE_URL: `http://127.0.0.1:${gateway.port}/v1`,
+  });
+  const image_url = `data:image/png;base64,${"A".repeat(3_600_000)}`;
+  const body = JSON.stringify({
+    model: "deepseek/deepseek-v4.1-flash",
+    input: [{ role: "user", content: [
+      { type: "input_text", text: "Inspect this screenshot." },
+      { type: "input_image", image_url },
+    ] }],
+  });
+  try {
+    await waitFor(`${routerBase(routerPort)}/models`, router);
+    for (const reported of [0, 4321]) {
+      reportedInputTokens = reported;
+      const response = await fetch(`${routerBase(routerPort)}/responses`, {
+        method: "POST",
+        headers: { Authorization: "Bearer CODEX_CALLER_SECRET", "Content-Type": "application/json" },
+        body,
+      });
+      assert.equal(response.status, 200);
+      const completed = JSON.parse((await response.text()).split("\n")
+        .find((line) => line.startsWith("data:") && line.includes("response.completed")).slice(5));
+      const count = completed.response.usage.input_tokens;
+      if (reported === 0) assert.ok(count >= 1024 && count < 2000, `image estimate was ${count}`);
+      else assert.equal(count, reported);
+      const events = await waitForUsageEvents(stateDir, reported === 0 ? 1 : 2, router);
+      assert.equal(events.at(-1).inputTokens, reported);
+      assert.equal(events.at(-1).estimatedInputTokens, reported === 0 ? count : undefined);
+      assert.equal(completed.response.usage.total_tokens, count + 12);
+      // Accounting must never replace the actual screenshot with a placeholder.
+      const images = gatewayBodies.at(-1).input.flatMap((item) => item.content || [])
+        .filter((part) => part.type === "input_image");
+      assert.equal(images.length, 1);
+      assert.equal(images[0].image_url, image_url);
+      assert.equal(gatewayBodies.at(-1).model, "deepseek-v4-1-flash");
+    }
+  } finally {
+    await stopChild(router);
+    await closeServer(gateway.server);
+    rmSync(stateDir, { recursive: true, force: true });
   }
 });
 
@@ -9108,7 +9681,7 @@ test("reasoning survives the replay onto tool-call and prose assistant turns ali
   }
 });
 
-test("GLM reasoning stays structurally separate while crossing the Responses bridge", async () => {
+["zai-coding/glm-5.3", "deepseek/deepseek-v4-flash", "commandcode/deepseek-v4-flash"].forEach((routedModel) => test(`${routedModel} reasoning stays structurally separate while crossing the Responses bridge`, async () => {
   const gatewayBodies = [];
   const gateway = await mockServer(async (request, response) => {
     gatewayBodies.push(await bodyJson(request));
@@ -9130,13 +9703,13 @@ test("GLM reasoning stays structurally separate while crossing the Responses bri
       summary: [{ type: "summary_text", text: "tool-call reasoning" }],
       content: null,
     },
+    { type: "reasoning", content: [{ type: "reasoning_text", text: "tool detail" }] },
     { type: "function_call", call_id: "glm-call", name: "lookup_number", arguments: "{}" },
     { type: "function_call_output", call_id: "glm-call", output: "323" },
     {
       type: "reasoning",
       id: "rs_glm_answer",
-      summary: [{ type: "summary_text", text: "provider-native reasoning" }],
-      content: null,
+      content: "provider-native reasoning",
     },
     {
       type: "message",
@@ -9154,14 +9727,18 @@ test("GLM reasoning stays structurally separate while crossing the Responses bri
         Authorization: "Bearer CODEX_CALLER_SECRET",
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ model: "zai-coding/glm-5.3", stream: false, input }),
+      body: JSON.stringify({ model: routedModel, stream: false, input }),
     });
     assert.equal(response.status, 200, await response.text());
     const forwarded = gatewayBodies[0].input;
     const callIndex = forwarded.findIndex((item) => item?.type === "function_call");
     const beforeCall = forwarded[callIndex - 1];
     assert.equal(beforeCall?.role, "assistant");
-    assert.deepEqual(beforeCall.content, [{ type: "thinking", text: "tool-call reasoning" }]);
+    assert.deepEqual(beforeCall.content, [{ type: "thinking", text: "tool-call reasoning\ntool detail" }]);
+    assert.equal(forwarded.some((item) => item.type === "reasoning"), false);
+    for (const text of ["tool-call reasoning", "tool detail", "provider-native reasoning"]) {
+      assert.equal(JSON.stringify(forwarded).split(text).length - 1, 1);
+    }
 
     const assistant = forwarded.find(
       (item) =>
@@ -9179,12 +9756,40 @@ test("GLM reasoning stays structurally separate while crossing the Responses bri
       false,
       "provider reasoning leaked into visible assistant content",
     );
+
+    // #653's exact boundary: a prose answer followed by a no-tool request to
+    // repeat it. The marker is present only in the prior assistant answer.
+    const marker = "QRTZN-0731-VLKXW";
+    const followup = await fetch(`${routerBase(routerPort)}/responses`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: routedModel,
+        stream: false,
+        input: [
+          { type: "message", role: "user", content: "Generate a marker. Do not call tools." },
+          { type: "reasoning", summary: [{ type: "summary_text", text: "Check the marker format." }] },
+          { type: "message", role: "assistant", content: `MARKER: ${marker}` },
+          { type: "message", role: "user", content: "Repeat your preceding marker and append ACK-2." },
+        ],
+      }),
+    });
+    assert.equal(followup.status, 200, await followup.text());
+    const replay = gatewayBodies.at(-1).input;
+    const answers = replay.filter((item) => item.role === "assistant");
+    assert.equal(answers.length, 1);
+    assert.deepEqual(answers[0].content, [
+      { type: "thinking", text: "Check the marker format." },
+      { type: "output_text", text: `MARKER: ${marker}` },
+    ]);
+    assert.equal(JSON.stringify(replay).split(marker).length - 1, 1);
+    assert.equal(replay.at(-1).role, "user");
   } finally {
     await stopChild(router);
     await closeServer(gateway.server);
     rmSync(stateDir, { recursive: true, force: true });
   }
-});
+}));
 
 // #292: the same "The `reasoning_content` in the thinking mode must be passed
 // back to the API" 400, but reached without a subagent and without a tool call
@@ -9787,7 +10392,8 @@ test("router compacts translated OpenCode routes and pins subagents on both rout
     );
     assert.deepEqual(
       nativeEvents.find((event) => event.type === "response.completed").response.output,
-      [terminalBlank, restoredTool("opencode-go-responses/gpt-5.6-luna")],
+      // The kept blank message precedes a tool call, so it is labelled commentary.
+      [{ ...terminalBlank, phase: "commentary" }, restoredTool("opencode-go-responses/gpt-5.6-luna")],
     );
   } finally {
     await stopChild(router);
@@ -10088,7 +10694,8 @@ test("router enables the terminal-only bridge repair only for Messages routes", 
     );
     assert.deepEqual(
       openai.events.find((event) => event.type === "response.completed").response.output,
-      [blank, tool],
+      // The kept blank message precedes a tool call, so it is labelled commentary.
+      [{ ...blank, phase: "commentary" }, tool],
     );
   } finally {
     await stopChild(router);

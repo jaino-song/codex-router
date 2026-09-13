@@ -154,6 +154,12 @@ function summaryText(item) {
     .join("");
 }
 
+function isGatewayErrorEnvelope(event) {
+  return event !== null && typeof event === "object" && !Array.isArray(event)
+    && !Object.hasOwn(event, "type")
+    && event.error !== null && typeof event.error === "object" && !Array.isArray(event.error);
+}
+
 // LiteLLM's Chat Completions -> Responses bridge can open an empty message
 // before Grok starts reasoning, and it hashes every reasoning delta into a
 // different item_id. Codex drops those orphaned deltas, so the user sees
@@ -172,6 +178,7 @@ export class GrokReasoningSummaryCompatTransform extends Transform {
   #nextSequenceNumber;
   #repairedReasoningItems = [];
   #canonicalReasoningId;
+  #gatewayErrorTerminal = false;
 
   constructor({
     maxFrameBytes = MAX_FRAME_BYTES,
@@ -191,6 +198,10 @@ export class GrokReasoningSummaryCompatTransform extends Transform {
 
   _transform(chunk, _encoding, callback) {
     try {
+      if (this.#gatewayErrorTerminal) {
+        callback();
+        return;
+      }
       const piece = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       if (this.#disabled) {
         this.push(Buffer.from(piece));
@@ -201,7 +212,7 @@ export class GrokReasoningSummaryCompatTransform extends Transform {
         this.#emitFrame(block, separator, original)
       ));
       if (outcome?.oversized) this.#unsafeFrame(outcome.oversized, "SSE frame byte limit");
-      if (outcome?.remainder?.length) this.push(outcome.remainder);
+      if (!this.#gatewayErrorTerminal && outcome?.remainder?.length) this.push(outcome.remainder);
       callback();
     } catch (error) {
       callback(error);
@@ -210,6 +221,11 @@ export class GrokReasoningSummaryCompatTransform extends Transform {
 
   _flush(callback) {
     try {
+      if (this.#gatewayErrorTerminal) {
+        this.#frames.take();
+        callback();
+        return;
+      }
       if (this.#disabled) {
         const pending = this.#frames.take();
         if (pending.length) this.push(pending);
@@ -238,13 +254,17 @@ export class GrokReasoningSummaryCompatTransform extends Transform {
     const pieces = this.#rewriteBlock(text);
     const inferredSeparator = Buffer.from(text.includes("\r\n") ? "\r\n\r\n" : "\n\n");
     for (let index = 0; index < pieces.length; index += 1) {
-      const trailing = separator.length || index === pieces.length - 1
+      // The normalized terminal must be dispatchable even if the gateway
+      // closed its last JSON frame without a blank line.
+      const trailing = this.#gatewayErrorTerminal && !separator.length
+        ? inferredSeparator
+        : separator.length || index === pieces.length - 1
         ? separator
         : inferredSeparator;
       this.push(Buffer.concat([Buffer.from(pieces[index]), trailing]));
     }
     this.#currentSeparator = "";
-    return !this.#disabled;
+    return !this.#disabled && !this.#gatewayErrorTerminal;
   }
 
   #disable(original) {
@@ -412,6 +432,27 @@ export class GrokReasoningSummaryCompatTransform extends Transform {
     if (!parsed) return [block];
     const event = parsed.event;
     const type = event?.type;
+
+    // LiteLLM can turn a forwarder SSE error into an untyped gateway error,
+    // then append empty message closes. Recognize only the top-level envelope;
+    // text containing error-shaped JSON and canonical typed events stay intact.
+    if (isGatewayErrorEnvelope(event)) {
+      this.#commitMutation(parsed);
+      const prefix = this.#finishReasoning(parsed, "incomplete");
+      this.#pendingMessage = [];
+      this.#gatewayErrorTerminal = true;
+      // Gateway messages may contain stack traces or request payloads. Emit a
+      // fixed safe error and suppress the rest of this upstream stream.
+      return [...prefix, this.#syntheticBlock("error", {
+        code: "local_router_stream_failed",
+        message: "The Grok gateway could not complete the upstream response stream.",
+        param: null,
+      }, {
+        ...parsed,
+        lines: ["event: error"],
+        newline: this.#currentSeparator === "\r\n\r\n" ? "\r\n" : parsed.newline,
+      })];
+    }
 
     if (!this.#reasoning && type === "response.output_item.added" && event?.item?.type === "message") {
       this.#message = {

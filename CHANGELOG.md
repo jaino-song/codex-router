@@ -2,6 +2,330 @@
 
 ## Unreleased
 
+- **Kimi no longer rejects a tool schema whose union leaf declares no type.**
+  A nullable field written the ordinary way --
+  `{"anyOf":[{"type":"string"},{"type":"null"}]}` -- carries no `type` of its
+  own, and Moonshot's validator refuses the whole request with HTTP 400
+  `tools.function.parameters missing type in anyOf properties`, losing the turn
+  on every Kimi model (#641). Nothing in the pipeline supplied one:
+  `normalizeSchemaLiterals` only removes literals that contradict a type a node
+  already declares. The Moonshot compatibility pass now declares a type where
+  the node already implies one -- from `properties`/`required`, `items`, a
+  single-typed `enum`/`const`, or a union whose branches all agree -- alongside
+  the existing `$ref` inlining. A node that implies nothing (a bare `{}`, a
+  lone `not`, a mixed `enum`) is left open, because narrowing a schema the
+  client meant to leave open is worse than the rejection. Every other provider
+  keeps the exact wire payload it has today.
+
+- **A routed model the router has not loaded now fails locally, not at
+  ChatGPT.** A model added to or renamed in `user-models.json` shows up in the
+  Codex picker as soon as the catalog is rebuilt, but the running router reads
+  its routes only at startup. Until the service restarted, the router forwarded
+  that slug to ChatGPT like a native model, and the turn failed with "The
+  'unorouter/gpt-6-astra' model is not supported when using Codex with a
+  ChatGPT account". That read as an OpenAI restriction, and the prompt went to
+  OpenAI besides. A user model the registry skipped as invalid failed the same
+  way (#689). No native slug contains a `/`, so the router now answers a
+  `provider/model` slug it has no route for with HTTP 400 `unrouted_model`
+  before the native redirect or passthrough can take it. The message names the
+  slug, says whether its provider is registered and enabled, gives the reason a
+  user model with that slug was skipped, and says to restart with
+  `bin/control service restart`. Native slugs, native aliases, the native
+  redirect, and routed slugs behave as before. `doctor` now warns about each
+  skipped user model that has no route.
+- **Control Center loads Codex account usage again when both account reads
+  answer.** The conflict resolution that merged #662 onto #648 renamed the
+  shared normalizer to `partialUsage` but left the both-answered call site on
+  the removed `usageFromReplies`, so every healthy poll threw a
+  `ReferenceError` and Control Center painted "Some router data could not
+  load" over the snapshot. The test fake answered synchronously from inside
+  the probe's guarded stdin write, whose `catch` swallowed the error; it now
+  has a `deferred` mode that answers on a later tick like a real pipe, and a
+  both-answered test that fails without the fix.
+- **Routed models' turns now render like native ones in Codex.** Native models
+  label each assistant message `commentary` (a progress note before more tool
+  calls) or `final_answer`, and Codex folds commentary into "Worked for ..."
+  and shows the final answer below it. Routed providers never send the label,
+  so every progress note rendered as a standalone answer. The router now labels
+  routed messages from the stream's item order: a message a tool call or
+  another message follows is commentary, and the last message of a completed
+  response is the final answer, even when only reasoning follows it. A phase
+  the provider sent always wins, text still streams live, and failed,
+  incomplete, or unterminated responses are relayed unlabelled; a stream the
+  upstream breaks off loses the held message frame along with the rest of the
+  turn. The label costs no model tokens, but Codex sends it back on later
+  turns. Chat-translated routes drop it from history. Responses-surface
+  providers (Meta, OpenCode, OpenCode free, GitHub Copilot, DeepSeek Responses)
+  receive it, as OpenAI's Responses schema allows. Endpoints added with
+  `--adapter openai-responses` have it removed before the request leaves the
+  router, since nothing shows that their validators accept it.
+- **`apply_patch` calls no longer abort routed turns mid-stream when a model
+  skips LiteLLM's wrapper.** LiteLLM sends native custom tools such as
+  `apply_patch` to Chat Completions providers as a function with one `content`
+  string, and relays whatever arguments come back. Models do not always comply:
+  they put `content` after another key, answer `{"input": ...}` or `{}`, or send
+  the raw patch. The router accepted only a leading `{"content": "..."}` and
+  aborted the already-streaming response, and Codex retried the identical turn
+  until it failed ("stream closed before response.completed"). The router log
+  showed "invalid custom tool arguments done" or "incomplete custom tool
+  argument delta sequence" on DeepSeek V4.1 Flash, DeepSeek V4 Flash, GLM-5.3,
+  and Grok 4.5. The relay now derives the input exactly as LiteLLM does, so
+  Codex receives the same call LiteLLM produced and a malformed patch comes
+  back to the model as an ordinary tool error. A non-string `content`, a
+  completed item that disagrees, and streamed text contradicted by the final
+  input still fail closed. Reproduced offline against pinned LiteLLM 1.96.0.
+- **Switching a conversation back to OpenAI no longer fails on routed item IDs.**
+  Routed providers mint their own item IDs (`call_...`, `tool_...`,
+  `chatcmpl-...`), Codex saves them, and OpenAI rejects them on replay with
+  "Expected an ID that begins with 'fc'". Before sending saved history to
+  OpenAI, the router now omits an optional `id` that lacks the native prefix for
+  its item type: `fc` for function calls, `ctc` for custom tool calls such as
+  `apply_patch`, and `msg` for messages. It preserves `call_id`, matching
+  results, native IDs, and requests to external providers, so a native-only
+  history is unchanged. Tests cover continuing and compacting a conversation,
+  sessions supplied by the caller or the router, and replaying normalized
+  history. Based on #664 by @webhype.
+
+- **Tok/s counts reasoning tokens exactly when they were generated inside the
+  timed window.** The Sep 5 change subtracted `reasoning_tokens` from the
+  numerator on every route, but the first-token clock already started on the
+  first reasoning delta, so on the OpenAI, Grok, and Command Code routes the
+  reasoning time stayed in the denominator while its tokens left the
+  numerator. A fit of generation time against visible and reasoning tokens
+  over the local usage log put the cost of a reasoning token at roughly the
+  cost of a visible one on those routes (gpt-5.6-sol 21 vs 25 ms, grok-4.6 18
+  vs 16 ms), proving the thinking ran inside the window; the meter read
+  gpt-5.6-luna at 21 tok/s against about 80 measured, and grok-4.5 at 16
+  against about 67. Only Muse Spark on the OpenCode Responses route thinks in
+  silence before its first token (0.02 ms per reasoning token in the same
+  fit), which is the route the subtraction had been measured on. The stream
+  transform now records `reasoningStreamed` -- whether any reasoning delta
+  (Responses summary or text deltas, chat `reasoning_content` / `reasoning`)
+  was relayed -- and reasoning deltas and chat tool-call deltas start the
+  first-token clock like visible text does. `aggregateProviderUsage` and the
+  Control Center per-event rate keep reasoning tokens when the marker is true
+  or absent (rows written before it existed), and subtract them only when it
+  is false. A reasoning count larger than the output count proves a provider
+  reports visible tokens only (Command Code's DeepSeek V4 Pro: 62 of 146 rows,
+  e.g. 150 output against 499 reasoning), so the inclusive total is rebuilt
+  first instead of clamping the sample to zero and silently dropping it.
+  Provider totals and billing are unchanged.
+- **Meta API routes for Muse Spark 1.3 and its Contributor tier.**
+  `meta/muse-spark-1.3` and `meta/muse-spark-1.3-contributor` mirror the Muse
+  Spark 1.2 Meta routes: 1M context compacting at 900K, text and image input,
+  the minimal-to-xhigh ladder defaulting to high, reasoning summaries, and
+  `auto-tool-choice`. Meta's model page documents both ids, the window, and
+  image input; the Contributor tier is cheaper because Meta may use its traffic
+  to improve its products.
+- **Command Code route for Muse Spark 1.3.** `commandcode/muse-spark-1.3`
+  follows `commandcode/muse-spark-1.2`: 1M context compacting at 900K, text and
+  image input, `auto-tool-choice`, and only the `high` effort, because Command
+  Code does not document effort values. Command Code also lists the
+  Contributor tier, but no Command Code Contributor route is checked in for
+  either version; it remains available through `bin/curate-models commandcode`.
+- **OpenRouter route for DeepSeek V4.1 Flash.**
+  `openrouter/deepseek-v4.1-flash` takes OpenRouter's catalog values (1,048,576
+  context, text and image input, low/high/max) and compacts at 900K to keep
+  DeepSeek's 128K max-effort completion. It carries `auto-tool-choice` because
+  DeepSeek rejects forced tool choices in thinking mode. Live verification has
+  not been run; see `docs/research/deepseek-v4-1-flash-2026-09-11.md`.
+- **Preserve tool calls after large fragmented response preludes.** Allow one
+  unfinished initial event within the existing 10 MiB bound and match the
+  namespace relay's limit, so later MCP calls retain their client identities.
+  Prelude timeouts, empty-completion checks and retry safety remain intact.
+- **DeepSeek empty-completion guard allows large reasoning after liveness
+  release.** Issue #684: Direct DeepSeek V4.1 Flash MCP turns with large
+  reasoning deltas no longer hit the empty-completion byte limit prematurely.
+  After liveness is established (by initial reasoning or content), the guard
+  uses a 10MB limit for incomplete SSE blocks instead of the 1MB pre-liveness
+  limit. This accommodates legitimate large reasoning events delivered in
+  small network chunks while still protecting against unbounded/malformed
+  streams. Fixes #684.
+- **DeepSeek V4.1 Flash is available on four providers, alongside V4.**
+  DeepSeek released V4.1 Flash on 2026-09-10. New routes:
+  `deepseek/deepseek-v4.1-flash` (1M window, image input, thinking with
+  low/high/max), `opencode-go/deepseek-v4.1-flash` (OpenCode's renamed id;
+  the launch-day `deepseek-flash` id is deprecated and not routed),
+  `nousresearch/deepseek-v4.1-flash` (sized to the Portal's served 262,144
+  window), and `commandcode/deepseek-v4.1-flash` (text-only until image input
+  is verified at the Provider API). Every V4 route stays listed. On the
+  DeepSeek API the V4 Flash ids are now served by V4.1 Flash, and from
+  2026-09-14 04:00 UTC `deepseek-v4-pro` requests are served by V4.1 Flash too.
+  Ollama Cloud and ClinePass do not offer V4.1 Flash yet. Evidence is in
+  `docs/research/deepseek-v4-1-flash-2026-09-11.md`.
+- **Routed workers expose read-only request progress.** `bin/control activity
+  [thread-id]` reports active requests and bounded recent outcomes behind the
+  caller capability, including observed stream events and cancellation causes.
+  Quiet polling never ends a request, and the shipped agent guidance separates
+  polling intervals from worker deadlines.
+- **Grok repairs require a successful response terminal.** Failed, incomplete,
+  and truncated streams return a terminal error without releasing withheld
+  client actions or private final answers. Reasoning remains live.
+- **Grok gateway stream errors reach Codex as terminal failures.** Untyped
+  gateway errors are normalized without exposing upstream diagnostics or
+  appending empty message closes, and request activity records the failure.
+- **Grok compaction keeps the Grok transport bounds, and a failed Grok turn
+  stays a failure when the client leaves.** A Grok OAuth compaction now uses
+  the same long-idle router pool and gateway `timeout` as a streamed turn, so a
+  long summary is no longer cut off by the 300-second Undici or 600-second
+  gateway defaults. A Grok turn that already delivered a terminal error is
+  metered and reported in `/activity` as a failure even if the client then
+  closes the still-open stream, which the WebSocket edge does five seconds
+  after a failure; it used to read as a user cancellation.
+- **Grok OAuth streams survive long reasoning pauses end to end.** After the
+  prologue is released, a Grok OAuth turn uses a ten-minute stall bound
+  (`CODEX_ROUTER_GROK_STREAM_STALL_MS`, positive milliseconds; invalid or
+  timer-unsafe values keep the default) instead of the 30-second prelude. Every
+  hop on that path now outlasts the bound: the router's gateway pool and the
+  forwarder's xAI pool used to end a silent stream after five minutes with
+  `UND_ERR_BODY_TIMEOUT`, and the gateway after ten. While the stream is silent
+  the router also relays a `response.in_progress` heartbeat
+  (`CODEX_ROUTER_GROK_HEARTBEAT_MS`, default one minute), because Codex abandons
+  a stream after five minutes without a data event and sends the whole turn
+  again, billing it a second time. Other providers keep their existing bounds
+  and receive no heartbeat. Visible streams are never replayed.
+- **A failure an upstream states before any content reaches the client at once.**
+  The empty-completion guard held a pre-content `error`, `response.failed`, or
+  `response.incomplete` until its prelude limit and then reported a second,
+  invented failure. It now releases the upstream's own verdict immediately and
+  never retries it. On the WebSocket edge, a stream that stays open after a
+  failure is drained for at most five seconds, so the client's next request on
+  that socket is not queued behind it.
+- **A Grok attempt is sealed by its first terminal event.** A tool call, text, or
+  second terminal arriving after `response.completed` can no longer add a client
+  action or change the outcome, and the forwarder stops reading there. An
+  optional progress-only retry that fails, is incomplete, or ends without a
+  terminal keeps the first, already-successful answer instead of replacing it
+  with an error. Provider-reported counts from a rejected attempt are logged.
+- **Fast is never sent where it was not offered.** A routed body keeps
+  `service_tier` only when the route serving it advertises that tier, so a
+  `priority` request on `grok-oauth/grok-4.6` no longer reaches a failover
+  candidate or a compaction for another route, while a curated model that
+  advertises a tier still receives it. A usage row covering two attempts no
+  longer carries one attempt's tier.
+- **Request activity is accurate on every path.** The routed transport retry and
+  failover candidates count as observed attempts, a candidate waiting for
+  headers is attributed to itself, and a `response.completed` carrying a failed
+  or incomplete status settles as `failed` with `terminalStatus`. Client
+  disconnects on native image/search and embeddings requests settle as
+  `canceled`; a canceled native stream used to record `completed` with status
+  200. `codex-router.ps1 activity` is the Windows entry point. Grok-only
+  diagnostics no longer follow a turn onto another provider, and run reports
+  total billed tokens for collapsed retries.
+- **Structured patch paths that a native header trim would change are refused**,
+  including trailing U+0085. The CI test job and `npm test` now fail a hung test
+  instead of holding a runner for six hours.
+- **The ChatGPT Web provider is removed: using it risked an OpenAI account
+  ban.** `chatgpt-web` routed Codex turns into an unofficial browser automation
+  of chatgpt.com, driven through a separately installed launcher on loopback
+  port 17841. Automating a ChatGPT account that way is outside OpenAI's terms of
+  service, and enforcement falls on the signed-in account: a suspension or
+  permanent ban costs the operator their ChatGPT subscription and their Codex
+  access with it. That is not a risk this router should carry behind a warning,
+  so the integration is gone rather than deprecated. Removed the provider
+  definition, its seven curation routes, the launcher metadata and catalog
+  handling in curation and discovery, the user-model slug rule, and the setup
+  documentation. The direct Responses contract existed only to serve it and
+  goes with it: `src/direct-responses-provider.mjs`, the router's
+  `directResponses` dispatch and error passthrough, the failover and
+  vision-bridge exclusions, the registry validation, and the client publication
+  filter. No other provider declared `directResponses`, `codexOnly`, or
+  `explicitSelection`, so every route now takes the ordinary routed path.
+  **Anyone who curated `chatgpt-web/*` rows should stop using them and delete
+  them** with `bin/curate-models chatgpt-web --remove <slug>` before updating;
+  after the update those entries reference a provider that no longer exists and
+  are skipped at load with a `Skipped user model: ... references unknown
+  provider chatgpt-web` warning, so nothing breaks, but the stale rows stay in
+  `user-models.json` until removed.
+- **A new native model no longer stays invisible after a Codex upgrade.** The
+  account catalog endpoint gates its model list on `client_version`, but the
+  router replayed the ETag it had cached under the *previous* version. The
+  server answered `304`, and the router then restamped that pre-upgrade body
+  with the new version — so `cacheIsFresh` passed forever, the model
+  fingerprint never moved, drift never fired, and GPT-6-Astra never reached the
+  picker while the router was installed (issue #645). A `client_version` change
+  now sends an unconditional request, and a `304` answering an unconditional
+  request is treated as a failure rather than blessing the stale body.
+  Revalidation within one `client_version` is unchanged.
+- **An outdated `codex` on PATH can no longer strip a model out of Codex's own
+  cache.** The same endpoint gates its list on `client_version` — measured
+  live, `0.150.0` is not offered `gpt-6-astra` while `0.153.4` is. When the
+  Codex the router resolves is older than the client that last wrote
+  `models_cache.json`, the refresh now declines to write (`stale-client`)
+  instead of replacing the richer list with its own poorer one.
+- **A missing native capture now counts as catalog drift.** With
+  `native-models.json` absent, `nativeCatalogDriftDetected()` returned "nothing
+  to compare" and the startup reconciliation never republished, stranding the
+  picker on whatever was last written even as the account gained models. A
+  missing capture alongside a valid account cache is maximal drift, and
+  republishing re-captures from that cache.
+- **Native collaboration relay auth and quota failures preserve their semantics.**
+  When the native Codex relay needed to open a routed subagent payload receives
+  HTTP 429, the router now preserves that status instead of rewriting it to
+  502. The exact account-and-ciphertext refusal is remembered for a short,
+  bounded interval so immediate client retries fail locally without spending
+  another native relay request; other accounts and payloads remain isolated.
+  A native 401 is also preserved with a sanitized local error, allowing Codex's
+  own ChatGPT authentication recovery to refresh the session and retry without
+  exposing the upstream response body.
+
+- **Command Code forced tool choices now use the same bounded alias as the tool definition.**
+  The 64-character compatibility added in #643 shortened provider-facing tool names but
+  left an object 	ool_choice at the client's original spelling, so a forced long tool
+  could still be rejected as unknown. Forced choices for both Command Code variants now
+  pass through the same reversible namespace alias map as the advertised tools.
+
+- **Router-injected subagent interrupts now keep unique call IDs across turns.**
+  Streamed collaboration cleanup previously numbered injected `interrupt_agent`
+  calls from `call_router_interrupt_1` inside each request-scoped transform, so
+  a later turn could reuse an ID still present in Codex conversation history.
+  Stream and non-stream injection now share a UUID-backed call-ID generator,
+  preserving call/output pairing across long multi-turn agent sessions.
+- **OpenCode Go Muse Responses routes can continue after a completed web search.**
+  Live replay probes for Muse Spark 1.2 and 1.3 Contributor confirmed that the
+  Responses upstream accepts completed `web_search_call` history even though
+  neither route advertises a new search tool. Both exact routes now declare
+  `supportsSearchHistory: true`, so follow-up and compact turns preserve that
+  verified history instead of failing locally with `model_search_not_supported`
+  (issue #639).
+- **Startup now repairs drifted routed-agent definitions.** The post-health
+  native-catalog reconciliation also compares Codex Router's managed agent
+  files with the current routed-model, visibility, and subagent settings. A
+  missing, stale, unprotected, or extra managed definition triggers the same
+  locked picker republish even when native model metadata itself is unchanged.
+  Foreign/unreadable Codex transport state remains write-free.
+- **The dashboard 24H chart now covers the exact rolling 24-hour window.** The
+  hourly rollup added in #644 aligned bars to clock hours but began at the
+  next whole hour after `now - 24h`, dropping up to almost one hour of valid
+  traffic. The router and legacy renderer fallback now retain both partial edge
+  hours while filtering events to the exact half-open `[now - 24h, now)` window.
+- **Command Code no longer rejects a routed turn over a long tool name or a
+  recursive schema.** A Codex turn carrying a client tool such as
+  `mcp__openai_api_key_local_confirmation__confirm_openai_api_key_local_destination`
+  (80 characters) was refused before generation with ``HTTP 400: `name` must be
+  at most 64 characters, got 80``, and the turn behind it then hit
+  `Recursive JSON schemas are not currently supported` (issue #626).
+  `chatProviderToolSurface()` now sends both `commandcode` and
+  `commandcode-messages` through the router's existing bounded alias route at
+  64 characters, and both variants join the non-recursive schema repair. The
+  aliases stay deterministic and reversible, so a call the model makes under
+  the bounded spelling is restored to the client's own tool identity. Every
+  other non-Groq provider keeps its tool surface byte for byte.
+
+- **The macOS tray no longer spawns a Node process every second to read
+  health.** `refreshActivity()` polls health once a second and ran
+  `bin/control health --json` each time, which boots Node and control.mjs's
+  whole module graph to make one loopback GET: about a second of CPU per call,
+  so an idle tray pegged a core for as long as it ran (measured 93.6% CPU,
+  1450 ms wall and 1000 ms CPU per poll, against 1.4 ms for the same GET over
+  plain HTTP). The tray now reads the protected health leaf directly with
+  `URLSession`, behind the same caller key and the same 3 s timeout. It decodes
+  every HTTP response, so a 503 still carries the degraded list and service
+  rows; transport failures throw and are recorded exactly as a failed
+  `control health` was. `control-health.mjs` remains the contract for the CLI
+  and the Control Center. The bounded one-second polls during MLX install,
+  runtime update, and vision-bridge pull still shell out and are unchanged.
+
 - **Tok/s meter now excludes reasoning tokens and hides during generation.**
   `observedTokensPerSecond` used full `outputTokens` while TTFT waited for the
   first *visible* token. Providers often include `reasoning_tokens` (silent

@@ -9,11 +9,11 @@
   },
   "scripts": {
     "check": "node scripts-check.mjs",
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test --test-timeout=600000 test/*.test.mjs"
   },
   "dependencies": {
     "proper-lockfile": "4.1.2",
-    "undici": "8.10.0"
+    "undici": "8.10.2"
   },
   "devDependencies": {
     "playwright": "1.62.1"

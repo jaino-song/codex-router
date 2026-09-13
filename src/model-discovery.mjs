@@ -49,9 +49,7 @@ function option(name) {
 export function modelIds(payload, provider) {
   const data = Array.isArray(payload) ? payload : payload?.data ?? payload?.models;
   if (!Array.isArray(data)) throw new Error("The provider returned an invalid model list.");
-  const candidates = provider?.id === "chatgpt-web"
-    ? data.filter((item) => modelRecordId(item).startsWith("chatgpt-web/"))
-    : provider?.authMode === "anonymous"
+  const candidates = provider?.authMode === "anonymous"
     ? data.filter((item) => anonymousModelAllowed(provider, item?.id))
     : provider?.id === "orca"
     ? data.filter((item) => {

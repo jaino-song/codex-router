@@ -28,6 +28,7 @@ import {
   removeChatGPTProfileAccount,
   requestChatGPTProfileSwitch,
   selectChatGPTProfileAccount,
+  selectedChatGPTUsageProfile,
 } from "../src/chatgpt-profile-switch.mjs";
 import { withCatalogPublicationLock } from "../src/catalog-publication-lock.mjs";
 import { privateFileIsProtected, protectPrivateFile } from "../src/file-security.mjs";
@@ -2006,4 +2007,70 @@ test("a removal failure rolls back the required active-profile handoff", async (
   assert.equal(readChatGPTAccountPoolState(filePath).policy.selectedAccountId, first.id);
   assert.equal(readChatGPTProfileSwitchState(switchPath).active, first.id);
   assert.equal(readFileSync(path.join(primaryHome, "auth.json"), "utf8"), firstAuth);
+});
+
+test("the active account reads usage from the live primary home, not its frozen profile copy", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "codex-profile-usage-home-"));
+  const primaryHome = path.join(root, "primary");
+  const homesDir = path.join(root, "accounts");
+  const filePath = path.join(root, "pool.json");
+  const switchPath = path.join(root, "switch.json");
+  mkdirSync(primaryHome, { recursive: true });
+  const account = createChatGPTSubscriptionAccount({ filePath, homesDir });
+  const other = createChatGPTSubscriptionAccount({ filePath, homesDir });
+  // The pooled copy is deliberately older than the primary: only a switch
+  // re-syncs it, so a single-account install spends its frozen refresh token
+  // and every later account read fails with 401.
+  const auth = JSON.stringify({ tokens: { access_token: "live-token", account_id: "usage" } });
+  writeFileSync(path.join(primaryHome, "auth.json"), auth, { mode: 0o600 });
+  writeFileSync(chatGPTSubscriptionAccountAuthPath(account.id, { homesDir }), JSON.stringify({
+    tokens: { access_token: "frozen-token", account_id: "usage" },
+  }), { mode: 0o600 });
+  const pool = readChatGPTAccountPoolState(filePath);
+  pool.accounts[account.id].identity = { accountId: "usage" };
+  pool.policy.selectedAccountId = account.id;
+  writeChatGPTAccountPoolState(pool, filePath);
+  const writeSwitch = (state) => {
+    writeFileSync(switchPath, JSON.stringify({ version: 1, ...state }), { mode: 0o600 });
+  };
+
+  writeSwitch({ desired: account.id, active: account.id, pending: false, phase: "idle" });
+  const settled = selectedChatGPTUsageProfile({ filePath, homesDir, primaryHome, switchPath });
+  assert.equal(settled.selection, account.id);
+  assert.equal(settled.home, primaryHome);
+  assert.equal(settled.pending, false);
+
+  // A pending switch has not installed the selection into the primary home
+  // yet, so its own profile copy remains the only place to read it from.
+  writeSwitch({ desired: account.id, active: other.id, pending: true, phase: "preparing" });
+  const pendingProfile = selectedChatGPTUsageProfile({ filePath, homesDir, primaryHome, switchPath });
+  assert.equal(pendingProfile.pending, true);
+  assert.equal(
+    pendingProfile.home,
+    path.dirname(chatGPTSubscriptionAccountAuthPath(account.id, { homesDir })),
+  );
+
+  // An active marker is a claim about the pool, not proof about CODEX_HOME:
+  // `codex login` writes that file directly. A primary home holding someone
+  // else must not be read as the selected account's usage.
+  writeSwitch({ desired: account.id, active: account.id, pending: false, phase: "idle" });
+  writeFileSync(path.join(primaryHome, "auth.json"), JSON.stringify({
+    tokens: { access_token: "someone-else", account_id: "different-account" },
+  }), { mode: 0o600 });
+  const mismatched = selectedChatGPTUsageProfile({ filePath, homesDir, primaryHome, switchPath });
+  assert.equal(
+    mismatched.home,
+    path.dirname(chatGPTSubscriptionAccountAuthPath(account.id, { homesDir })),
+  );
+  writeFileSync(path.join(primaryHome, "auth.json"), auth, { mode: 0o600 });
+
+  // An unselected account is never in the primary home at all.
+  writeSwitch({ desired: other.id, active: other.id, pending: false, phase: "idle" });
+  const inactive = selectedChatGPTUsageProfile({ filePath, homesDir, primaryHome, switchPath });
+  assert.equal(
+    inactive.home,
+    path.dirname(chatGPTSubscriptionAccountAuthPath(account.id, { homesDir })),
+  );
+
+  rmSync(root, { recursive: true, force: true });
 });

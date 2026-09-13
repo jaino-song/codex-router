@@ -28,19 +28,62 @@ export function fetchDispatcherOptions() {
   };
 }
 
+// `bodyTimeoutMs` raises Undici's 300s idle bound between body chunks. Only a
+// process that carries nothing but long-silent streams (the Grok OAuth
+// forwarder) sets it for its whole pool.
 export function installStableFetchTransport({
   AgentClass = Agent,
   EnvHttpProxyAgentClass = EnvHttpProxyAgent,
   setDispatcher = setGlobalDispatcher,
   environment = process.env,
   execArgv = process.execArgv,
+  bodyTimeoutMs,
 } = {}) {
   const DispatcherClass = environmentHttpProxyConfigured(environment, execArgv)
     ? EnvHttpProxyAgentClass
     : AgentClass;
-  const dispatcher = new DispatcherClass(fetchDispatcherOptions());
+  const dispatcher = new DispatcherClass({
+    ...fetchDispatcherOptions(),
+    ...(bodyTimeoutMs ? { bodyTimeout: bodyTimeoutMs } : {}),
+  });
   setDispatcher(dispatcher);
   return dispatcher;
+}
+
+// A Grok OAuth turn can stay silent for minutes while it reasons. The shared
+// pool keeps Undici's 300s body idle bound for every other provider; a hop that
+// carries a Grok stream uses this separate pool instead, whose bound outlasts
+// the router's stall guard. The dispatcher class and proxy decision match the
+// shared pool, so only the idle bounds differ. The headers bound moves with the
+// body bound: a Grok compaction is not streamed, so the gateway answers its
+// headers only after the whole generation, and Undici's 300s headers default
+// would end a long compaction before the stall guard's allowance.
+const longIdleStreamDispatchers = new Map();
+
+export function longIdleStreamDispatcher(bodyTimeoutMs, {
+  AgentClass = Agent,
+  EnvHttpProxyAgentClass = EnvHttpProxyAgent,
+  environment = process.env,
+  execArgv = process.execArgv,
+} = {}) {
+  let dispatcher = longIdleStreamDispatchers.get(bodyTimeoutMs);
+  if (!dispatcher) {
+    const DispatcherClass = environmentHttpProxyConfigured(environment, execArgv)
+      ? EnvHttpProxyAgentClass
+      : AgentClass;
+    dispatcher = new DispatcherClass({
+      ...fetchDispatcherOptions(),
+      headersTimeout: bodyTimeoutMs,
+      bodyTimeout: bodyTimeoutMs,
+    });
+    longIdleStreamDispatchers.set(bodyTimeoutMs, dispatcher);
+  }
+  return dispatcher;
+}
+
+// Undici's own `fetch`, for the reason given at the probe pool below.
+export function longIdleStreamFetch(url, init = {}, { bodyTimeoutMs } = {}) {
+  return undiciFetch(url, { ...init, dispatcher: longIdleStreamDispatcher(bodyTimeoutMs) });
 }
 
 // Health probes must not share the streaming pool. A GET /health/liveliness
