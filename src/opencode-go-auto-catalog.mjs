@@ -388,8 +388,8 @@ function buildPlan({ discovery, docs, currentModels, picker, seen }) {
     // A previous curation may have routed the same upstream id through a Go
     // protocol variant whose public endpoint was later clarified. Preserve
     // that user-owned entry instead of creating a second model; checked-in
-    // presets still prefer the exact documented provider below.
-    const existing = currentByKey.get(identityKey) || findChecked(row.providerId, id) || currentByUpstream.get(id) || checkedByUpstream.get(id);
+    // presets use the documented provider when no user route exists.
+    const existing = currentByKey.get(identityKey) || currentByUpstream.get(id) || findChecked(row.providerId, id) || checkedByUpstream.get(id);
     // A previously adopted user model can be removed deliberately. The seen
     // identity is the durable distinction between "new on this machine" and
     // "the operator already decided not to keep it"; never recreate the latter
@@ -409,7 +409,7 @@ function buildPlan({ discovery, docs, currentModels, picker, seen }) {
   const visibilityChanged = [];
   for (const model of [...newModels, ...documentedLive.map((id) => {
     const row = byId.get(id);
-    return currentByKey.get(key(row.providerId, id)) || findChecked(row.providerId, id) || currentByUpstream.get(id) || checkedByUpstream.get(id);
+    return currentByKey.get(key(row.providerId, id)) || currentByUpstream.get(id) || findChecked(row.providerId, id) || checkedByUpstream.get(id);
   }).filter(Boolean)]) {
     const shouldSeed = firstActivation || !seen.has(key(model.provider, model.upstreamModel));
     if (!shouldSeed || hidden.has(model.slug) || visible.has(model.slug) || seeded.has(model.slug)) continue;

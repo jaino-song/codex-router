@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { CHECKED_IN_MODELS } from "../src/model-registry.mjs";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import os from "node:os";
@@ -188,6 +189,12 @@ test("undocumented legacy live ids remain pending while documented ids still act
   const again = await checkGoAutoCatalog(options);
   assert.equal(again.reason, "missing_documentation");
   assert.equal(published, 1, "persisted history must remain readable and avoid a second publication");
+  writeFileSync(p.userModelsPath, JSON.stringify({ version: 1, models: [] }));
+  const afterRemoval = await checkGoAutoCatalog(options);
+  assert.equal(afterRemoval.reason, "missing_documentation");
+  assert.deepEqual(JSON.parse(readFileSync(p.userModelsPath, "utf8")).models, []);
+  assert.equal(published, 1, "an operator removal must not trigger re-adoption");
+
 
 });
 
@@ -304,4 +311,29 @@ test("disable checks a loaded job even when its saved policy is already disabled
     if (args[0] === "bootout") throw new Error("permission denied");
   } }), /disabled/i);
   assert.deepEqual(calls, ["print", "bootout"]);
+});
+
+
+test("existing user route takes priority over a documented preset on another Go protocol", async () => {
+  const preset = CHECKED_IN_MODELS.find(model => model.provider === "opencode-go-responses" && model.listed !== false);
+  assert.ok(preset);
+  for (const hidden of [false, true]) {
+    const p = tempPaths();
+    Object.assign(p, { policyPath: path.join(p.stateDir, "policy.json"), seenPath: path.join(p.stateDir, "seen.json"), pickerPath: path.join(p.stateDir, "picker.json"), userModelsPath: path.join(p.stateDir, "user-models.json") });
+    mkdirSync(p.stateDir, { recursive: true, mode: 0o700 }); policy(p);
+    const custom = { ...preset, provider: "opencode-go", slug: "opencode-go/my-custom-route", gatewayModel: "opencode-go-my-custom-route" };
+    const userText = JSON.stringify({ version: 1, models: [custom] });
+    const pickerText = JSON.stringify({ version: 1, hidden: hidden ? [custom.slug] : [], visible: hidden ? [] : [custom.slug], seeded: [custom.slug] });
+    writeFileSync(p.userModelsPath, userText); writeFileSync(p.pickerPath, pickerText);
+    const result = await checkGoAutoCatalog({ ...p, configuredCheck: () => ["opencode-go"], discoveryDisabledCheck: () => false,
+      discover: async () => ({ discovered: [preset.upstreamModel] }), fetchDocs: async () => html([[preset.upstreamModel, "https://opencode.ai/zen/go/v1/responses"]]),
+      readHealth: async () => ({ ok: false }), readActivity: async () => ({ ok: false }),
+      transact: transaction => transactModelOverlayMutation({ ...transaction, lock: false }),
+      applyPublication: async () => { assert.fail("existing route does not need publication"); },
+    });
+    assert.equal(result.reason, "history_updated");
+    assert.deepEqual(result.plan.modelSlugs, [custom.slug]);
+    assert.equal(readFileSync(p.userModelsPath, "utf8"), userText);
+    assert.equal(readFileSync(p.pickerPath, "utf8"), pickerText);
+  }
 });
