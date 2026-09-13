@@ -202,12 +202,22 @@ test("publication failure rolls all three updater files back", async () => {
   const now = Date.now(); const activity = { ok: true, version: 1, instanceId: "router-1", observedAt: now - GO_AUTO_QUIET_MS - 1_000, active: [], recent: [] };
   status(p, { instanceId: "router-1", inFlightRequests: 0, activeCount: 0, observedAt: activity.observedAt, latestActivityAt: activity.observedAt });
   let publications = 0;
-  const result = await checkGoAutoCatalog({ ...p, sourceRoot: process.cwd(), configuredCheck: () => ["opencode-go"], discoveryDisabledCheck: () => false, discover: async () => ({ discovered: ["rollback-me"], modelMetadata: {} }), fetchDocs: async () => html([["rollback-me", "https://opencode.ai/zen/go/v1/responses"]]), readHealth: async () => ({ ok: true, resources: { inFlightRequests: 0 } }), readActivity: async () => activity, now: () => now, transact: (transaction) => transactModelOverlayMutation({ ...transaction, lock: false }), applyPublication: async () => { publications += 1; if (publications === 1) throw new Error("simulated publication failure"); } });
+  const options = { ...p, sourceRoot: process.cwd(), configuredCheck: () => ["opencode-go"], discoveryDisabledCheck: () => false, discover: async () => ({ discovered: ["rollback-me"], modelMetadata: {} }), fetchDocs: async () => html([["rollback-me", "https://opencode.ai/zen/go/v1/responses"]]), readHealth: async () => ({ ok: true, resources: { inFlightRequests: 0 } }), readActivity: async () => activity, now: () => now, transact: (transaction) => transactModelOverlayMutation({ ...transaction, lock: false }), applyPublication: async () => { publications += 1; if (publications === 1) {
+    const concurrent = await checkGoAutoCatalog(options);
+    assert.equal(concurrent.reason, "already_running", "another updater must not observe uncommitted model state");
+    throw new Error("simulated publication failure");
+  } } };
+  const result = await checkGoAutoCatalog(options);
   assert.equal(result.state, "error");
   assert.deepEqual(JSON.parse(readFileSync(p.userModelsPath, "utf8")), originalUser);
   assert.deepEqual(JSON.parse(readFileSync(p.pickerPath, "utf8")), originalPicker);
   assert.deepEqual(JSON.parse(readFileSync(p.seenPath, "utf8")), originalSeen);
   assert.equal(publications, 2);
+  status(p, { instanceId: "router-1", inFlightRequests: 0, activeCount: 0, observedAt: activity.observedAt, latestActivityAt: activity.observedAt });
+  const retry = await checkGoAutoCatalog(options);
+  assert.equal(retry.state, "active");
+  assert.ok(JSON.parse(readFileSync(p.userModelsPath, "utf8")).models.some(model => model.upstreamModel === "rollback-me"));
+  assert.ok(JSON.parse(readFileSync(p.seenPath, "utf8")).seen.some(identity => JSON.parse(identity)[1] === "rollback-me"));
 });
 
 test("disabled or unconfigured Go is skipped before discovery", async () => {
@@ -249,4 +259,49 @@ test("official table uses Model ID instead of the preceding display name", () =>
   for (const endpoint of ["https://user@opencode.ai/zen/go/v1/responses", "see https://opencode.ai/zen/go/v1/responses here", "https://opencode.ai/zen/go/v1/RESPONSES", "https://opencode.ai:443/zen/go/v1/responses"]) {
     assert.throws(() => parseOfficialGoDocs(html([["example-id", endpoint]])), /endpoint/i);
   }
+});
+
+test("policy cannot redirect activation to a different state directory", async () => {
+  const p = tempPaths();
+  p.policyPath = path.join(p.stateDir, "policy.json");
+  mkdirSync(p.stateDir, { recursive: true, mode: 0o700 });
+  policy(p);
+  writeFileSync(p.policyPath, JSON.stringify({ version: 1, enabled: true, sourceRoot: process.cwd(), stateDir: p.root }));
+  const result = await checkGoAutoCatalog({ ...p, discover: async () => { throw new Error("must not discover"); } });
+  assert.equal(result.state, "pending");
+  assert.equal(result.reason, "state belongs to another source checkout");
+  assert.equal(existsSync(path.join(p.stateDir, "user-models.json")), false);
+});
+
+
+test("history-only updates use the overlay transaction without publishing or rewriting model choices", async () => {
+  const p = tempPaths();
+  Object.assign(p, { policyPath: path.join(p.stateDir, "policy.json"), seenPath: path.join(p.stateDir, "seen.json"), pickerPath: path.join(p.stateDir, "picker.json"), userModelsPath: path.join(p.stateDir, "user-models.json") });
+  mkdirSync(p.stateDir, { recursive: true, mode: 0o700 }); policy(p);
+  const model = { slug: "opencode-go/history", gatewayModel: "opencode-go-history", upstreamModel: "history", provider: "opencode-go" };
+  const userText = JSON.stringify({ version: 1, models: [model] });
+  const pickerText = JSON.stringify({ version: 1, hidden: [model.slug], visible: [], seeded: [model.slug] });
+  writeFileSync(p.userModelsPath, userText); writeFileSync(p.pickerPath, pickerText);
+  let transactions = 0;
+  const result = await checkGoAutoCatalog({ ...p, sourceRoot: process.cwd(), configuredCheck: () => ["opencode-go"], discoveryDisabledCheck: () => false,
+    discover: async () => ({ discovered: ["history"] }), fetchDocs: async () => html([["history", "https://opencode.ai/zen/go/v1/chat/completions"]]),
+    readHealth: async () => ({ ok: false }), readActivity: async () => ({ ok: false }),
+    transact: transaction => { transactions += 1; return transactModelOverlayMutation({ ...transaction, lock: false }); },
+    applyPublication: async () => { assert.fail("history does not require publication"); },
+  });
+  assert.equal(result.reason, "history_updated"); assert.equal(transactions, 1);
+  assert.equal(readFileSync(p.userModelsPath, "utf8"), userText); assert.equal(readFileSync(p.pickerPath, "utf8"), pickerText);
+  assert.equal(JSON.parse(readFileSync(p.seenPath, "utf8")).seen.length, 1);
+});
+
+
+test("disable checks a loaded job even when its saved policy is already disabled", async () => {
+  const p = tempPaths(); p.policyPath = path.join(p.stateDir, "policy.json");
+  mkdirSync(p.stateDir, { recursive: true, mode: 0o700 }); policy(p, false);
+  const calls = [];
+  await assert.rejects(disableGoAutoCatalog({ stateDir: p.stateDir, paths: { policyPath: p.policyPath }, platform: "darwin", launchctl: args => {
+    calls.push(args[0]);
+    if (args[0] === "bootout") throw new Error("permission denied");
+  } }), /disabled/i);
+  assert.deepEqual(calls, ["print", "bootout"]);
 });

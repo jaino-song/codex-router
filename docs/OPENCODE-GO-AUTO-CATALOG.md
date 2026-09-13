@@ -27,7 +27,7 @@ Redirects, oversized or malformed pages, duplicate model rows, arbitrary
 endpoint hosts, and rows missing a protocol fail closed. A model is eligible
 only when the same id is present in the fresh live Go catalog and the official
 page documents its endpoint. A documentation or protocol gap records a
-pending status and leaves the prior user catalog intact.
+pending status for that id while eligible documented models continue to activate.
 
 Unknown eligible ids are written as user-owned models with the existing
 `userModelEntry` conservative defaults. Their description identifies the
@@ -53,8 +53,10 @@ State is owner-private under the managed router state directory:
 * `opencode-go-auto-catalog-policy.json` — enabled flag and stable source root;
 * `opencode-go-auto-catalog-status.json` — bounded status and idle observations;
 * `opencode-go-auto-catalog-seen.json` — provider/id history;
-* `opencode-go-auto-catalog.lock` — short updater single-flight lock;
-* `opencode-go-auto-catalog.plist` — the independent launchd definition.
+* `opencode-go-auto-catalog.lock` — short updater single-flight lock.
+
+The independent launchd definition is stored at
+`~/Library/LaunchAgents/io.github.codex-router.opencode-go-auto-catalog.plist`.
 
 The launchd program invokes the stable source root directly with quoted XML
 arguments. It is independent of the managed router service, so the updater

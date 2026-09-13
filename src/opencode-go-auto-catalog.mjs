@@ -168,7 +168,7 @@ function readPolicy(file) {
   if (text === undefined) return { exists: false, enabled: false };
   try {
     const parsed = parseObject(text, "invalid_policy");
-    if (parsed.version !== 1 || typeof parsed.enabled !== "boolean" || !validString(parsed.sourceRoot, { max: 4096 }) || !validString(parsed.stateDir, { max: 4096 })) throw new Error("invalid policy");
+    if (parsed.version !== 1 || typeof parsed.enabled !== "boolean" || !validString(parsed.sourceRoot, { max: 4096 }) || !validString(parsed.stateDir, { max: 4096 }) || !path.isAbsolute(parsed.sourceRoot) || !path.isAbsolute(parsed.stateDir)) throw new Error("invalid policy");
     return parsed;
   } catch (error) {
     if (error?.code === "invalid_policy") throw error;
@@ -544,6 +544,7 @@ function ownerGuard({ sourceRoot = SOURCE_ROOT, stateDir = STATE_DIR, policyPath
   try { policy = policyPath ? readPolicy(policyPath) : undefined; }
   catch (error) { throw error?.code ? error : makeError("invalid_policy", "Auto catalog policy is malformed."); }
   if ((owner && current && owner !== current) || (policy?.sourceRoot && canonical(policy.sourceRoot) !== current)) throw makeError("foreign_state_owner", "Auto catalog state belongs to another source checkout.");
+  if (policy?.stateDir && canonical(policy.stateDir) !== canonical(stateDir)) throw makeError("foreign_state_owner", "Auto catalog policy belongs to another state directory.");
   return { current, owner };
 }
 
@@ -608,13 +609,15 @@ export async function disableGoAutoCatalog({ stateDir = STATE_DIR, paths = {}, l
   if (platform !== "darwin") throw makeError("unsupported_platform", "OpenCode Go auto catalog requires macOS launchd.");
   ownerGuard({ sourceRoot: SOURCE_ROOT, stateDir, policyPath: resolved.policyPath, installManifestPath: installManifestFile({}, resolved) });
   const policy = readPolicy(resolved.policyPath);
-  try { launchctl(["bootout", `gui/${uid()}/${GO_AUTO_LABEL}`]); } catch (error) {
-    if (policy.enabled) throw makeError("disable_failed", "The launchd updater could not be disabled.");
+  const loaded = () => { try { launchctl(["print", `gui/${uid()}/${GO_AUTO_LABEL}`]); return true; } catch { return false; } };
+  if (loaded()) {
+    try { launchctl(["bootout", `gui/${uid()}/${GO_AUTO_LABEL}`]); }
+    catch { throw makeError("disable_failed", "The launchd updater could not be disabled."); }
   }
-  try { launchctl(["disable", `gui/${uid()}/${GO_AUTO_LABEL}`]); } catch (error) {
-    if (policy.enabled) throw makeError("disable_failed", "The launchd updater could not be disabled.");
-  }
-  writeJson(resolved.policyPath, { ...policy, enabled: false, disabledAt: new Date().toISOString() });
+  try { launchctl(["disable", `gui/${uid()}/${GO_AUTO_LABEL}`]); }
+  catch { throw makeError("disable_failed", "The launchd updater could not be disabled."); }
+  if (loaded()) throw makeError("disable_failed", "The launchd updater is still loaded.");
+  writeJson(resolved.policyPath, { ...policy, version: 1, sourceRoot: SOURCE_ROOT, stateDir: path.resolve(stateDir), enabled: false, disabledAt: new Date().toISOString() });
   return { state: "disabled" };
 }
 
@@ -653,7 +656,7 @@ export async function checkGoAutoCatalog(options = {}) {
   }
   const acquire = options.acquireLock === false ? undefined : options.acquireLock || defaultAcquire;
   const release = options.releaseLock || ((token) => token?.());
-  return withUpdaterLock(paths.lockPath, async (releaseUpdaterLock) => {
+  return withUpdaterLock(paths.lockPath, async () => {
     const now = options.now || Date.now;
     let discovery;
     let docs;
@@ -703,15 +706,8 @@ export async function checkGoAutoCatalog(options = {}) {
       updateStatus(paths.statusPath, { state: "deferred", reason: quiet.reason, checkedAt: new Date(now()).toISOString(), observations });
       return { state: "deferred", reason: quiet.reason, plan, observations };
     }
-    if (!plan.catalogChanged && plan.seenChanged) {
-      writeJson(paths.seenPath, { version: 1, seen: plan.nextSeen });
-      const state = pendingDocs.length ? "pending" : "active";
-      const reason = pendingDocs.length ? "missing_documentation" : "history_updated";
-      updateStatus(paths.statusPath, { state, reason, ...(pendingDocs.length ? { pendingModelIds: pendingDocs } : {}), checkedAt: new Date(now()).toISOString(), observations });
-      return { state, reason, plan, observations };
-    }
     const finalObservation = await (options.observeIdle || observeRouterIdle)({ readHealth: options.readHealth || readProtectedRouterHealth, readActivity: options.readActivity || readControlActivity, now });
-    if (!quietEligible({ observations: [baselineObservation] }, finalObservation, now()).ok) {
+    if (plan.catalogChanged && !quietEligible({ observations: [baselineObservation] }, finalObservation, now()).ok) {
       const result = { state: "deferred", reason: "router_activity_changed", checkedAt: new Date(now()).toISOString(), observations: [firstObservation, finalObservation] };
       updateStatus(paths.statusPath, result);
       return { ...result, plan };
@@ -721,26 +717,25 @@ export async function checkGoAutoCatalog(options = {}) {
     let deferredReason = "router_activity_changed";
     let appliedPlan = plan;
     try {
-      const activationGate = async () => {
+      const refreshPlan = () => buildPlan({ discovery, docs, currentModels: strictUserModels(userModelsFile(options, paths)).models, picker: strictPickerState(pickerFile(options, paths)), seen: new Set(strictSeenState(paths.seenPath).seen) });
+      const activationGate = async (requireIdle = true) => {
         let latestPolicy;
         try { latestPolicy = readPolicy(paths.policyPath); }
         catch { deferredReason = "policy_changed"; return false; }
         if (!latestPolicy.enabled) { deferredReason = "disabled"; return false; }
+        try { ownerGuard({ sourceRoot: options.sourceRoot || SOURCE_ROOT, stateDir: paths.stateDir, policyPath: paths.policyPath, installManifestPath: installManifestFile(options, paths) }); }
+        catch { deferredReason = "policy_changed"; return false; }
         const latestEligibility = goProviderEligibility({ discoveryDisabledCheck: options.discoveryDisabledCheck || discoveryDisabled, configuredCheck: options.configuredCheck || configuredProviderIds, selectionPath: selectionFile(options, paths) });
         if (!latestEligibility.enabled) { deferredReason = latestEligibility.reason; return false; }
+        if (!requireIdle) return true;
         const observation = await (options.observeIdle || observeRouterIdle)({ readHealth: options.readHealth || readProtectedRouterHealth, readActivity: options.readActivity || readControlActivity, now });
         if (!quietEligible({ observations: [baselineObservation] }, observation, now()).ok) { deferredReason = "router_activity_changed"; return false; }
         return true;
       };
       const mutate = async () => {
         if (deferredInMutation) return;
-        if (!(await activationGate())) { deferredInMutation = true; return; }
-        const latestCurrent = strictUserModels(userModelsFile(options, paths));
-        const latestPicker = strictPickerState(pickerFile(options, paths));
-        const latestSeen = strictSeenState(paths.seenPath);
-        const latestPlan = buildPlan({ discovery, docs, currentModels: latestCurrent.models, picker: latestPicker, seen: new Set(latestSeen.seen) });
-        const recheck = await (options.observeIdle || observeRouterIdle)({ readHealth: options.readHealth || readProtectedRouterHealth, readActivity: options.readActivity || readControlActivity, now });
-        if (!quietEligible({ observations: [baselineObservation] }, recheck, now()).ok) { deferredReason = "router_activity_changed"; deferredInMutation = true; return; }
+        const latestPlan = refreshPlan();
+        if (!(await activationGate(latestPlan.catalogChanged))) { deferredInMutation = true; return; }
         appliedPlan = latestPlan;
         // Another updater may have committed this exact live id while this
         // process was outside the overlay lock. Preserve the fresh state and
@@ -755,12 +750,8 @@ export async function checkGoAutoCatalog(options = {}) {
         writePicker(pickerFile(options, paths), latestPlan.nextPicker);
         writeJson(paths.seenPath, { version: 1, seen: latestPlan.nextSeen });
       };
-      // The updater lock protects discovery/planning only. Release it before
-      // entering the model-overlay transaction: that transaction owns the
-      // publication lock and may restart the router, so holding a second
-      // updater lock across launchd/restart would create an avoidable lock
-      // cycle with other maintenance paths.
-      await releaseUpdaterLock?.();
+      // Keep the updater lock until publication or rollback has completed so
+      // another check cannot plan against this transaction's temporary files.
       const publication = options.applyPublication || applyModelOverlayPublication;
       const result = await (options.transact || transactModelOverlayMutation)({
         files: [userModelsFile(options, paths), pickerFile(options, paths), paths.seenPath],
@@ -771,10 +762,10 @@ export async function checkGoAutoCatalog(options = {}) {
         // mutate repeats the same check under the overlay lock for the tiny
         // interval between this observation and the write.
         restart: async () => {
-          if (options.restart === false) return false;
-          const gate = await activationGate();
+          appliedPlan = refreshPlan();
+          const gate = await activationGate(appliedPlan.catalogChanged);
           if (!gate) deferredInMutation = true;
-          return gate;
+          return gate && appliedPlan.catalogChanged && options.restart !== false;
         },
         applyPublication: async (publicationOptions) => (deferredInMutation || skipPublication) ? {} : publication({ ...publicationOptions, restartService: options.restartService, publish: options.publish }),
       });
