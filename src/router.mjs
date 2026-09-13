@@ -4392,19 +4392,24 @@ async function handleResponses(request, response, requestUrl) {
       // also normalizes gateway error envelopes here. Observe the canonical
       // terminal for metering and activity; the leading byte observer still
       // measures the original upstream bytes.
+      // Custom providers carry protocol on each model endpoint, so the
+      // container provider alone cannot identify a translated bridge.
+      const responseProvider = route
+        ? { ...providerForModel(route), protocol: protocolForModel(route) }
+        : undefined;
       const reasoningSummaryCompat = route
-        ? reasoningSummaryCompatTransform(providerForModel(route), contentType)
+        ? reasoningSummaryCompatTransform(responseProvider, contentType)
         : undefined;
       if (reasoningSummaryCompat) transforms.splice(1, 0, reasoningSummaryCompat);
       // LiteLLM can add blank assistant envelopes while translating either
       // Chat Completions or Messages. The factory refuses native traffic and
       // providers that already speak Responses, so those paths gain no stage.
       const translatedToolMessageCompat = route
-        ? translatedToolMessageCompatTransform(providerForModel(route), contentType)
+        ? translatedToolMessageCompatTransform(responseProvider, contentType)
         : undefined;
       if (translatedToolMessageCompat) transforms.push(translatedToolMessageCompat);
       const earlyToolDone = route
-        ? earlyToolItemDoneTransform(providerForModel(route), contentType)
+        ? earlyToolItemDoneTransform(responseProvider, contentType)
         : undefined;
       if (earlyToolDone) transforms.push(earlyToolDone);
       // Restore flattened namespace calls for routed chat-completions providers

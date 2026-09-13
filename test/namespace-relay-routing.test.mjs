@@ -2829,3 +2829,28 @@ test("routed native apply_patch relays LiteLLM arguments that are not a leading 
     assert.equal(closed.item.input, call.input, `${call.id} item input`);
   }
 });
+
+test("local MLX Responses bypasses translated reasoning and blank-message repairs", async () => {
+  const blank = { id: "msg_direct_blank", type: "message", role: "assistant", status: "completed", content: [{ type: "output_text", text: "", annotations: [] }] };
+  const tool = { id: "call_direct", type: "function_call", call_id: "call_direct", name: "inspect", arguments: "{}", status: "completed" };
+  const terminal = { id: "resp_direct", object: "response", status: "completed", output: [blank, tool] };
+  const base = {
+    model: "custom/qwen3.8-27b-uncensored",
+    requestPayload: (stream, model) => ({ model, stream, input: "Inspect it.", tools: [{ type: "function", name: "inspect", parameters: { type: "object", properties: {} } }] }),
+  };
+  const jsonResult = await scenario(false, { ...base, jsonBody: () => terminal });
+  assert.deepEqual(JSON.parse(jsonResult.clientBody).output.map(item => item.id), [blank.id, tool.id]);
+  const events = [
+    { type: "response.created", response: { ...terminal, status: "in_progress", output: [] } },
+    { type: "response.output_item.added", output_index: 0, item: { ...blank, status: "in_progress", content: [] } },
+    { type: "response.reasoning_summary_text.delta", item_id: blank.id, output_index: 0, summary_index: 0, delta: "direct provider text" },
+    { type: "response.output_item.done", output_index: 0, item: blank },
+    { type: "response.completed", response: { ...terminal, output: [blank] } },
+  ];
+  const streamResult = await scenario(true, { ...base, sseBody: () => events.map(event => `data: ${JSON.stringify(event)}\n\n`).join("") });
+  const returned = streamResult.clientBody.split("\n").filter(line => line.startsWith("data: {")).map(line => JSON.parse(line.slice(6)));
+  assert.equal(returned.some(event => event.item?.type === "reasoning"), false, "a direct Responses endpoint must not gain synthetic reasoning items");
+  const delta = returned.find(event => event.type === "response.reasoning_summary_text.delta");
+  assert.equal(delta.item_id, blank.id);
+  assert.equal(delta.output_index, 0);
+});
