@@ -224,7 +224,8 @@ test("one generic gateway routes ordinary and explicitly profiled models without
   }
 });
 
-test("a generic Responses gateway receives replayed messages without Codex's phase label", async () => {
+for (const customEndpoint of [false, true]) {
+test(`a ${customEndpoint ? "custom per-model" : "generic"} Responses gateway receives replayed messages without Codex's phase label`, async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "generic-responses-phase-"));
   const providersFile = path.join(directory, "generic-providers.json");
   const userModelsFile = path.join(directory, "user-models.json");
@@ -247,10 +248,17 @@ test("a generic Responses gateway receives replayed messages without Codex's pha
     });
   });
   const model = userModelEntry({
-    providerId: "responses-gateway",
+    providerId: customEndpoint ? "custom" : "responses-gateway",
     upstreamId: "responses-model",
     priority: 100,
   });
+  if (customEndpoint) {
+    model.endpoint = {
+      baseUrl: `http://127.0.0.1:${upstream.port}/v1`,
+      protocol: "openai-responses",
+      keyless: true,
+    };
+  }
   writeFileSync(providersFile, `${JSON.stringify({
     version: 1,
     providers: [{
@@ -311,3 +319,4 @@ test("a generic Responses gateway receives replayed messages without Codex's pha
     rmSync(directory, { recursive: true, force: true });
   }
 });
+}

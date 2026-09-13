@@ -1653,6 +1653,35 @@ test("bounded routes preserve one alias for pre-flattened MCP definitions and hi
   }
 });
 
+test("local MLX Qwen defers preflattened MCP tools and restores their identities", async () => {
+  const flatName = "mcp__apmneonsnapshotro__get_monitor_snapshot";
+  const result = await scenario(false, {
+    model: "custom/qwen3.8-27b-uncensored",
+    requestPayload: (stream, model) => {
+      const payload = preflattenedCommandCodeMcpPayload(stream, model);
+      payload.tools.push({ type: "tool_search", execution: "client" });
+      payload.input = [
+        { role: "user", content: "Use the snapshot tool again." },
+        { type: "function_call", namespace: "mcp__apmneonsnapshotro", name: "get_monitor_snapshot", call_id: "previous", arguments: "{}" },
+        { type: "function_call_output", call_id: "previous", output: "done" },
+      ];
+      return payload;
+    },
+    jsonBody: () => ({ id: "resp_local_flat", output: [{
+      type: "function_call", name: flatName, call_id: "next", arguments: "{}",
+    }] }),
+  });
+  const outgoing = result.gatewayBodies[0];
+  assert.ok(outgoing.tools.some((tool) => tool.name === "tool_search"));
+  assert.equal(outgoing.tools.some((tool) => tool.name === flatName), false);
+  const history = outgoing.input.find((item) => item.call_id === "previous" && item.type === "function_call");
+  assert.equal(history.name, flatName);
+  assert.equal(history.namespace, undefined);
+  const call = JSON.parse(result.clientBody).output[0];
+  assert.equal(call.name, "get_monitor_snapshot");
+  assert.equal(call.namespace, "mcp__apmneonsnapshotro");
+});
+
 test("local MLX Qwen starts with a bounded lazy tool surface", async () => {
   function bulkyLocalPayload(stream, model) {
     const payload = routedRequestPayload(stream, model);

@@ -756,7 +756,7 @@ function normalizeBody(buffer, contentType, route) {
     // Codex replays it on every later turn. An operator-configured Responses
     // endpoint is an unknown validator, so it gets the pre-label history
     // shape. Built-in Responses providers keep the field.
-    if (provider.generic === true) {
+    if (provider.generic === true || provider.perModelEndpoint === true) {
       payload.input = withoutInputMessagePhase(payload.input);
     }
   }

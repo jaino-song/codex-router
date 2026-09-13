@@ -3154,11 +3154,12 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
   const provider = providerForModel(route);
   const chatCompletionsProvider = protocolForModel(route) !== "openai-responses";
   const deepSeekResponses = usesDeepSeekResponses(route);
+  const lazyLocalToolSurface = route.requestProfile === "qwen38-mlx";
   const consoleGoResponsesCompatibility = needsConsoleGoResponsesToolCompatibility(route);
   // Restore declarations only where the existing adapter flattens tools again.
   // Native Responses routes retain the client's original declaration shape and
   // restore only their response lookup below.
-  const clientTools = chatCompletionsProvider || deepSeekResponses || consoleGoResponsesCompatibility
+  const clientTools = chatCompletionsProvider || deepSeekResponses || consoleGoResponsesCompatibility || lazyLocalToolSurface
     ? restorePreflattenedToolNamespaces(payload.tools, payload.client_metadata)
     : payload.tools;
   const compatibleInput = zenFreeCompatibleInput(
@@ -3236,7 +3237,6 @@ async function buildRoutedRequest({ request, payload, route, agedInput }) {
       input.pop();
     }
   }
-  const lazyLocalToolSurface = route.requestProfile === "qwen38-mlx";
   let tools = clientTools;
   // LiteLLM's Responses -> Chat Completions bridge drops namespace tools, which
   // is how the client ships the collaboration runtime, the app toolset
