@@ -81,8 +81,11 @@ export function endpointForModel(model, providers = RUNTIME_PROVIDERS) {
 // beside an unrelated Chat Completions server. Consumers must ask this helper
 // instead of reading the protocol off the container, which intentionally has
 // no destination metadata of its own.
-export function protocolForModel(model, providers = PROVIDERS) {
+export function protocolForModel(model, providers = RUNTIME_PROVIDERS) {
   const provider = providers.get(model?.provider);
+  // The direct Flash route overrides its provider's legacy Chat protocol,
+  // just as providerForModel does. Keep custom per-model endpoints intact.
+  if (provider && usesDeepSeekResponses(model)) return "openai-responses";
   return endpointForModel(model, providers)?.protocol ?? provider?.protocol;
 }
 

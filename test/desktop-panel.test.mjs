@@ -351,7 +351,7 @@ test("the panel renders and answers in a real browser", { skip: browserSkip }, a
     await page.waitForTimeout(600);
     assert.match(
       await page.locator("#router-status").innerText(),
-      /Router online/i,
+      /Router online|라우터 온라인/i,
       "the control snapshot did not render",
     );
     assert.equal(
