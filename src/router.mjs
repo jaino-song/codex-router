@@ -2647,7 +2647,7 @@ function extractResponseText(payload) {
 // is empty, in which case asking it again only buys the same rejection.
 function compactionAttempts(route, aged, searchContract, { allowFailover = true } = {}) {
   if (!allowFailover) return [route];
-  const settings = readFailoverSettings();
+  const settings = readFailoverSettings(route);
   if (!settings.enabled) return [route];
   const candidates = rankFailoverCandidates(
     selectedConfiguredListedModels().filter(
@@ -3675,7 +3675,7 @@ async function attemptModelFailover({
   searchContract,
   progress,
 }) {
-  const settings = readFailoverSettings();
+  const settings = readFailoverSettings(route);
   if (!settings.enabled) return undefined;
   const transportFallback = verdict.reason === "transport";
   const candidates = transportFallback
@@ -4040,7 +4040,7 @@ async function handleResponses(request, response, requestUrl) {
       // just built is thrown away, which costs one local serialization -- far
       // less than the request it avoids. The cooldown expires by itself, so
       // the operator's chosen model comes back without anyone doing anything.
-      const settings = readFailoverSettings();
+      const settings = readFailoverSettings(route);
       const cooled = !exactRouteProbe && settings.enabled
         ? providerCooldown(route.provider)
         : undefined;

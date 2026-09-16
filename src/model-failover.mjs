@@ -310,7 +310,7 @@ function unreadableSettings() {
   return { version: 1, enabled: false, chain: [] };
 }
 
-export function readFailoverSettings() {
+function readLocalFailoverSettings() {
   if (!existsSync(FAILOVER_STATE_PATH)) return defaultSettings();
   try {
     const parsed = JSON.parse(readFileSync(FAILOVER_STATE_PATH, "utf8"));
@@ -318,6 +318,7 @@ export function readFailoverSettings() {
       return {
         version: 1,
         enabled: parsed.enabled,
+        ...(typeof parsed.policyFile === "string" ? { policyFile: parsed.policyFile } : {}),
         chain: Array.isArray(parsed.chain)
           ? parsed.chain.map((slug) => String(slug).trim()).filter(Boolean)
           : [],
@@ -329,9 +330,43 @@ export function readFailoverSettings() {
   return unreadableSettings();
 }
 
+// Optional shared, non-secret policy. No candidates outside a matched group
+// may be used, including after adopting an intermediate provider on cooldown.
+export function readFailoverSettings(route) {
+  const settings = readLocalFailoverSettings();
+  if (!route || !settings.enabled || !settings.policyFile) return settings;
+  try {
+    if (!path.isAbsolute(settings.policyFile)) throw new Error("absolute policyFile required");
+    const policy = JSON.parse(readFileSync(settings.policyFile, "utf8"));
+    if (policy?.version !== 1 || (!Array.isArray(policy.groups) || !policy.groups.length)) throw new Error("invalid policy");
+    const seen = new Set();
+    let matched;
+    for (const group of policy.groups) {
+      if (!Array.isArray(group.routes) || !group.routes.length) throw new Error("empty routes");
+      const chain = group.routes.map((entry) => entry.router);
+      for (const slug of chain) {
+        if (typeof slug !== "string" || !/^[a-z0-9][a-z0-9._/-]*$/.test(slug) || seen.has(slug)) {
+          throw new Error("invalid or duplicate route");
+        }
+        seen.add(slug);
+      }
+      const index = chain.indexOf(route.slug);
+      if (index >= 0) matched = chain.slice(index + 1);
+    }
+    if (matched) return { ...settings, enabled: matched.length > 0, chain: matched };
+    return settings;
+  } catch {
+    // A broken operator policy cannot grant permission to use an arbitrary model.
+    return { ...settings, enabled: false, chain: [], policyError: true };
+  }
+}
+
 export function setFailoverEnabled(enabled) {
   const current = readFailoverSettings();
-  const next = { version: 1, enabled: enabled === true, chain: current.chain };
+  const next = {
+    version: 1, enabled: enabled === true, chain: current.chain,
+    ...(current.policyFile ? { policyFile: current.policyFile } : {}),
+  };
   writePrivateJson(FAILOVER_STATE_PATH, next, { directoryMode: 0o700 });
   return next;
 }
@@ -345,7 +380,10 @@ export function setFailoverChain(slugs) {
     .flatMap((value) => String(value).split(","))
     .map((value) => value.trim())
     .filter(Boolean);
-  const next = { version: 1, enabled: current.enabled, chain };
+  const next = {
+    version: 1, enabled: current.enabled, chain,
+    ...(current.policyFile ? { policyFile: current.policyFile } : {}),
+  };
   writePrivateJson(FAILOVER_STATE_PATH, next, { directoryMode: 0o700 });
   return next;
 }

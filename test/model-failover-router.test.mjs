@@ -194,6 +194,7 @@ function run(
   {
     chain = [FALLBACK.slug],
     enabled = true,
+    policy,
     cooldowns,
     toolResultAging = false,
     userModels,
@@ -202,10 +203,12 @@ function run(
   } = {},
 ) {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "model-failover-router-state-"));
+  const policyFile = path.join(stateDir, "shared-policy.json");
+  if (policy) writeFileSync(policyFile, JSON.stringify(policy));
   if (chain !== null) {
     writeFileSync(
       path.join(stateDir, "failover.json"),
-      JSON.stringify({ version: 1, enabled, chain }),
+      JSON.stringify({ version: 1, enabled, chain, ...(policy ? { policyFile } : {}) }),
       "utf8",
     );
   }
@@ -1926,6 +1929,61 @@ test("a rate limit with no usable window asks for patience", async () => {
       assert.match(message, /Wait a bit and retry\./);
       assert.doesNotMatch(message, /Retry in about 0s/);
     }
+  } finally {
+    await stopChild(child);
+    await closeServer(gw.server);
+  }
+});
+
+for (const cooled of [false, true]) {
+  test(`shared policy overrides unrelated global chain (cooled=${cooled})`, async () => {
+    const seen = [];
+    const gw = await gateway(async (request, response) => {
+      const body = await bodyJson(request);
+      seen.push(body.model);
+      if (body.model === PRIMARY.gatewayModel) {
+        response.writeHead(429, { "Content-Type": "application/json" });
+        response.end(QUOTA_BODY);
+      } else {
+        response.writeHead(200, { "Content-Type": "text/event-stream" });
+        response.end(contentSse("policy-fallback"));
+      }
+    });
+    const routerPort = await openPort();
+    const child = run(routerEnv(gw.port, routerPort), {
+      chain: ["wrong/qwen"],
+      policy: { version: 1, groups: [{ routes: [PRIMARY, FALLBACK].map(({ slug }) => ({ router: slug })) }] },
+      ...(cooled ? { cooldowns: { deepseek: { until: new Date(Date.now() + 60000).toISOString(), reason: "out_of_usage" } } } : {}),
+    });
+    try {
+      await waitFor(`http://127.0.0.1:${routerPort}/health`, child);
+      const result = await readRouted(routerPort, TURN_BODY);
+      assert.equal(result.status, 200);
+      assert.match(result.body, /answered-by-policy-fallback/);
+      assert.deepEqual(seen, cooled ? [FALLBACK.gatewayModel] : [PRIMARY.gatewayModel, FALLBACK.gatewayModel]);
+    } finally {
+      await stopChild(child);
+      await closeServer(gw.server);
+    }
+  });
+}
+
+test("shared policy with no eligible route never escapes to a configured unrelated model", async () => {
+  const seen = [];
+  const gw = await gateway(async (request, response) => {
+    seen.push((await bodyJson(request)).model);
+    response.writeHead(429, { "Content-Type": "application/json" });
+    response.end(QUOTA_BODY);
+  });
+  const routerPort = await openPort();
+  const child = run(routerEnv(gw.port, routerPort), {
+    policy: { version: 1, groups: [{ routes: [{ router: PRIMARY.slug }, { router: "gone/flash" }] }] },
+  });
+  try {
+    await waitFor(`http://127.0.0.1:${routerPort}/health`, child);
+    const result = await readRouted(routerPort, TURN_BODY);
+    assert.equal(result.status, 429);
+    assert.deepEqual(seen, [PRIMARY.gatewayModel]);
   } finally {
     await stopChild(child);
     await closeServer(gw.server);

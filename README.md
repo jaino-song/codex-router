@@ -1829,6 +1829,34 @@ failure. Choose the order yourself, or hand the choice back:
 ./bin/control failover auto
 ```
 
+**Shared per-model provider order.** A machine-local `failover.json` may add
+`"policyFile": "/absolute/path/to/shared-policy.json"`. The non-secret shared file
+can be consumed by other harness adapters too:
+
+```json
+{
+  "version": 1,
+  "groups": [{
+    "routes": [
+      { "router": "opencode-go/deepseek-v4.1-flash", "opencode": "opencode-go/deepseek-v4.1-flash" },
+      { "router": "openrouter/deepseek-v4.1-flash", "opencode": "openrouter/deepseek/deepseek-v4.1-flash" },
+      { "router": "deepseek/deepseek-v4.1-flash", "opencode": "deepseek/deepseek-flash" }
+    ]
+  }]
+}
+```
+
+For a matched route, only later entries in its group may serve as fallbacks.
+The last entry has no fallback; missing or ineligible routes never reopen the
+automatic ranking. Unmatched routes keep the local global chain. A configured
+policy that is missing, malformed, or contains duplicate routes disables
+fallback. The local `enabled: false` switch always wins. Control commands keep
+the policy pointer, so `failover auto` changes only the unmatched/global policy.
+Remove `policyFile` to detach the shared policy. The router reads it per request;
+provider credentials, enablement, context checks and retry triggers are unchanged.
+This applies to quota recovery, cooldown skips, eligible child transport recovery
+and compaction. Additional adapter fields are ignored by the router.
+
 **When a provider tells you when it will be back, that is believed.** The next
 turn skips it outright instead of paying for the same rejection again, and it
 starts being used the moment the window passes — or the next time it answers

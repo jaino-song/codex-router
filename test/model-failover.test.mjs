@@ -635,3 +635,34 @@ test("setFailoverChain accepts comma-separated slugs and auto clears it", () => 
   ]);
   assert.deepEqual(setFailoverChain([]).chain, []);
 });
+
+test("shared policy strictly limits every hop and survives local settings updates", () => {
+  const policyFile = path.join(stateDir, "shared-policy.json");
+  const stateFile = path.join(stateDir, "failover.json");
+  const routes = ["go/flash", "reseller/flash", "direct/flash"];
+  writeFileSync(policyFile, JSON.stringify({ version: 1, groups: [
+    { routes: routes.map((router) => ({ router })) },
+  ] }));
+  writeFileSync(stateFile, JSON.stringify({ version: 1, enabled: true, chain: ["wrong/qwen"], policyFile }));
+  try {
+    assert.deepEqual(readFailoverSettings({ slug: routes[0] }).chain, routes.slice(1));
+    assert.deepEqual(readFailoverSettings({ slug: routes[1] }).chain, routes.slice(2));
+    assert.equal(readFailoverSettings({ slug: routes[2] }).enabled, false);
+    assert.deepEqual(readFailoverSettings({ slug: "unrelated/model" }).chain, ["wrong/qwen"]);
+    assert.equal(setFailoverEnabled(false).policyFile, policyFile);
+    assert.equal(readFailoverSettings({ slug: routes[0] }).enabled, false);
+    setFailoverEnabled(true);
+    assert.equal(setFailoverChain(["other/model"]).policyFile, policyFile);
+    assert.deepEqual(readFailoverSettings({ slug: routes[0] }).chain, routes.slice(1));
+    for (const document of ["{", JSON.stringify({ version: 2, groups: [] }),
+      JSON.stringify({ version: 1, groups: [{ routes: [{ router: routes[0] }, { router: routes[0] }] }] })]) {
+      writeFileSync(policyFile, document);
+      assert.equal(readFailoverSettings({ slug: routes[0] }).enabled, false);
+      assert.equal(readFailoverSettings({ slug: routes[0] }).policyError, true);
+    }
+    writeFileSync(stateFile, JSON.stringify({ version: 1, enabled: true, chain: [], policyFile: `${policyFile}.missing` }));
+    assert.equal(readFailoverSettings({ slug: routes[0] }).enabled, false);
+  } finally {
+    writeFileSync(stateFile, JSON.stringify({ version: 1, enabled: true, chain: [] }));
+  }
+});
