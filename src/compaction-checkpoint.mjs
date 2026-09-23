@@ -603,10 +603,31 @@ function isStandingInstruction(item) {
 // (the compaction storm behind the Z.ai Flash loop).
 //
 // Everything before the newest readable boundary is covered by that checkpoint
-// and is dropped, except standing instructions and the newest two user
-// messages: that is the same replacement-history contract the V1 compaction
-// response already returns, so a lossy checkpoint never becomes the only
-// record of the current ask.
+// and is dropped, except standing instructions and the newest user messages:
+// that is the replacement-history contract the V1 compaction response already
+// returns, so a lossy checkpoint never becomes the only record of the current
+// ask.
+const MAX_REPLAYED_USER_MESSAGE_CHARS = 80_000;
+
+// Mirrors `compactOutput`'s replay rule: at most the newest two ordinary user
+// messages, newest first, complete messages only, and the first message that
+// does not fit stops the replay rather than being replayed as an unmarked
+// fragment. The budget matters here for the same reason it matters there -- a
+// large paste in a covered ask must not blunt the shrink this prune exists to
+// produce.
+function survivingUserMessages(users) {
+  const newest = users.slice(-2);
+  const selected = [];
+  let remaining = MAX_REPLAYED_USER_MESSAGE_CHARS;
+  for (let index = newest.length - 1; index >= 0 && remaining > 0; index -= 1) {
+    const size = messageText(newest[index]).length;
+    if (size > remaining) break;
+    selected.push(newest[index]);
+    remaining -= size;
+  }
+  return selected.reverse();
+}
+
 export function dropCoveredByCompaction(input) {
   if (!Array.isArray(input)) return input;
   let boundary = -1;
@@ -616,7 +637,7 @@ export function dropCoveredByCompaction(input) {
   if (boundary <= 0) return input;
   const head = input.slice(0, boundary);
   const users = head.filter((item) => item?.type === "message" && item.role === "user");
-  const keepUsers = new Set(users.slice(-2));
+  const keepUsers = new Set(survivingUserMessages(users));
   const kept = head.filter((item) => isStandingInstruction(item) || keepUsers.has(item));
   return [...kept, ...input.slice(boundary)];
 }

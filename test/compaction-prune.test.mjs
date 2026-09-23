@@ -6,6 +6,7 @@ import {
   dropCoveredByCompaction,
   encodeCheckpoint,
   finalizeCheckpoint,
+  KCR1_PREFIX,
   LEGACY_WARNING,
   prepareCompaction,
   renderCheckpoint,
@@ -107,6 +108,45 @@ test("recognizes a legacy summary message as a boundary", () => {
     message("user", "after"),
   ];
   assert.deepEqual(dropCoveredByCompaction(input), [input[0], summary, input[3]]);
+});
+
+test("recognizes a kcr1 compaction item as a boundary", () => {
+  const legacy = {
+    type: "compaction",
+    id: "cmp_legacy",
+    encrypted_content: `${KCR1_PREFIX}${Buffer.from("old summary", "utf8").toString("base64")}`,
+  };
+  const input = [
+    message("user", "before"),
+    output("run-10", "covered"),
+    legacy,
+    message("user", "after"),
+  ];
+  assert.deepEqual(dropCoveredByCompaction(input), [input[0], legacy, input[3]]);
+});
+
+test("an over-budget user message stops the replay instead of resurrecting older asks", () => {
+  const huge = message("user", "x".repeat(80_001));
+  const input = [
+    message("user", "small ask"),
+    huge,
+    compactionItem("cmp_1", checkpointFrom(COVERED)),
+    message("user", "after"),
+  ];
+  assert.deepEqual(dropCoveredByCompaction(input), [input[2], input[3]]);
+});
+
+test("a boundary that lands mid call/result pair keeps the orphan output", () => {
+  // Codex appends the trigger after a complete turn, so this shape is not
+  // expected in practice; only the pre-boundary half is ever dropped, and the
+  // chat path already drops orphan tool rows downstream.
+  const input = [
+    call("run-11"),
+    compactionItem("cmp_1", checkpointFrom(COVERED)),
+    output("run-11", "orphan"),
+    message("user", "after"),
+  ];
+  assert.deepEqual(dropCoveredByCompaction(input), [input[1], input[2], input[3]]);
 });
 
 test("does not treat an unreadable foreign compaction item as a boundary", () => {

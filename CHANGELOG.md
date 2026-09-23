@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- **A routed turn drops the history the newest readable checkpoint covers.**
+  Codex's remote-compaction v2 keeps the covered conversation in the request
+  and expects the provider to consume the checkpoint: OpenAI's own backend
+  drops what the summary covers, but a routed provider cannot decrypt
+  anything, so every covered item was still replayed upstream. Compaction
+  therefore never shrank a routed prompt -- the client measures its context by
+  the usage the provider reports, re-crossed its threshold within a turn or
+  two, and compacted again (25 compactions in 15 minutes observed on
+  `opencode-go/deepseek-v4.1-flash`). The routed path now renders the newest
+  readable checkpoint and drops the history it covers, keeping standing
+  instructions and the newest user messages inside the same
+  80,000-character budget the v1 replacement history already uses. An
+  unreadable foreign compaction item (an OpenAI blob after a native-to-routed
+  switch) is not a boundary: nothing can decode it, so nothing is dropped. The
+  compaction request itself still receives the covered items -- it builds the
+  next checkpoint from them.
 - **Reasoning from Chat Completions models now shows in Codex.** LiteLLM's
   Chat Completions to Responses bridge opens the assistant message first and
   streams the model's reasoning under a fresh hashed item id per delta, with no

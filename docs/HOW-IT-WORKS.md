@@ -363,6 +363,16 @@ generating a checkpoint on an ordinary turn, which puts summarization work --
 and its provider call -- on the request path, so it is deliberately held back
 for its own change rather than landing behind the checkpoint format.
 
+On a routed turn, the newest readable checkpoint is rendered in place and the
+history it covers is dropped before the request leaves for the provider.
+Standing instructions and the newest user messages survive, inside the same
+80,000-character budget the v1 replacement history uses. OpenAI's backend
+performs the equivalent drop for native compaction items; a routed provider
+cannot read a checkpoint, so the router has to do it, or the prompt never
+shrinks and the client -- which measures its context by the provider-reported
+usage -- compacts again immediately. An unreadable foreign compaction item is
+never a boundary: nothing can decode it, so nothing is dropped.
+
 Standalone `/images/generations` and `/images/edits` requests always pass through
 to the native OpenAI Codex backend with filtered Codex authentication headers.
 They are never sent to an external model provider.
