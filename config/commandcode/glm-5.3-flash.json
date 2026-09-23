@@ -26,7 +26,7 @@
         }
       ],
       "contextWindow": 1000000,
-      "autoCompact": 900000,
+      "autoCompact": 307000,
       "inputModalities": [
         "text",
         "image"

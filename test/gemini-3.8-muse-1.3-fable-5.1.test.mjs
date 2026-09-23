@@ -52,7 +52,7 @@ const FABLE_51_ROUTES = [
 // Additional confirmed routes 2026-09-03.
 const ADDITIONAL_ROUTES = [
   ["commandcode/qwen3.8-max-0902", "Qwen/Qwen3.8-Max-0902", 1_000_000, 900_000],
-  ["commandcode/glm-5.3-flash", "z-ai/glm-5.3-flash", 1_000_000, 900_000],
+  ["commandcode/glm-5.3-flash", "z-ai/glm-5.3-flash", 1_000_000, 307_000],
   ["opencode-go-messages/qwen3.8-flash", "qwen3.8-flash", 262_144, 235_000],
 ];
 

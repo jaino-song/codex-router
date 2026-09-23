@@ -827,7 +827,7 @@ test("GLM-5.3-Flash replaces OpenCode Go's withdrawn Ox Alpha route", () => {
   const model = MODEL_BY_SLUG.get("opencode-go/glm-5.3-flash");
   assert.equal(model?.upstreamModel, "glm-5.3-flash");
   assert.equal(model?.contextWindow, 1_000_000);
-  assert.equal(model?.autoCompact, 400_000);
+  assert.equal(model?.autoCompact, 307_000);
   assert.ok(model.contextWindow - model.autoCompact >= 131_072);
   assert.deepEqual(model?.inputModalities, ["text", "image"]);
   assert.equal(MODEL_SLUG_ALIASES.get("opencode-go/ox-alpha"), model.slug);
@@ -862,7 +862,7 @@ test("GLM-5.3-Flash on Ollama Cloud uses the :cloud tag and shared profile", () 
   assert.equal(model?.upstreamModel, "glm-5.3-flash:cloud");
   assert.equal(model?.requestProfile, "ollama-cloud-glm-5-3-flash");
   assert.equal(model?.contextWindow, 1_000_000);
-  assert.equal(model?.autoCompact, 400_000);
+  assert.equal(model?.autoCompact, 307_000);
   assert.deepEqual(model?.reasoningLevels.map((level) => level.effort), ["low", "high", "max"]);
   assert.equal(model?.defaultEffort, "max");
   assert.deepEqual(model?.inputModalities, ["text", "image"]);

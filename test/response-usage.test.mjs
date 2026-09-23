@@ -435,7 +435,7 @@ test("parses usage when UTF-8 text is split across response chunks", async () =>
 // never fired, and the turn died at the provider's real 1,048,576-token limit.
 // The router substitutes an estimate only where the upstream is plainly wrong.
 const DEEPSEEK_CONTEXT_WINDOW = 1_048_576;
-const DEEPSEEK_AUTO_COMPACT = 900_000;
+const DEEPSEEK_AUTO_COMPACT = 307_000;
 
 function completedEvent(usage) {
   return `event: response.completed\ndata: ${JSON.stringify({
@@ -445,8 +445,8 @@ function completedEvent(usage) {
 }
 
 test("the prompt-token estimate errs high rather than low", () => {
-  // The two errors are not symmetric. Compaction fires at 900,000 of a
-  // 1,048,576-token window, so an estimate more than ~14% low still lets the
+  // The two errors are not symmetric. Compaction fires at 307,000 of a
+  // 1,048,576-token window, so an estimate more than ~70% low still lets the
   // provider reject the turn -- the exact failure this exists to prevent --
   // while a high estimate only compacts sooner. Four bytes per token is the
   // most generous density real conversation text reaches, so an estimate at

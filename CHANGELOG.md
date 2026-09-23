@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **The flash models compact at the OpenCode threshold (307,000 tokens).**
+  OpenCode caps its flash routes at a 384,000-token input window with 77,000
+  reserved for the compaction request, so auto-compaction fires at 307,000
+  tokens on every route a role can use. Codex's checked-in entries carried the
+  router's own budgets instead (850,000-900,000 for DeepSeek V4.1 Flash,
+  400,000 for GLM-5.3 Flash), so the same conversation compacted at a
+  different point depending on the harness and, for DeepSeek, the route. Every
+  checked-in route of both flash models now carries `autoCompact: 307_000`,
+  matching the OpenCode policy and its reason: a model or route switch must
+  never move the compaction threshold mid-session. The Nous Portal route stays
+  at its served 262,144-token window, which cannot hold 307,000.
 - **A routed turn drops the history the newest readable checkpoint covers.**
   Codex's remote-compaction v2 keeps the covered conversation in the request
   and expects the provider to consume the checkpoint: OpenAI's own backend
