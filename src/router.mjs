@@ -19,6 +19,7 @@ import {
 import {
   CHECKPOINT_WARNING,
   COMPACTION_PROMPT,
+  dropCoveredByCompaction,
   encodeCheckpoint,
   finalizeCheckpoint,
   isRouterCompactionValue,
@@ -1471,9 +1472,16 @@ function normalizeProviderAppToolOutputs(input) {
   return input.map(normalizeOrphanAppToolOutput);
 }
 
-function normalizeRoutedInput(input) {
+function normalizeRoutedInput(input, { dropCovered = false } = {}) {
   if (!Array.isArray(input)) return input;
-  return input
+  // A normal routed turn carries the conversation Codex already compacted, and
+  // the routed provider cannot read the checkpoint to prune it. Drop what the
+  // newest readable checkpoint covers before the turn is rendered, so
+  // compaction actually shrinks the prompt (see `dropCoveredByCompaction`).
+  // The compaction request itself (`summarize`) leaves this off: it needs the
+  // covered items to build the next checkpoint.
+  const items = dropCovered ? dropCoveredByCompaction(input) : input;
+  return items
     .filter((item) => item?.type !== "compaction_trigger")
     .map((item) => {
       if (item?.type !== "compaction") return item;
@@ -1929,8 +1937,8 @@ async function relayEncryptedAgentPayload(request, item, encrypted, signal) {
   return waitForAgentPayloadRelay(operation, signal);
 }
 
-async function normalizeRoutedAgentInput(request, input, signal) {
-  const normalized = normalizeRoutedInput(input);
+async function normalizeRoutedAgentInput(request, input, signal, options = {}) {
+  const normalized = normalizeRoutedInput(input, options);
   if (!Array.isArray(normalized)) return normalized;
   const output = [];
   for (const item of normalized) {
@@ -4014,6 +4022,7 @@ async function handleResponses(request, response, requestUrl) {
         request,
         payload.input,
         controller.signal,
+        { dropCovered: true },
       );
       searchContract = routedSearchContract(searchSnapshot, normalizedInput);
       agingEnabled = toolResultAgingEnabled();

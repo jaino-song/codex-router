@@ -576,6 +576,51 @@ function isCheckpointMessage(item) {
   return Boolean(renderedCheckpointFromMessage(item)) || legacySummaryFromMessage(item) !== undefined;
 }
 
+// A compaction boundary is a checkpoint this router can actually read: one it
+// encoded itself, a rendered checkpoint message, or a legacy summary message.
+// A foreign compaction item (an OpenAI blob after a native-to-routed switch)
+// is deliberately not a boundary -- nothing here can decode it, so dropping
+// what it covers would leave the model with a placeholder instead of a
+// summary.
+function isReadableCompactionBoundary(item) {
+  if (item?.type === "compaction") {
+    return decodeCompaction(item.encrypted_content) !== undefined;
+  }
+  return isCheckpointMessage(item);
+}
+
+function isStandingInstruction(item) {
+  return item?.type === "message" && (item.role === "system" || item.role === "developer");
+}
+
+// Codex's remote-compaction V2 keeps the covered conversation in the request
+// and expects the provider to consume the checkpoint: OpenAI's own backend
+// decrypts the summary and drops what the summary covers, so the next turn's
+// prompt is small. A routed provider cannot decrypt anything, so the router
+// has to do the dropping itself or compaction never shrinks what the model
+// sees -- and the client, which measures its context by the usage the provider
+// reports, re-crosses its threshold within a turn or two and compacts again
+// (the compaction storm behind the Z.ai Flash loop).
+//
+// Everything before the newest readable boundary is covered by that checkpoint
+// and is dropped, except standing instructions and the newest two user
+// messages: that is the same replacement-history contract the V1 compaction
+// response already returns, so a lossy checkpoint never becomes the only
+// record of the current ask.
+export function dropCoveredByCompaction(input) {
+  if (!Array.isArray(input)) return input;
+  let boundary = -1;
+  input.forEach((item, index) => {
+    if (isReadableCompactionBoundary(item)) boundary = index;
+  });
+  if (boundary <= 0) return input;
+  const head = input.slice(0, boundary);
+  const users = head.filter((item) => item?.type === "message" && item.role === "user");
+  const keepUsers = new Set(users.slice(-2));
+  const kept = head.filter((item) => isStandingInstruction(item) || keepUsers.has(item));
+  return [...kept, ...input.slice(boundary)];
+}
+
 function nextId(prefix, counters) {
   const number = counters[prefix];
   counters[prefix] += 1;

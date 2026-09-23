@@ -2419,9 +2419,13 @@ test("router synthesizes routed compaction and safely replays it to native model
       sources: latestRequirements,
     };
 
-    // A routed turn renders a kcr2 boundary in place. Rewriting pre-boundary
-    // history is the held-back bridging half, so every original item still
-    // reaches the provider exactly as the client sent it.
+    // A routed turn renders a kcr2 boundary in place and drops the history
+    // that checkpoint covers: a routed provider cannot read the checkpoint to
+    // prune it itself, and replaying the covered items would defeat compaction
+    // -- the client measures its context by the usage the provider reports, so
+    // the prompt has to actually shrink or it compacts again immediately.
+    // Standing instructions and the newest two user messages survive, matching
+    // the v1 replacement-history contract.
     const replayed = await routed([
       ...historicalUsers,
       { type: "compaction", encrypted_content: encodeCheckpoint(replayCheckpoint) },
@@ -2433,10 +2437,10 @@ test("router synthesizes routed compaction and safely replays it to native model
     ]);
     assert.equal(replayed.status, 200);
     const replayedInput = gatewayRequests.at(-1).body.input;
-    assert.equal(replayedInput.length, historicalUsers.length + 2);
+    assert.equal(replayedInput.length, 4);
     assert.deepEqual(
       replayedInput.slice(0, 2).map((item) => item.content[0].text),
-      ["historical user 001", "historical user 002"],
+      ["historical user 128", "historical user 129"],
     );
     assert.match(replayedInput.at(-2).content[0].text, /BEGIN_CODEX_ROUTER_CHECKPOINT_V2/u);
     assert.equal(replayedInput.at(-1).content[0].text, "continue after kcr2");
