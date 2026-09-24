@@ -33,9 +33,10 @@ test("every checked-in GLM-5.3-Flash route records its static metadata", () => {
     assert.deepEqual(model.reasoningLevels.map((level) => level.effort), ["low", "high", "max"]);
     assert.equal(model.defaultEffort, "max");
     assert.equal(model.contextWindow, 1_000_000);
-    // The flash family compacts at OpenCode's threshold (384000 - 77000) so a
-    // route or harness switch never moves it.
-    assert.equal(model.autoCompact, 307_000);
+    // GLM keeps the conservative budget: large live requests have returned
+    // empty completions, so it caps at the proven 400000 instead of DeepSeek's
+    // 500000.
+    assert.equal(model.autoCompact, 400_000);
     assert.deepEqual(
       model.inputModalities,
       ["opencode-go/glm-5.3-flash", "ollama-cloud/glm-5.3-flash"].includes(slug) ? ["text", "image"] : ["text"],

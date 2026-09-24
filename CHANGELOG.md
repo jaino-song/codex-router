@@ -12,17 +12,23 @@
   token counters alone -- a client can keep replaying history a checkpoint
   already covers -- and only this line shows the real split between replayed
   history, the checkpoint, and fresh turns.
-- **The flash models compact at the OpenCode threshold (307,000 tokens).**
-  OpenCode caps its flash routes at a 384,000-token input window with 77,000
-  reserved for the compaction request, so auto-compaction fires at 307,000
-  tokens on every route a role can use. Codex's checked-in entries carried the
-  router's own budgets instead (850,000-900,000 for DeepSeek V4.1 Flash,
-  400,000 for GLM-5.3 Flash), so the same conversation compacted at a
-  different point depending on the harness and, for DeepSeek, the route. Every
-  checked-in route of both flash models now carries `autoCompact: 307_000`,
-  matching the OpenCode policy and its reason: a model or route switch must
-  never move the compaction threshold mid-session. The Nous Portal route stays
-  at its served 262,144-token window, which cannot hold 307,000.
+- **Codex-side flash compaction budgets follow the routed client, not OpenCode.**
+  The routed Codex client re-sends its built-in tool schemas and instructions on
+  every request -- measured at 194,000-222,000 tokens upstream for a prompt
+  whose own items were 31,000 tokens -- so the floor after a compaction sits
+  near 250,000 tokens. Matching OpenCode's 307,000 left only ~50,000 tokens of
+  work per cycle and compacted every few minutes (7 compactions in 20 minutes
+  observed on `opencode-go/deepseek-v4.1-flash`). Every checked-in DeepSeek
+  V4.1 Flash route now carries `autoCompact: 500_000`, leaving 500,000 tokens
+  of headroom under the 1M window, and every GLM-5.3-Flash route carries
+  `autoCompact: 400_000`, the conservative value that model has proven because
+  large live requests have returned empty completions. OpenCode keeps its own
+  307,000 (384,000-token input window with 77,000 reserved for the compaction
+  request); the threshold now serves each client's floor instead of a shared
+  number that only fit one of them, and every route of one model still shares
+  one number so a route switch never moves it mid-session. The Nous Portal
+  route stays at its served 262,144-token window, which cannot hold either
+  budget.
 - **A routed turn drops the history the newest readable checkpoint covers.**
   Codex's remote-compaction v2 keeps the covered conversation in the request
   and expects the provider to consume the checkpoint: OpenAI's own backend

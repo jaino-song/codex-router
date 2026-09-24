@@ -435,7 +435,7 @@ test("parses usage when UTF-8 text is split across response chunks", async () =>
 // never fired, and the turn died at the provider's real 1,048,576-token limit.
 // The router substitutes an estimate only where the upstream is plainly wrong.
 const DEEPSEEK_CONTEXT_WINDOW = 1_048_576;
-const DEEPSEEK_AUTO_COMPACT = 307_000;
+const DEEPSEEK_AUTO_COMPACT = 500_000;
 
 function completedEvent(usage) {
   return `event: response.completed\ndata: ${JSON.stringify({

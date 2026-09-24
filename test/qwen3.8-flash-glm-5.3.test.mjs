@@ -32,7 +32,7 @@ const GLM_FULL_ROUTES = [
 
 // GLM-5.3-Flash zai-api route confirmed 2026-08-27.
 const GLM_FLASH_ZAI_API = [
-  ["zai-api/glm-5.3-flash", "glm-5.3-flash", 1_000_000, 307_000],
+  ["zai-api/glm-5.3-flash", "glm-5.3-flash", 1_000_000, 400_000],
 ];
 
 test("every Qwen3.8 Flash route records the upstream id and window", () => {

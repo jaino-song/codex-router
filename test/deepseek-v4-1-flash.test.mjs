@@ -18,9 +18,11 @@ test("DeepSeek V4.1 Flash on the direct API publishes its documented capabilitie
   assert.equal(model.defaultEffort, "high");
   assert.deepEqual(model.reasoningLevels.map(({ effort }) => effort), ["low", "high", "max"]);
   assert.equal(model.contextWindow, 1_048_576);
-  // The flash family compacts at OpenCode's threshold (384000 - 77000) so a
-  // route or harness switch never moves it.
-  assert.equal(model.autoCompact, 307_000);
+  // Codex-side budget: the routed client re-sends ~200K of built-in tool
+  // schemas on every request, so the compaction floor sits near 250K and the
+  // old 307K threshold left only ~50K of work per cycle. 500K restores real
+  // working room; OpenCode keeps its own 307K (384000 - 77000).
+  assert.equal(model.autoCompact, 500_000);
   assert.ok(model.contextWindow - model.autoCompact >= MAX_EFFORT_DEFAULT_OUTPUT);
   assert.deepEqual(model.inputModalities, ["text", "image"]);
   assert.notEqual(model.multiAgentVersion, "v2");
@@ -38,7 +40,7 @@ test("DeepSeek V4.1 Flash on opencode Go uses the renamed Chat Completions id", 
   assert.equal(model.requestProfile, "auto-tool-choice");
   assert.deepEqual(model.reasoningLevels.map(({ effort }) => effort), ["low", "high", "max"]);
   assert.equal(model.contextWindow, 1_000_000);
-  assert.equal(model.autoCompact, 307_000);
+  assert.equal(model.autoCompact, 500_000);
   assert.ok(model.contextWindow - model.autoCompact >= MAX_EFFORT_DEFAULT_OUTPUT);
   assert.deepEqual(model.inputModalities, ["text", "image"]);
   assert.notEqual(model.multiAgentVersion, "v2");
@@ -89,7 +91,7 @@ test("DeepSeek V4.1 Flash on OpenRouter takes the catalog window and DeepSeek's 
   assert.equal(model.requestProfile, "auto-tool-choice");
   assert.deepEqual(model.reasoningLevels.map(({ effort }) => effort), ["low", "high", "max"]);
   assert.equal(model.contextWindow, 1_048_576);
-  assert.equal(model.autoCompact, 307_000);
+  assert.equal(model.autoCompact, 500_000);
   assert.ok(model.contextWindow - model.autoCompact >= MAX_EFFORT_DEFAULT_OUTPUT);
   assert.deepEqual(model.inputModalities, ["text", "image"]);
   assert.notEqual(model.multiAgentVersion, "v2");
@@ -117,7 +119,7 @@ test("DeepSeek V4.1 Flash on Ollama Cloud uses the cloud tag and the shared serv
   assert.equal(model.defaultEffort, "high");
   assert.deepEqual(model.reasoningLevels.map(({ effort }) => effort), ["low", "high", "max"]);
   assert.equal(model.contextWindow, 1_048_576);
-  assert.equal(model.autoCompact, 307_000);
+  assert.equal(model.autoCompact, 500_000);
   assert.ok(model.contextWindow - model.autoCompact >= MAX_EFFORT_DEFAULT_OUTPUT);
   assert.deepEqual(model.inputModalities, ["text", "image"]);
   assert.notEqual(model.multiAgentVersion, "v2");
