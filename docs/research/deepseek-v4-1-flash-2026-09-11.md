@@ -54,7 +54,7 @@ https://github.com/anomalyco/opencode/pull/48363.
   (400 on V4 Flash when `reasoning_content` is echoed with `reasoning_effort`).
 
 Route: `opencode-go/deepseek-v4.1-flash` with `auto-tool-choice`, window
-1,000,000 compacting at 850,000.
+1,000,000 compacting at 500,000.
 
 ## OpenRouter (`openrouter`)
 
@@ -79,7 +79,7 @@ https://openrouter.ai/api/v1/models/deepseek/deepseek-v4.1-flash/endpoints
   `src/chat-reasoning.mjs`) does not apply here.
 
 Route: `openrouter/deepseek-v4.1-flash` with `auto-tool-choice`, window
-1,048,576 compacting at 900,000, which keeps DeepSeek's 128K max-effort
+1,048,576 compacting at 500,000, which keeps DeepSeek's 128K max-effort
 completion and every listed host's output limit below the window.
 
 ## Nous Research Portal (`nousresearch`)
@@ -110,7 +110,7 @@ https://github.com/ollama/ollama/issues/18360.
   lists `deepseek-v4.1-flash` beside the two V4 ids. The cloud catalog shows
   ~7.2K pulls against V4 Flash's 448K, so it landed within the last day.
 - Route: `ollama-cloud/deepseek-v4.1-flash`, window 1,048,576 compacting at
-  900,000, text and image, efforts low/high/max. It takes the plain
+  500,000, text and image, efforts low/high/max. It takes the plain
   `ollama-cloud` profile rather than `ollama-cloud-auto-tool-choice`: Ollama
   serves the weights itself, so the DeepSeek API's thinking-mode rejection of
   forced tool choices is not known to apply, and the V4 Flash route on this
@@ -147,7 +147,7 @@ https://commandcode.ai/models/deepseek-v4-1-flash.
   `reasoning_content` behavior. Image input appears only in marketing copy.
 
 Route: `commandcode/deepseek-v4.1-flash`, text-only until image input is
-verified at the API, window 1,000,000 compacting at 850,000. The low/high/max
+verified at the API, window 1,000,000 compacting at 500,000. The low/high/max
 ladder is DeepSeek's documented ladder for this model, matching the existing
 Command Code V4 Flash route; it is not separately documented by Command Code.
 
