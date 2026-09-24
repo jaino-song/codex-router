@@ -72,6 +72,7 @@ test("DeepSeek V4.1 Flash on Command Code uses the Provider API chat route", () 
   assert.equal(model.listed, true);
   assert.deepEqual(model.reasoningLevels.map(({ effort }) => effort), ["low", "high", "max"]);
   assert.equal(model.contextWindow, 1_000_000);
+  assert.equal(model.autoCompact, 500_000);
   assert.ok(model.contextWindow - model.autoCompact >= MAX_EFFORT_DEFAULT_OUTPUT);
   // Image input is claimed only in marketing copy, not at the API.
   assert.deepEqual(model.inputModalities, ["text"]);

@@ -18,13 +18,13 @@ const MAX_JSON_CAPTURE_BYTES = 8 * 1024 * 1024;
 // conversation tokenizes like code, which is the assumption that errs high on
 // everything else.
 //
-// The direction is arithmetic, not taste. Compaction fires at 900,000 tokens
-// of a 1,048,576-token window, a margin of 14%, so an estimate more than 14%
+// The direction is arithmetic, not taste. Compaction fires at 500,000 tokens
+// of a 1,048,576-token window, a margin of ~52%, so an estimate more than ~52%
 // low still lets the provider reject the turn -- the failure this exists to
 // prevent -- while a high estimate only compacts sooner, which costs context
 // the session can be summarized out of. Against real text this lands between
 // about 1.0x (code-heavy) and 1.3x (prose-heavy) of the true count, so
-// compaction fires somewhere between 690,000 and 900,000 real tokens.
+// compaction fires somewhere between 385,000 and 500,000 real tokens.
 //
 // That band only holds if the bytes handed to it are bytes the model reads.
 // See NON_VISIBLE_KEY below and the provider-scoped image bound, and issue #266

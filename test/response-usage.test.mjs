@@ -445,8 +445,8 @@ function completedEvent(usage) {
 }
 
 test("the prompt-token estimate errs high rather than low", () => {
-  // The two errors are not symmetric. Compaction fires at 307,000 of a
-  // 1,048,576-token window, so an estimate more than ~70% low still lets the
+  // The two errors are not symmetric. Compaction fires at 500,000 of a
+  // 1,048,576-token window, so an estimate more than ~52% low still lets the
   // provider reject the turn -- the exact failure this exists to prevent --
   // while a high estimate only compacts sooner. Four bytes per token is the
   // most generous density real conversation text reaches, so an estimate at
