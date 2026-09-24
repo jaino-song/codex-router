@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **A routed request can dump its prompt composition on demand.** Pointing
+  `CODEX_ROUTER_REQUEST_DUMP` at a file appends one JSON line per routed turn
+  and per compaction request: item counts and byte sizes by type, opaque item
+  ids, and the upstream body sizes. Message text is never written, and nothing
+  is written while the variable is unset. Compaction floors are invisible from
+  token counters alone -- a client can keep replaying history a checkpoint
+  already covers -- and only this line shows the real split between replayed
+  history, the checkpoint, and fresh turns.
 - **The flash models compact at the OpenCode threshold (307,000 tokens).**
   OpenCode caps its flash routes at a 384,000-token input window with 77,000
   reserved for the compaction request, so auto-compaction fires at 307,000

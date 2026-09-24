@@ -29,6 +29,12 @@ import {
   renderCheckpoint,
   renderCompactionValue,
 } from "./compaction-checkpoint.mjs";
+import {
+  compositionStats,
+  dumpRequestComposition,
+  jsonBytes,
+  requestDumpPath,
+} from "./request-composition.mjs";
 import { handlePanelRequest, isPanelRoute } from "./desktop-panel.mjs";
 import { handleGeminiRequest, isGeminiRoute } from "./gemini-surface.mjs";
 import { handleCursorRequest, isCursorRoute } from "./cursor-surface.mjs";
@@ -2783,6 +2789,17 @@ async function summarize(request, payload, route, signal, { allowFailover = true
   // costs nothing extra here.
   const normalized = await normalizeRoutedAgentInput(request, originalInput, signal);
   const searchContract = routedSearchContract(searchSnapshot, normalized);
+  // Prompt diagnostics: compaction replays the whole conversation, so this
+  // line measures the client's full context at the moment it compacted.
+  if (requestDumpPath()) {
+    dumpRequestComposition("summarize", {
+      model: route.slug,
+      provider: route.provider,
+      headerRequestId: request.headers?.["x-request-id"],
+      incoming: compositionStats(originalInput),
+      normalized: compositionStats(normalized),
+    });
+  }
   // Evidence is extracted before tool-result aging rewrites old output bytes.
   // The summarizer may select source IDs, but only this deterministic pass can
   // decide which source types and machine outcomes enter a kcr2 checkpoint.
@@ -4043,6 +4060,26 @@ async function handleResponses(request, response, requestUrl) {
       headers = built.headers;
       routedBody = built.body;
       builtSearchMode = built.searchMode;
+      // Prompt diagnostics: what the client sent, what the checkpoint prune
+      // left of it, and the body that actually goes upstream. Sizes and
+      // opaque ids only, and the stats walk is paid for only while
+      // CODEX_ROUTER_REQUEST_DUMP is set.
+      if (requestDumpPath()) {
+        dumpRequestComposition("turn", {
+          model: route.slug,
+          provider: route.provider,
+          requestId: diagnostics.requestId,
+          headerRequestId: request.headers?.["x-request-id"],
+          incoming: compositionStats(payload.input),
+          normalized: compositionStats(normalizedInput),
+          upstream: {
+            instructionsBytes: jsonBytes(routedBody?.instructions),
+            toolsBytes: jsonBytes(routedBody?.tools),
+            inputBytes: jsonBytes(routedBody?.input),
+            bodyBytes: jsonBytes(routedBody),
+          },
+        });
+      }
       // This provider has already said it would be empty until a named time.
       // Sending anyway buys one guaranteed rejection per turn for as long as
       // the window lasts, so move now and skip the dead round trip. The body
