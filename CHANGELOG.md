@@ -4,9 +4,11 @@
 
 - **A routed request can dump its prompt composition on demand.** Pointing
   `CODEX_ROUTER_REQUEST_DUMP` at a file appends one JSON line per routed turn
-  and per compaction request: item counts and byte sizes by type, opaque item
-  ids, and the upstream body sizes. Message text is never written, and nothing
-  is written while the variable is unset. Compaction floors are invisible from
+  and per routed compaction request: item counts and byte sizes by type, opaque
+  item ids, and the body size built for the selected route. A later failover
+  rebuilds that body, so the line describes the turn as first prepared.
+  Message text is never written, and nothing is written while the variable is
+  unset. Compaction floors are invisible from
   token counters alone -- a client can keep replaying history a checkpoint
   already covers -- and only this line shows the real split between replayed
   history, the checkpoint, and fresh turns.

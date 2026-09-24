@@ -61,6 +61,14 @@ test("composition stats return undefined for a non-list input", () => {
   assert.equal(compositionStats(null), undefined);
 });
 
+test("a client-supplied __proto__ type records a bucket instead of touching the prototype", () => {
+  const stats = compositionStats([{ type: "__proto__", id: "msg_1" }]);
+  assert.equal(stats.byType["__proto__"].items, 1);
+  assert.equal(Object.getPrototypeOf(stats.byType), null);
+  assert.equal(Object.prototype.items, undefined);
+  assert.equal(Object.prototype.bytes, undefined);
+});
+
 test("the dump stays silent until a path is configured, then appends one line per request", () => {
   const dir = mkdtempSync(join(tmpdir(), "request-composition-"));
   const path = join(dir, "requests.jsonl");
@@ -72,12 +80,23 @@ test("the dump stays silent until a path is configured, then appends one line pe
     withDumpPath(path, () => {
       dumpRequestComposition("turn", {
         model: "deepseek/deepseek-v4.1-flash",
-        incoming: compositionStats([{ type: "message", id: "msg_1" }]),
+        incoming: compositionStats([
+          {
+            type: "message",
+            id: "msg_1",
+            content: "SECRET MESSAGE TEXT",
+            arguments: "SECRET ARGUMENTS",
+            output: "SECRET OUTPUT",
+          },
+        ]),
         upstream: { bodyBytes: 12 },
       });
       dumpRequestComposition("summarize", { model: "deepseek/deepseek-v4.1-flash" });
     });
-    const lines = readFileSync(path, "utf8")
+    const raw = readFileSync(path, "utf8");
+    assert.ok(raw.endsWith("\n"), "each line ends with a newline");
+    assert.ok(!raw.includes("SECRET"), "message text, arguments, and outputs never reach the dump");
+    const lines = raw
       .trim()
       .split("\n")
       .map((line) => JSON.parse(line));

@@ -4061,8 +4061,10 @@ async function handleResponses(request, response, requestUrl) {
       routedBody = built.body;
       builtSearchMode = built.searchMode;
       // Prompt diagnostics: what the client sent, what the checkpoint prune
-      // left of it, and the body that actually goes upstream. Sizes and
-      // opaque ids only, and the stats walk is paid for only while
+      // left of it, and the body built for the selected route. A later
+      // cooldown swap or failover rebuilds the route and the body, so this
+      // line describes the turn as it was first prepared; sizes and opaque
+      // ids only, and the stats walk is paid for only while
       // CODEX_ROUTER_REQUEST_DUMP is set.
       if (requestDumpPath()) {
         dumpRequestComposition("turn", {

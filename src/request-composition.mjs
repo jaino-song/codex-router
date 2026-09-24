@@ -30,7 +30,10 @@ function itemId(item) {
 
 export function compositionStats(input) {
   if (!Array.isArray(input)) return undefined;
-  const byType = {};
+  // A client controls `type`, so the bucket map must not inherit `Object.prototype`:
+  // an item typed `__proto__` or `constructor` would otherwise write onto shared
+  // built-ins instead of recording a bucket.
+  const byType = Object.create(null);
   const detail = [];
   let bytes = 0;
   for (const item of input) {
