@@ -2018,8 +2018,9 @@ retry rules on the shared path.
   constraints use the existing adapters. Never infer tools from name prefixes or
   create declarations from metadata alone; ambiguous and ordinary-name
   collisions remain unchanged.
-- GLM thinking, legacy DeepSeek thinking and Command Code's DeepSeek Flash Chat
-  route carry reasoning through LiteLLM as assistant `thinking` parts, restored
+- GLM thinking, legacy DeepSeek thinking, Command Code's DeepSeek Flash and the
+  opencode Go DeepSeek Flash (`deepseek-v4-flash`, `deepseek-v4.1-flash`) Chat
+  routes carry reasoning through LiteLLM as assistant `thinking` parts, restored
   by the forwarder to `reasoning_content`. Remove only successfully carried
   reasoning runs so plaintext cannot also become a user message. Do not mutate
   source items or change other native Responses routes. Keep this policy shared

@@ -16,10 +16,17 @@ test("native chat reasoning stays scoped to established history contracts", () =
   assert.equal(usesNativeChatReasoning({
     provider: "commandcode", upstreamModel: "deepseek/deepseek-v4-flash",
   }), true);
+  assert.equal(usesNativeChatReasoning({
+    provider: "opencode-go", upstreamModel: "deepseek-v4.1-flash",
+  }), true);
+  assert.equal(usesNativeChatReasoning({
+    provider: "opencode-go", upstreamModel: "deepseek-v4-flash",
+  }), true);
   for (const model of [
     undefined,
     { provider: "deepseek", requestProfile: "deepseek-nonthinking" },
-    { provider: "opencode-go", upstreamModel: "deepseek-v4-flash" },
+    { provider: "opencode-go", upstreamModel: "deepseek-v4-pro" },
+    { provider: "opencode-go", upstreamModel: "deepseek-v4-flash-vision-exp" },
     { provider: "custom", upstreamModel: "deepseek/deepseek-v4-flash" },
     { provider: "commandcode", upstreamModel: "moonshotai/kimi-k2.6" },
     { provider: "commandcode-messages", upstreamModel: "deepseek/deepseek-v4-flash" },
@@ -164,6 +171,7 @@ asyncio.run(main())
       DEEPSEEK_API_BASE_URL: `http://127.0.0.1:${upstream.address().port}/v1`, DEEPSEEK_API_KEY: "TEST_DEEPSEEK_KEY",
       ZAI_CODING_BASE_URL: `http://127.0.0.1:${upstream.address().port}/v1`, ZAI_API_KEY: "TEST_ZAI_KEY",
       COMMANDCODE_BASE_URL: `http://127.0.0.1:${upstream.address().port}/v1`, COMMAND_CODE_API_KEY: "TEST_COMMANDCODE_KEY",
+      OPENCODE_GO_BASE_URL: `http://127.0.0.1:${upstream.address().port}/v1`, OPENCODE_GO_API_KEY: "TEST_OPENCODE_GO_KEY",
     };
     const output = childOutput();
     const services = ["api-forwarder.mjs", "router.mjs"].map((script) => output.capture(script,
@@ -174,7 +182,7 @@ asyncio.run(main())
       { name: "api-forwarder /health", url: `http://127.0.0.1:${forwarderPort}/health`, headers: { Authorization: `Bearer ${internal}` } },
       { name: "router /models", url: `${base}/models` },
     ], { children: services, output });
-    for (const model of ["zai-coding/glm-5.3", "deepseek/deepseek-v4-flash", "commandcode/deepseek-v4-flash"]) {
+    for (const model of ["zai-coding/glm-5.3", "deepseek/deepseek-v4-flash", "commandcode/deepseek-v4-flash", "opencode-go/deepseek-v4-flash", "opencode-go/deepseek-v4.1-flash"]) {
       for (negativeControl of [false, true]) {
         const response = await fetch(`${base}/responses`, {
           method: "POST", headers: { "Content-Type": "application/json" }, signal: AbortSignal.timeout(30000),
