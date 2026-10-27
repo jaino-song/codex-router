@@ -226,6 +226,108 @@ function createRequest(overrides = {}) {
   };
 }
 
+test("unsupported steering returns input promptly without failing an active response", async (t) => {
+  const bodies = [];
+  let finishFirst;
+  const assistant = { type: "message", role: "assistant", content: "original answer" };
+  const { server, port } = await startServer(async (request, response) => {
+    let body = "";
+    for await (const chunk of request) body += chunk;
+    bodies.push(JSON.parse(body));
+    if (bodies.length === 1) {
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.write('data: {"type":"response.created","sequence_number":0,"response":{"id":"resp-active"}}\n\n');
+      await new Promise((resolve) => { finishFirst = resolve; });
+      response.end("data: " + JSON.stringify({
+        type: "response.completed", sequence_number: 1,
+        response: { id: "resp-active", output: [assistant] },
+      }) + "\n\n");
+    } else {
+      sse(response, [
+        { type: "response.created", sequence_number: 0, response: { id: "resp-next" } },
+        { type: "response.completed", sequence_number: 1, response: { id: "resp-next", output: [] } },
+      ]);
+    }
+  });
+  const { peer } = await connect(port);
+  t.after(() => { finishFirst?.(); peer.socket.destroy(); server.closeAllConnections(); server.close(); });
+  const initial = createRequest();
+  peer.sendJson(initial);
+  const created = await peer.nextJson();
+  assert.equal(created.type, "response.created");
+  const input = [{ type: "message", role: "user", content: [
+    { type: "input_text", text: "Keep the original files unchanged." },
+  ] }];
+  peer.sendJson({ type: "response.steer", previous_response_id: "resp-active", input });
+  // Must arrive while the first upstream response is deliberately held.
+  const rejected = await peer.nextJson();
+  assert.equal(rejected.type, "response.steer.failed");
+  assert.equal(rejected.error.code, "steering_not_supported");
+  assert.equal(rejected.error.type, "invalid_request_error");
+  assert.deepEqual(rejected.steer, { previous_response_id: "resp-active", input });
+  assert.equal(rejected.steer.id, undefined, "input was never accepted");
+  assert.equal(rejected.status, undefined, "not a fatal WebSocket error");
+  assert.ok(rejected.sequence_number > created.sequence_number);
+  assert.equal(bodies.length, 1, "steering must not spend another provider call");
+  finishFirst();
+  const completed = await peer.nextJson();
+  assert.equal(completed.type, "response.completed");
+  assert.equal(completed.response.id, "resp-active");
+  assert.ok(completed.sequence_number > rejected.sequence_number);
+  // Only an explicit caller retry may apply returned input.
+  peer.sendJson(createRequest({ previous_response_id: "resp-active", input }));
+  const nextCreated = await peer.nextJson();
+  const nextCompleted = await peer.nextJson();
+  assert.equal(nextCreated.type, "response.created");
+  assert.equal(nextCompleted.type, "response.completed");
+  assert.ok(nextCreated.sequence_number > completed.sequence_number);
+  assert.deepEqual(bodies[1].input, [...initial.input, assistant, ...input]);
+  assert.equal(bodies[1].model, initial.model);
+  assert.equal(bodies[1].type, undefined);
+});
+
+test("steering rejection preserves string input and never forwards it", async (t) => {
+  let calls = 0;
+  const { server, port } = await startServer(() => { calls += 1; });
+  const { peer } = await connect(port);
+  t.after(() => { peer.socket.destroy(); server.closeAllConnections(); server.close(); });
+  const input = "  Keep this exact whitespace.\nSecond line.  ";
+  peer.sendJson({ type: "response.steer", previous_response_id: "resp-client", input });
+  const rejected = await peer.nextJson();
+  assert.equal(rejected.type, "response.steer.failed");
+  assert.equal(rejected.error.code, "steering_not_supported");
+  assert.equal(rejected.steer.input, input);
+  assert.equal(calls, 0);
+  peer.sendJson({ type: "response.steer", previous_response_id: "resp-client", input, model: "other/model" });
+  const invalid = await peer.nextJson();
+  assert.equal(invalid.type, "response.steer.failed");
+  assert.equal(invalid.error.code, "invalid_input");
+  assert.deepEqual(invalid.steer, { previous_response_id: "resp-client", input });
+  assert.equal(calls, 0);
+});
+
+test("invalid steering and unknown event types retain request validation", async (t) => {
+  const { server, port } = await startServer(() => assert.fail("invalid input must not reach HTTP"));
+  const { peer } = await connect(port);
+  t.after(() => { peer.socket.destroy(); server.closeAllConnections(); server.close(); });
+  for (const request of [
+    { type: "response.steer", input: "missing target" },
+    { type: "response.steer", previous_response_id: "resp", input: [] },
+    { type: "response.steer", previous_response_id: "resp", input: [{ role: "assistant", content: "not user input" }] },
+    { type: "response.steer", previous_response_id: "resp", input: [{ role: "user", content: [{ type: "function_call_output" }] }] },
+  ]) {
+    peer.sendJson(request);
+    const error = await peer.nextJson();
+    assert.equal(error.type, "error");
+    assert.equal(error.status, 400);
+    assert.equal(error.error.code, "invalid_input");
+  }
+  peer.sendJson({ type: "unknown.event", input: "ignored" });
+  const error = await peer.nextJson();
+  assert.equal(error.type, "error");
+  assert.equal(error.status, 400);
+});
+
 test("authenticates the capability and beta contract before switching protocols", async (t) => {
   const { server, port } = await startServer(() => assert.fail("HTTP route must not run"));
   t.after(() => server.close());

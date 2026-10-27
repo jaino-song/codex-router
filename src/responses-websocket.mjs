@@ -728,6 +728,10 @@ class ResponsesWebSocketPeer {
     this.closeSent = false;
     this.pendingRequests = 0;
     this.queue = Promise.resolve();
+    this.pendingControls = 0;
+    this.controlQueue = Promise.resolve();
+    this.lastSequenceNumber = -1;
+    this.resequenceEvents = false;
     this.abortController = new AbortController();
     this.continuations = new Map();
     this.turnState = undefined;
@@ -755,7 +759,16 @@ class ResponsesWebSocketPeer {
   }
 
   sendJson(value) {
-    return this.send(0x1, Buffer.from(JSON.stringify(value), "utf8"));
+    let outgoing = value;
+    // A local rejection shares the event stream with upstream SSE. Ordinary
+    // streams stay untouched; inserted control events need unique sequence numbers.
+    if (value.type === "response.steer.failed") this.resequenceEvents = true;
+    if (this.resequenceEvents && value.type?.startsWith("response.")) {
+      outgoing = { ...value, sequence_number: ++this.lastSequenceNumber };
+    } else if (Number.isSafeInteger(value.sequence_number)) {
+      this.lastSequenceNumber = Math.max(this.lastSequenceNumber, value.sequence_number);
+    }
+    return this.send(0x1, Buffer.from(JSON.stringify(outgoing), "utf8"));
   }
 
   async sendJsonWithBackpressure(value) {
@@ -914,6 +927,29 @@ class ResponsesWebSocketPeer {
   }
 
   enqueue(text) {
+    let control;
+    try {
+      control = JSON.parse(text);
+    } catch {
+      // Keep malformed JSON on the existing request validation path.
+    }
+    if (control?.type === "response.steer") {
+      // Reject promptly instead of waiting behind a long-running generation.
+      this.pendingControls += 1;
+      if (this.pendingControls > MAX_QUEUED_REQUESTS) {
+        this.fail(1008, "Too many queued Responses control messages.");
+        return;
+      }
+      this.controlQueue = this.controlQueue
+        .then(() => this.rejectUnsupportedSteer(control))
+        .catch(() => {
+          if (!this.closed) this.fail(1011, "Unable to return uncommitted steering input.");
+        })
+        .finally(() => {
+          this.pendingControls -= 1;
+        });
+      return;
+    }
     this.pendingRequests += 1;
     if (this.pendingRequests > MAX_QUEUED_REQUESTS) {
       this.fail(1008, "Too many queued Responses requests.");
@@ -932,6 +968,48 @@ class ResponsesWebSocketPeer {
       .finally(() => {
         this.pendingRequests -= 1;
       });
+  }
+
+  async rejectUnsupportedSteer(request) {
+    if (this.closed) return;
+    const input = request.input;
+    const validInput = typeof input === "string"
+      ? input.trim().length > 0
+      : Array.isArray(input) && input.length > 0 && input.every((item) =>
+        item && typeof item === "object" && !Array.isArray(item) &&
+        item.role === "user" &&
+        (item.type === undefined || item.type === "message") &&
+        Object.keys(item).every((key) => ["type", "role", "content"].includes(key)) &&
+        (typeof item.content === "string"
+          ? item.content.trim().length > 0
+          : Array.isArray(item.content) && item.content.length > 0 &&
+            item.content.every((part) => part && typeof part === "object" &&
+              !Array.isArray(part) &&
+              ["input_text", "input_image", "input_file"].includes(part.type))));
+    if (typeof request.previous_response_id !== "string" ||
+        request.previous_response_id.trim().length === 0 || !validInput) {
+      this.sendError(400, {
+        type: "invalid_request_error",
+        code: "invalid_input",
+        message: "response.steer requires a response ID and nonempty user input.",
+      });
+      return;
+    }
+    const validFields = Object.keys(request)
+      .every((key) => ["type", "previous_response_id", "input"].includes(key));
+    // HTTP/SSE cannot steer an in-flight upstream response. Reject only the
+    // steer, not the turn. No accepted event/id: the client still owns input.
+    await this.sendJsonWithBackpressure({
+      type: "response.steer.failed",
+      steer: { previous_response_id: request.previous_response_id, input },
+      error: {
+        type: "invalid_request_error",
+        code: validFields ? "steering_not_supported" : "invalid_input",
+        message: validFields
+          ? "This HTTP/SSE router does not support mid-turn steering. The input was not applied; carry it into response.create."
+          : "response.steer accepts only type, previous_response_id, and input. The input was not applied.",
+      },
+    });
   }
 
   async process(text) {
