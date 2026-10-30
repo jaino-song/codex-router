@@ -341,12 +341,13 @@ function responseHeaders(response, { includeRateLimits = false } = {}) {
   return Object.keys(headers).length > 0 ? headers : undefined;
 }
 
-async function sendSuccessfulResponseHeaders(peer, response) {
+async function sendSuccessfulResponseHeaders(peer, response, generation) {
+  const send = (event) => peer.sendGeneration(generation, event);
   const headers = responseHeaders(response) || {};
   const turnState = headers["x-codex-turn-state"];
   if (turnState !== undefined) {
     // Current Codex accepts sticky state only from response.metadata.
-    if (!(await peer.sendJsonWithBackpressure({
+    if (!(await send({
       type: "response.metadata",
       headers: { "x-codex-turn-state": turnState },
     }))) return false;
@@ -362,14 +363,14 @@ async function sendSuccessfulResponseHeaders(peer, response) {
     if (headers[name] !== undefined) codexMetadataHeaders[name] = headers[name];
   }
   if (Object.keys(codexMetadataHeaders).length > 0) {
-    if (!(await peer.sendJsonWithBackpressure({
+    if (!(await send({
       type: "codex.response.metadata",
       headers: codexMetadataHeaders,
     }))) return false;
   }
 
   for (const rateLimits of rateLimitEvents(response.headers)) {
-    if (!(await peer.sendJsonWithBackpressure(rateLimits))) return false;
+    if (!(await send(rateLimits))) return false;
   }
 
   if (headers["x-reasoning-included"] !== undefined) {
@@ -574,10 +575,12 @@ function reconciledContinuationOutput(completedOutput, outputItems) {
     if (key) doneByKey.set(key, item);
   }
 
+  const forwarded = new Set(outputItems);
   const used = new Set();
   const reconciled = completedOutput.map((item) => {
     const key = continuationItemKey(item);
-    const done = key ? doneByKey.get(key) : undefined;
+    const done = (key ? doneByKey.get(key) : undefined) ||
+      (forwarded.has(item) ? item : undefined);
     if (!done) return item;
     used.add(done);
     return done;
@@ -656,6 +659,8 @@ async function sniffUndeclaredResponse(upstream, signal) {
 async function relaySse(body, onEvent, { signal, maxEventBytes }) {
   if (!body) throw new Error("The internal Responses endpoint returned no stream.");
   const reader = body.getReader();
+  const cancel = () => { void reader.cancel().catch(() => {}); };
+  signal.addEventListener("abort", cancel, { once: true });
   const decoder = new TextDecoder("utf-8", { fatal: true });
   let text = "";
   let dataLines = [];
@@ -709,7 +714,8 @@ async function relaySse(body, onEvent, { signal, maxEventBytes }) {
     if (text && (await consumeLine(text)) === false) return;
     await dispatch();
   } finally {
-    await reader.cancel().catch(() => {});
+    signal.removeEventListener("abort", cancel);
+    void reader.cancel().catch(() => {});
     reader.releaseLock?.();
   }
 }
@@ -762,7 +768,9 @@ class ResponsesWebSocketPeer {
     let outgoing = value;
     // A local rejection shares the event stream with upstream SSE. Ordinary
     // streams stay untouched; inserted control events need unique sequence numbers.
-    if (value.type === "response.steer.failed") this.resequenceEvents = true;
+    if (value.type === "response.steer.failed" || value.type?.startsWith("response.interrupt.")) {
+      this.resequenceEvents = true;
+    }
     if (this.resequenceEvents && value.type?.startsWith("response.")) {
       outgoing = { ...value, sequence_number: ++this.lastSequenceNumber };
     } else if (Number.isSafeInteger(value.sequence_number)) {
@@ -771,8 +779,13 @@ class ResponsesWebSocketPeer {
     return this.send(0x1, Buffer.from(JSON.stringify(outgoing), "utf8"));
   }
 
-  async sendJsonWithBackpressure(value) {
-    if (this.sendJson(value)) return true;
+  async sendJsonWithBackpressure(value, onEnqueued) {
+    if (this.closed || this.socket.destroyed || !this.socket.writable) return false;
+    const writable = this.sendJson(value);
+    // Both write(true) and write(false) have accepted the frame. Record it
+    // synchronously, before a control frame can run while we await drain.
+    onEnqueued?.();
+    if (writable) return true;
     if (this.closed || this.socket.destroyed) return false;
     await new Promise((resolve) => {
       const finish = () => {
@@ -933,7 +946,7 @@ class ResponsesWebSocketPeer {
     } catch {
       // Keep malformed JSON on the existing request validation path.
     }
-    if (control?.type === "response.steer") {
+    if (["response.steer", "response.interrupt"].includes(control?.type)) {
       // Reject promptly instead of waiting behind a long-running generation.
       this.pendingControls += 1;
       if (this.pendingControls > MAX_QUEUED_REQUESTS) {
@@ -941,9 +954,10 @@ class ResponsesWebSocketPeer {
         return;
       }
       this.controlQueue = this.controlQueue
-        .then(() => this.rejectUnsupportedSteer(control))
+        .then(() => control.type === "response.interrupt"
+          ? this.interrupt(control) : this.rejectUnsupportedSteer(control))
         .catch(() => {
-          if (!this.closed) this.fail(1011, "Unable to return uncommitted steering input.");
+          if (!this.closed) this.fail(1011, "Unable to return a Responses control result.");
         })
         .finally(() => {
           this.pendingControls -= 1;
@@ -968,6 +982,89 @@ class ResponsesWebSocketPeer {
       .finally(() => {
         this.pendingRequests -= 1;
       });
+  }
+
+  commitGeneration(generation, output) {
+    this.continuations.clear();
+    const continuation = !generation.overflow
+      ? continuationState(generation.input, output, this.options.maxContinuationBytes)
+      : undefined;
+    if (continuation) this.continuations.set(generation.id, continuation);
+    // Keep the successful terminal identity even when its baseline overflowed.
+    this.lastCompletedId = typeof generation.id === "string" && generation.id.length <= 512
+      ? generation.id : undefined;
+  }
+
+  sendGeneration(generation, event) {
+    // Check + write + bookkeeping is one synchronous transaction. In
+    // particular, never forward a buffered upstream event after an interrupt.
+    if (generation.interrupted || generation.terminal) return Promise.resolve(false);
+    return this.sendJsonWithBackpressure(event, () => {
+      if (event.type === "response.created") generation.id ??= event.response?.id;
+      if (event.type === "response.output_item.done" && event.item) {
+        const bytes = Buffer.byteLength(JSON.stringify(event.item), "utf8");
+        if (generation.bytes + bytes <= this.options.maxContinuationBytes) {
+          generation.output.push(event.item);
+          generation.bytes += bytes;
+        } else generation.overflow = true;
+      }
+      if (event.type === "response.completed") {
+        generation.id ??= event.response?.id;
+        generation.terminal = true;
+        this.commitGeneration(generation,
+          reconciledContinuationOutput(event.response?.output, generation.output));
+      } else if (["error", "response.failed", "response.incomplete"].includes(event.type)) {
+        generation.terminal = true;
+      }
+    });
+  }
+
+  async interrupt(request) {
+    if (this.closed) return;
+    if (Array.isArray(request) ||
+        !Object.keys(request).every((key) => ["type", "response_id", "mode"].includes(key)) ||
+        typeof request.response_id !== "string" || !request.response_id.trim() ||
+        request.response_id.length > 512 || request.mode !== "discard_partial_items") {
+      this.sendError(400, {
+        type: "invalid_request_error", code: "invalid_input",
+        message: "response.interrupt requires a bounded response_id and mode discard_partial_items.",
+      });
+      return;
+    }
+    const generation = this.activeGeneration;
+    const matching = generation?.id === request.response_id;
+    if ((!matching || generation.terminal) && this.lastCompletedId !== request.response_id) {
+      await this.sendJsonWithBackpressure({
+        type: "response.interrupt.failed", response_id: request.response_id,
+        error: { type: "invalid_request_error", code: "response_not_found",
+          message: "No interruptible response with this ID exists on this connection." },
+      });
+      return;
+    }
+    const needsTerminal = matching && !generation.terminal;
+    let release;
+    if (matching) {
+      // Freeze output and install the queue barrier before aborting HTTP.
+      generation.interrupted = true;
+      generation.barrier = new Promise((resolve) => { release = resolve; });
+    }
+    try {
+      const ack = this.sendJsonWithBackpressure({
+        type: "response.interrupt.accepted", response_id: request.response_id,
+      });
+      if (matching) generation.controller.abort();
+      if (!(await ack)) return;
+      if (needsTerminal) {
+        await this.sendJsonWithBackpressure({
+          type: "response.completed", response: { id: generation.id },
+        }, () => {
+          generation.terminal = true;
+          this.commitGeneration(generation, generation.output);
+        });
+      }
+    } finally {
+      release?.();
+    }
   }
 
   async rejectUnsupportedSteer(request) {
@@ -1085,25 +1182,29 @@ class ResponsesWebSocketPeer {
       return;
     }
 
+    const controller = new AbortController();
+    const generation = {
+      controller, input: fullRequest.input, output: [], bytes: 0,
+      overflow: false, terminal: false, interrupted: false,
+    };
+    this.activeGeneration = generation;
     if (request.generate === false) {
       const responseId = `resp_router_prewarm_${randomUUID().replaceAll("-", "")}`;
-      this.continuations.clear();
-      this.continuations.set(responseId, { input: fullRequest.input, output: [] });
-      await this.sendJsonWithBackpressure({
-        type: "response.created",
-        response: { id: responseId },
-      });
-      await this.sendJsonWithBackpressure({
-        type: "response.completed",
-        response: {
-          id: responseId,
-          usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
-        },
-      });
+      try {
+        if (!(await this.sendGeneration(generation, {
+          type: "response.created", response: { id: responseId },
+        }))) return;
+        await this.sendGeneration(generation, {
+          type: "response.completed",
+          response: { id: responseId, usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 } },
+        });
+      } finally {
+        await generation.barrier;
+        if (this.activeGeneration === generation) this.activeGeneration = undefined;
+      }
       return;
     }
 
-    const controller = new AbortController();
     const onClose = () => controller.abort(this.abortController.signal.reason);
     this.abortController.signal.addEventListener("abort", onClose, { once: true });
     let upstream;
@@ -1186,38 +1287,22 @@ class ResponsesWebSocketPeer {
           });
           return;
         }
-        if (!(await sendSuccessfulResponseHeaders(this, upstream))) return;
-        if (!(await this.sendJsonWithBackpressure({
+        if (!(await sendSuccessfulResponseHeaders(this, upstream, generation))) return;
+        if (!(await this.sendGeneration(generation, {
           type: "response.created",
           response: { ...completedResponse, status: "in_progress", output: [] },
         }))) return;
         for (const [outputIndex, item] of completedResponse.output.entries()) {
-          if (!(await this.sendJsonWithBackpressure({
-            type: "response.output_item.done",
-            output_index: outputIndex,
-            item,
+          if (!(await this.sendGeneration(generation, {
+            type: "response.output_item.done", output_index: outputIndex, item,
           }))) return;
         }
-        if (!(await this.sendJsonWithBackpressure({
-          type: "response.completed",
-          response: completedResponse,
-        }))) return;
-        this.continuations.clear();
-        const continuation = continuationState(
-          fullRequest.input,
-          completedResponse.output,
-          this.options.maxContinuationBytes,
-        );
-        if (continuation) this.continuations.set(completedResponse.id, continuation);
+        await this.sendGeneration(generation, {
+          type: "response.completed", response: completedResponse,
+        });
         return;
       }
-      if (!(await sendSuccessfulResponseHeaders(this, upstream))) return;
-      const outputItems = [];
-      let outputItemsBytes = 0;
-      let continuationOverflow = false;
-      let completed;
-      let terminalFailure = false;
-      let terminalSeen = false;
+      if (!(await sendSuccessfulResponseHeaders(this, upstream, generation))) return;
       await relaySse(
         upstream.body,
         async (data) => {
@@ -1234,7 +1319,8 @@ class ResponsesWebSocketPeer {
           // logical response. Drain the HTTP body for clean accounting and
           // connection reuse, but never graft a provider trailer onto the next
           // continuation baseline.
-          if (terminalSeen) return true;
+          if (generation.interrupted) return false;
+          if (generation.terminal) return true;
           // Native Codex maps WebSocket `error` events only when they carry
           // an HTTP failure status. SSE can instead signal failure by ending
           // its body; the persistent socket has no such turn boundary.
@@ -1242,29 +1328,9 @@ class ResponsesWebSocketPeer {
               !(Number.isInteger(event.status) && event.status >= 400 && event.status <= 599)) {
             event = { ...event, status: 502 };
           }
-          if (!(await this.sendJsonWithBackpressure(event))) return false;
-          if (event.type === "response.output_item.done" && event.item) {
-            const itemBytes = Buffer.byteLength(JSON.stringify(event.item), "utf8");
-            if (outputItemsBytes + itemBytes <= this.options.maxContinuationBytes) {
-              outputItems.push(event.item);
-              outputItemsBytes += itemBytes;
-            } else {
-              continuationOverflow = true;
-            }
-          }
-          if (event.type === "response.completed") {
-            completed = event.response;
-            terminalSeen = true;
-            return true;
-          }
+          if (!(await this.sendGeneration(generation, event))) return false;
           if (["error", "response.failed", "response.incomplete"].includes(event.type)) {
-            terminalFailure = true;
-            terminalSeen = true;
-            // Codex ends the turn on this event and may send its retry on the
-            // same socket, where it queues behind this drain. A gateway that
-            // holds the stream open after a failure must not stall that retry.
             setTimeout(() => controller.abort(), 5_000).unref?.();
-            return true;
           }
           return true;
         },
@@ -1273,18 +1339,7 @@ class ResponsesWebSocketPeer {
           maxEventBytes: this.options.maxEventBytes,
         },
       );
-      if (completed?.id && !terminalFailure) {
-        const output = reconciledContinuationOutput(completed.output, outputItems);
-        this.continuations.clear();
-        const continuation = !continuationOverflow
-          ? continuationState(
-            fullRequest.input,
-            output,
-            this.options.maxContinuationBytes,
-          )
-          : undefined;
-        if (continuation) this.continuations.set(completed.id, continuation);
-      } else if (!terminalFailure && !this.closed) {
+      if (!generation.terminal && !generation.interrupted && !this.closed) {
         this.sendError(502, {
           type: "local_router_stream_failed",
           message: "The internal Responses stream ended before response.completed.",
@@ -1300,6 +1355,8 @@ class ResponsesWebSocketPeer {
     } finally {
       this.abortController.signal.removeEventListener("abort", onClose);
       controller.abort();
+      await generation.barrier;
+      if (this.activeGeneration === generation) this.activeGeneration = undefined;
     }
   }
 }

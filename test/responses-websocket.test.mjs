@@ -25,7 +25,7 @@ function waitFor(predicate, timeoutMs = 2_000) {
   });
 }
 
-async function startServer(handler, options = {}) {
+async function startServer(handler, { onSocket, ...options } = {}) {
   const server = http.createServer(async (request, response) => {
     try {
       const route = authenticatedRoute(
@@ -44,6 +44,7 @@ async function startServer(handler, options = {}) {
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = server.address().port;
   server.on("upgrade", (request, socket, head) => {
+    onSocket?.(socket);
     handleResponsesWebSocketUpgrade(request, socket, head, {
       callerKey: CALLER_KEY,
       responsesUrl: `http://127.0.0.1:${port}/_codex-router/${CALLER_KEY}/v1/responses`,
@@ -1449,4 +1450,315 @@ test("aborts the internal HTTP request when the WebSocket disappears", async (t)
   await waitFor(() => requestStarted);
   socket.destroy();
   await waitFor(() => requestAborted);
+});
+
+test("interrupt completes before upstream EOF and replays only complete items", async (t) => {
+  const bodies = [];
+  const done = { type: "function_call", call_id: "call-1", name: "read", arguments: '{"path":"a"}' };
+  const { server, port } = await startServer(async (request, response) => {
+    let body = "";
+    for await (const chunk of request) body += chunk;
+    bodies.push(JSON.parse(body));
+    if (bodies.length === 1) {
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      for (const event of [
+        { type: "response.created", response: { id: "resp-interrupt" } },
+        { type: "response.output_item.done", item: done },
+        { type: "response.output_text.delta", delta: "partial" },
+      ]) response.write(`data: ${JSON.stringify(event)}\n\n`);
+    } else sse(response, [{ type: "response.completed", response: { id: "resp-successor", output: [] } }]);
+  });
+  const { peer } = await connect(port);
+  t.after(() => { peer.socket.destroy(); server.closeAllConnections(); server.close(); });
+  const initial = createRequest();
+  peer.sendJson(initial);
+  for (let i = 0; i < 3; i++) await peer.nextJson();
+  peer.sendJson({ type: "response.interrupt", response_id: "resp-interrupt", mode: "discard_partial_items" });
+  assert.equal((await peer.nextJson()).type, "response.interrupt.accepted");
+  assert.deepEqual((await peer.nextJson()).response, { id: "resp-interrupt" });
+  peer.sendJson(createRequest({ previous_response_id: "resp-interrupt", input: [] }));
+  assert.equal((await peer.nextJson()).response.id, "resp-successor");
+  assert.deepEqual(bodies[1].input, [...initial.input, done]);
+});
+
+function interruptRequest(response_id) {
+  return { type: "response.interrupt", response_id, mode: "discard_partial_items" };
+}
+
+// Force write(false) after a frame really entered the socket's outbound queue.
+function holdFrame(type) {
+  let socket;
+  let held = false;
+  return {
+    onSocket(value) {
+      socket = value;
+      const write = socket.write.bind(socket);
+      socket.write = (chunk, ...args) => {
+        const result = write(chunk, ...args);
+        if (!held && Buffer.isBuffer(chunk) && chunk.includes(Buffer.from(`"type":"${type}"`))) {
+          held = true;
+          return false;
+        }
+        return result;
+      };
+    },
+    release() { socket.emit("drain"); },
+  };
+}
+
+for (const heldType of ["response.created", "response.output_item.done", "response.interrupt.accepted", "response.completed"]) {
+  test(`interrupt handshake survives backpressure at ${heldType}`, async (t) => {
+    const hold = holdFrame(heldType);
+    const bodies = [];
+    const reasoning = { type: "reasoning", id: "r1", encrypted_content: "opaque", summary: [] };
+    const tool = { type: "custom_tool_call", call_id: "c1", name: "patch", input: "complete patch" };
+    const { server, port } = await startServer(async (request, response) => {
+      let body = "";
+      for await (const chunk of request) body += chunk;
+      bodies.push(JSON.parse(body));
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.write(`data: ${JSON.stringify({ type: "response.created", response: { id: `bp-${bodies.length}` } })}\n\n`);
+      if (bodies.length === 1) {
+        for (const item of [reasoning, tool]) response.write(`data: ${JSON.stringify({ type: "response.output_item.done", item })}\n\n`);
+      } else response.end(`data: ${JSON.stringify({ type: "response.completed", response: { id: "bp-2", output: [] } })}\n\n`);
+    }, { onSocket: hold.onSocket });
+    const { peer } = await connect(port);
+    t.after(() => { hold.release(); peer.socket.destroy(); server.closeAllConnections(); server.close(); });
+    const initial = createRequest();
+    peer.sendJson(initial);
+    assert.equal((await peer.nextJson()).type, "response.created");
+    const expected = [];
+    if (heldType !== "response.created") {
+      assert.equal((await peer.nextJson()).type, "response.output_item.done");
+      expected.push(reasoning);
+      if (heldType !== "response.output_item.done") {
+        assert.equal((await peer.nextJson()).type, "response.output_item.done");
+        expected.push(tool);
+      }
+    }
+    // Coalesce interrupt and successor: the create queue must stay behind the
+    // ACK, cache commit and terminal even if abort has already ended fetch.
+    peer.socket.write(Buffer.concat([
+      maskedFrame(1, JSON.stringify(interruptRequest("bp-1"))),
+      maskedFrame(1, JSON.stringify(createRequest({ previous_response_id: "bp-1", input: [] }))),
+    ]));
+    assert.equal((await peer.nextJson()).type, "response.interrupt.accepted");
+    if (heldType !== "response.completed") hold.release();
+    assert.deepEqual((await peer.nextJson()).response, { id: "bp-1" });
+    hold.release();
+    assert.equal((await peer.nextJson()).response.id, "bp-2");
+    assert.equal((await peer.nextJson()).type, "response.completed");
+    assert.deepEqual(bodies[1].input, [...initial.input, ...expected]);
+  });
+}
+
+test("interrupt validation and cross-peer IDs leave the active generation intact", async (t) => {
+  let finish;
+  const { server, port } = await startServer(async (_request, response) => {
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    response.write('data: {"type":"response.created","response":{"id":"owned"}}\n\n');
+    await new Promise((resolve) => { finish = resolve; });
+    response.end('data: {"type":"response.completed","response":{"id":"owned","output":[]}}\n\n');
+  });
+  const { peer } = await connect(port);
+  const { peer: other } = await connect(port);
+  t.after(() => { finish?.(); peer.socket.destroy(); other.socket.destroy(); server.closeAllConnections(); server.close(); });
+  peer.sendJson(createRequest());
+  await peer.nextJson();
+  other.sendJson(interruptRequest("owned"));
+  assert.equal((await other.nextJson()).type, "response.interrupt.failed");
+  peer.sendJson(interruptRequest("unknown"));
+  assert.equal((await peer.nextJson()).type, "response.interrupt.failed");
+  for (const invalid of [
+    { ...interruptRequest("owned"), extra: true },
+    { type: "response.interrupt", response_id: "owned" },
+    interruptRequest(""), interruptRequest("x".repeat(513)),
+    { ...interruptRequest("owned"), mode: "retain" },
+  ]) {
+    peer.sendJson(invalid);
+    assert.equal((await peer.nextJson()).status, 400);
+  }
+  finish();
+  assert.equal((await peer.nextJson()).type, "response.completed");
+  peer.sendJson(interruptRequest("owned"));
+  peer.sendJson(interruptRequest("owned"));
+  assert.equal((await peer.nextJson()).type, "response.interrupt.accepted");
+  assert.equal((await peer.nextJson()).type, "response.interrupt.accepted");
+});
+
+for (const kind of ["json", "prewarm", "held-completed"]) {
+  test(`completed ${kind} interrupt is a no-op and releases a held body`, async (t) => {
+    let calls = 0;
+    const { server, port } = await startServer((_request, response) => {
+      calls++;
+      if (kind === "json") response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ id: "finished", status: "completed", output: [] }));
+      else {
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        response.write('data: {"type":"response.created","response":{"id":"finished"}}\n\n');
+        response.write('data: {"type":"response.completed","response":{"id":"finished","output":[]}}\n\n');
+      }
+    });
+    const { peer } = await connect(port);
+    t.after(() => { peer.socket.destroy(); server.closeAllConnections(); server.close(); });
+    peer.sendJson(createRequest(kind === "prewarm" ? { generate: false } : {}));
+    const created = await peer.nextJson();
+    assert.equal((await peer.nextJson()).type, "response.completed");
+    peer.sendJson(interruptRequest(created.response.id));
+    assert.equal((await peer.nextJson()).type, "response.interrupt.accepted");
+    peer.sendJson(createRequest({ generate: false, previous_response_id: created.response.id, input: [] }));
+    assert.equal((await peer.nextJson()).type, "response.created");
+    assert.equal((await peer.nextJson()).type, "response.completed");
+    assert.equal(calls, kind === "prewarm" ? 0 : 1);
+  });
+}
+
+for (const kind of ["json", "prewarm"]) {
+  test(`interrupt ${kind} after created suppresses buffered completion`, async (t) => {
+    const hold = holdFrame("response.created");
+    const { server, port } = await startServer((_request, response) => {
+      response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({
+        id: "json-active", status: "completed", output: [{ type: "message", content: "not forwarded" }],
+      }));
+    }, { onSocket: hold.onSocket });
+    const { peer } = await connect(port);
+    t.after(() => { hold.release(); peer.socket.destroy(); server.closeAllConnections(); server.close(); });
+    peer.sendJson(createRequest(kind === "prewarm" ? { generate: false } : {}));
+    const created = await peer.nextJson();
+    peer.sendJson(interruptRequest(created.response.id));
+    assert.equal((await peer.nextJson()).type, "response.interrupt.accepted");
+    assert.deepEqual((await peer.nextJson()).response, { id: created.response.id });
+    hold.release();
+    peer.sendJson(createRequest({ generate: false, previous_response_id: created.response.id, input: [] }));
+    assert.equal((await peer.nextJson()).type, "response.created");
+    assert.equal((await peer.nextJson()).type, "response.completed");
+  });
+}
+
+test("interrupt overflow keeps completed identity but requires full replay", async (t) => {
+  let calls = 0;
+  const { server, port } = await startServer((_request, response) => {
+    calls++;
+    response.writeHead(200, { "content-type": "text/event-stream" });
+    for (const event of [
+      { type: "response.created", response: { id: "overflow" } },
+      { type: "response.output_item.done", item: { type: "reasoning", encrypted_content: "x".repeat(500) } },
+      { type: "response.output_item.done", item: { type: "function_call", call_id: "small" } },
+    ]) response.write(`data: ${JSON.stringify(event)}\n\n`);
+  }, { maxContinuationBytes: 200 });
+  const { peer } = await connect(port);
+  t.after(() => { peer.socket.destroy(); server.closeAllConnections(); server.close(); });
+  peer.sendJson(createRequest());
+  for (let i = 0; i < 3; i++) await peer.nextJson();
+  peer.sendJson(interruptRequest("overflow"));
+  assert.equal((await peer.nextJson()).type, "response.interrupt.accepted");
+  assert.equal((await peer.nextJson()).type, "response.completed");
+  peer.sendJson(interruptRequest("overflow"));
+  assert.equal((await peer.nextJson()).type, "response.interrupt.accepted");
+  peer.sendJson(createRequest({ previous_response_id: "overflow", input: [] }));
+  assert.equal((await peer.nextJson()).status, 409);
+  assert.equal(calls, 1);
+});
+
+test("delayed old body cancellation and duplicate controls never cancel the successor", async (t) => {
+  let releaseCleanup;
+  let successor;
+  const signals = [];
+  let calls = 0;
+  const fetchImpl = async (_url, options) => {
+    const index = ++calls;
+    signals.push(options.signal);
+    return new Response(new ReadableStream({
+      start(controller) {
+        const send = (event) => controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n\n`));
+        send({ type: "response.created", response: { id: `delayed-${index}` } });
+        if (index === 2) successor = () => {
+          send({ type: "response.completed", response: { id: "delayed-2", output: [] } });
+          controller.close();
+        };
+      },
+      cancel() {
+        if (index === 1) return new Promise((resolve) => { releaseCleanup = resolve; });
+      },
+    }), { headers: { "content-type": "text/event-stream" } });
+  };
+  const { server, port } = await startServer(() => {}, { fetchImpl });
+  const { peer } = await connect(port);
+  t.after(() => { releaseCleanup?.(); peer.socket.destroy(); server.closeAllConnections(); server.close(); });
+  peer.sendJson(createRequest());
+  await peer.nextJson();
+  peer.sendJson(interruptRequest("delayed-1"));
+  peer.sendJson(interruptRequest("delayed-1"));
+  assert.equal((await peer.nextJson()).type, "response.interrupt.accepted");
+  assert.equal((await peer.nextJson()).type, "response.completed");
+  assert.equal((await peer.nextJson()).type, "response.interrupt.accepted");
+  peer.sendJson(createRequest({ previous_response_id: "delayed-1", input: [] }));
+  assert.equal((await peer.nextJson()).response.id, "delayed-2");
+  peer.sendJson(interruptRequest("delayed-1"));
+  assert.equal((await peer.nextJson()).type, "response.interrupt.accepted");
+  releaseCleanup();
+  assert.equal(signals[0].aborted, true);
+  assert.equal(signals[1].aborted, false);
+  successor();
+  assert.equal((await peer.nextJson()).response.id, "delayed-2");
+});
+
+test("disconnect during interrupt ACK aborts only the captured HTTP request", async (t) => {
+  const hold = holdFrame("response.interrupt.accepted");
+  let signal;
+  const { server, port } = await startServer(() => {}, {
+    onSocket: hold.onSocket,
+    fetchImpl: async (_url, options) => {
+      signal = options.signal;
+      return new Response(new ReadableStream({ start(controller) {
+        controller.enqueue(new TextEncoder().encode('data: {"type":"response.created","response":{"id":"disconnect"}}\n\n'));
+      } }), { headers: { "content-type": "text/event-stream" } });
+    },
+  });
+  const { peer } = await connect(port);
+  t.after(() => { peer.socket.destroy(); server.closeAllConnections(); server.close(); });
+  peer.sendJson(createRequest());
+  await peer.nextJson();
+  peer.sendJson(interruptRequest("disconnect"));
+  assert.equal((await peer.nextJson()).type, "response.interrupt.accepted");
+  peer.socket.destroy();
+  await waitFor(() => signal.aborted);
+});
+
+for (const terminalType of ["response.failed", "response.incomplete", "error"]) {
+  test(`interrupt never accepts the ID of ${terminalType}`, async (t) => {
+    const { server, port } = await startServer((_request, response) => {
+      sse(response, [
+        { type: "response.created", response: { id: "unsuccessful" } },
+        { type: terminalType, response: { id: "unsuccessful" }, error: { message: "failed" } },
+      ]);
+    });
+    const { peer } = await connect(port);
+    t.after(() => { peer.socket.destroy(); server.closeAllConnections(); server.close(); });
+    peer.sendJson(createRequest());
+    await peer.nextJson();
+    assert.equal((await peer.nextJson()).type, terminalType);
+    peer.sendJson(interruptRequest("unsuccessful"));
+    assert.equal((await peer.nextJson()).type, "response.interrupt.failed");
+  });
+}
+
+test("completed JSON continuation does not duplicate unkeyed output items", async (t) => {
+  const bodies = [];
+  const item = { type: "message", role: "assistant", content: [] };
+  const { server, port } = await startServer(async (request, response) => {
+    let body = "";
+    for await (const chunk of request) body += chunk;
+    bodies.push(JSON.parse(body));
+    response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({
+      id: `json-${bodies.length}`, status: "completed", output: [item],
+    }));
+  });
+  const { peer } = await connect(port);
+  t.after(() => { peer.socket.destroy(); server.closeAllConnections(); server.close(); });
+  const initial = createRequest();
+  peer.sendJson(initial);
+  for (let i = 0; i < 3; i++) await peer.nextJson();
+  peer.sendJson(createRequest({ previous_response_id: "json-1", input: [] }));
+  for (let i = 0; i < 3; i++) await peer.nextJson();
+  assert.deepEqual(bodies[1].input, [...initial.input, item]);
 });
