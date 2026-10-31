@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+- **Go endpoint rejections get one bounded retry before relay.** Only the
+  canonical `opencode-go`, `opencode-go-messages`, and `opencode-go-responses`
+  providers retry 400/422 JSON bodies containing the endpoint-unavailable
+  message or only a string `model` field. Classification reads at most 32 KiB
+  for at most five seconds; incomplete, oversized, and unparseable bodies do
+  not retry. Each existing attempt gets at most one extra send; embeddings
+  never replay. A successful retry streams immediately. The second HTTP
+  response is authoritative, including a different failure; a non-abort
+  transport exception preserves the first response, and cancellation propagates.
+- **Optional upstream diagnostics are bounded and private.**
+  `CODEX_ROUTER_UPSTREAM_ERROR_DUMP` enables a best-effort JSONL record for each
+  actual non-2xx attempt, including a rejection followed by a successful retry.
+  The response prefix is capped at 32 KiB and five seconds, with observed and
+  captured byte counts plus completion/truncation flags; an incomplete read
+  cannot report the full response size. Diagnostic headers are allowlisted
+  and bounded; credential headers are excluded. Records are capped at 256 KiB.
+  Asynchronous writes serialize per path; JSONL rotates at 1 MiB with one
+  backup (2 MiB total). Existing oversized dumps are rejected. Admission happens
+  before cloning, with at most eight captures and a conservative 64 MiB retained
+  memory budget held through reading, serialization, writing, and dropping.
+  Excess work is dropped. Capture errors do not fail a turn; capture still has
+  bounded CPU and memory overhead.
+  `CODEX_ROUTER_CAPTURE_UPSTREAM_REQUESTS=1` is a separate opt-in for outgoing
+  request bodies, capped at 24 MiB per file in `upstream-error-requests` beside
+  the dump. Raw retention is at most 16 files / 64 MiB, reserved before create;
+  seven-day pruning is best-effort maintenance during capture activity, not a
+  guaranteed expiry. Only recognized capture-owned files are pruned. Unknown
+  occupants count against the budget and remain untouched; a blocked budget
+  drops the new artifact. Existing owned artifact directories are hardened to
+  0700 and diagnostic files to 0600. Symlinks, hardlinks, foreign-owned and
+  nonregular file targets fail closed; arbitrary parent directories are never
+  chmodded. The dump parent must already exist. Both opt-ins remain off by
+  default; response and raw request captures may contain sensitive content.
 - **A routed request can dump its prompt composition on demand.** Pointing
   `CODEX_ROUTER_REQUEST_DUMP` at a file appends one JSON line per routed turn
   and per routed compaction request: item counts and byte sizes by type, opaque
