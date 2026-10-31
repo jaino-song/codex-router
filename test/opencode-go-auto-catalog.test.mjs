@@ -436,7 +436,7 @@ test("consumed inventory metadata fails closed on malformed values", () => {
     value => { value.data[0].modalities.input = ["image"]; }, value => { value.data[0].modalities.input = [null]; },
     value => { value.data[0].modalities.output = "text"; }, value => { value.data[0].modalities.output = []; },
     value => { value.data[0].api = []; }, value => { value.data[0].api = {}; },
-    value => { value.data[0].api["chat-completions"].sdk = {}; }, value => { delete value.data[0].api["chat-completions"].sdk; },
+    value => { value.data[0].api["chat-completions"].base_url = {}; }, value => { delete value.data[0].api["chat-completions"].base_url; },
     value => { value.data[0].api = { unknown: { base_url: "https://opencode.ai/inference/go/openai/v1", sdk: "test" } }; },
     value => { value.data[0].api = JSON.parse('{"__proto__":{"base_url":"https://evil.example","sdk":"test"}}'); },
   ];
@@ -739,4 +739,42 @@ test("spawn errors never relay diagnostics and remain attached until child close
   assert.equal(outcome.failed, true);
   assert.equal(JSON.stringify(outcome).includes(MANAGED_DUMMY), false);
   assert.equal(signals.listenerCount("SIGTERM"), 0);
+});
+
+test("public SDK objects across all protocol families stay unused while supported models activate", async () => {
+  const options = checkFixture();
+  const metadataMarker = "UNUSED_SDK_METADATA_FIXTURE";
+  const families = [
+    ["fixture-sdk-chat", "chat-completions", "@ai-sdk/openai-compatible", "@opencode/ai/providers/openai-compatible"],
+    ["fixture-sdk-responses", "responses", "@ai-sdk/openai", "@opencode/ai/providers/openai"],
+    ["fixture-sdk-messages", "messages", "@ai-sdk/anthropic", "@opencode/ai/providers/anthropic"],
+    ["fixture-sdk-google", "generate-content", "@ai-sdk/google", "@opencode/ai/providers/google"],
+  ];
+  const payload = JSON.parse(inventory(families.map(([id, protocol]) => [id, protocolRoutes[protocol]])));
+  payload.data.forEach((model, index) => {
+    const api = model.api[families[index][1]];
+    api.sdk = { aisdk: families[index][2], opencodeai: families[index][3] };
+    api.compatibility = { instructions: metadataMarker, nested: { supported: true } };
+    api.capabilities = { tools: { supported: true }, metadata: metadataMarker };
+    model.compatibility = { metadata: metadataMarker };
+    model.capabilities = { tools: true, reasoning: { metadata: metadataMarker } };
+  });
+  const text = JSON.stringify(payload);
+  const snapshot = parseOfficialGoInventory(text);
+  assert.deepEqual(snapshot.discovered, families.map(([id]) => id));
+  assert.deepEqual(snapshot.rows.map(row => row.providerId), ["opencode-go", "opencode-go-responses", "opencode-go-messages"]);
+  assert.equal(JSON.stringify(snapshot).includes("@ai-sdk/") || JSON.stringify(snapshot).includes("@opencode/ai/") || JSON.stringify(snapshot).includes(metadataMarker), false);
+  for (const sdk of [undefined, null, "@ai-sdk/legacy-fixture", { aisdk: { unused: metadataMarker } }]) {
+    const variant = structuredClone(payload);
+    for (const model of variant.data) model.api[Object.keys(model.api)[0]].sdk = sdk;
+    assert.deepEqual(parseOfficialGoInventory(JSON.stringify(variant)), snapshot);
+  }
+  const result = await checkGoAutoCatalog({ ...options, fetchInventory: async () => text });
+  assert.equal(result.reason, "catalog_updated_pending_documentation");
+  assert.deepEqual(result.plan.missingDocs, ["fixture-sdk-google"]);
+  assert.equal(JSON.parse(readFileSync(options.userModelsPath, "utf8")).models.length, 3);
+  for (const file of [options.userModelsPath, options.pickerPath, options.seenPath, options.statusPath]) {
+    const saved = readFileSync(file, "utf8");
+    assert.equal(saved.includes("@ai-sdk/") || saved.includes("@opencode/ai/") || saved.includes(metadataMarker), false, "unused API metadata reached updater state");
+  }
 });

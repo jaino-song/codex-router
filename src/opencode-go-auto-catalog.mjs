@@ -242,8 +242,9 @@ export function parseOfficialGoInventory(payload) {
       // Exact source strings reject URL normalization tricks, credentials,
       // query/fragment suffixes, alternate origins, and unexpected paths.
       const tuple = Object.hasOwn(GO_API_TUPLES, protocol) ? GO_API_TUPLES[protocol] : undefined;
-      if (!tuple || !record(api) || api.base_url !== tuple.baseUrl || !validString(api.sdk, { max: 240 })) throw makeError("inventory_unknown_endpoint", "The public Go inventory contains an unsupported endpoint tuple.");
-      // sdk, compatibility, and capabilities are never executed or copied.
+      if (!tuple || !record(api) || api.base_url !== tuple.baseUrl) throw makeError("inventory_unknown_endpoint", "The public Go inventory contains an unsupported endpoint tuple.");
+      // sdk (including the public aisdk/opencodeai object), compatibility,
+      // and capabilities are unused: never interpret, execute, or copy them.
       // The first supported protocol in the inventory determines the row.
       if (!route && tuple.endpoint) route = { endpoint: `${tuple.baseUrl}${tuple.endpoint}`, providerId: GO_ENDPOINT_PROVIDERS[tuple.endpoint] };
     }

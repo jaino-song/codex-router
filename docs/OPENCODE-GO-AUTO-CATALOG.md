@@ -25,8 +25,10 @@ object must contain a `data` array with unique bounded model ids. Names, positiv
 integer context/input/output limits, text/MIME modality arrays, and API entries
 are validated before any model is adopted.
 
-Each `model.api` entry is keyed by protocol and contains a `base_url` and `sdk`.
-Only these exact protocol/base URL tuples map to existing router variants:
+Each `model.api` entry is keyed by protocol and requires an exact `base_url`.
+The public `sdk` metadata can be an object with `aisdk` and `opencodeai` entries.
+Its shape is not an adoption requirement because the router does not consume
+it. Only these exact protocol/base URL tuples map to existing router variants:
 
 | Inventory protocol | Exact base URL | Operation appended to the plan row | Router provider variant |
 | --- | --- | --- | --- |
