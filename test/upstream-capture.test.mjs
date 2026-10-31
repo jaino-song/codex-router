@@ -306,3 +306,46 @@ test("oversized raw requests are omitted while bounded metadata and headers rema
   assert.equal(item.responseHeaders["x-opencode-token"], undefined);
   assert.ok(statSync(file).size < 1024);
 }));
+
+
+test("legacy timestamp artifacts participate in retention and retained files are hardened", async () => fixture(async (directory, file) => {
+  const rawDir = join(directory, "upstream-error-requests");
+  mkdirSync(rawDir, { mode: 0o755 });
+  const expired = join(rawDir, "2026-01-02T03-04-05-006Z-0123abcd.json");
+  const retained = join(rawDir, "2026-11-01T03-04-05-006Z-89abcdef.json");
+  const unknown = join(rawDir, "2026-11-01T03-04-05-006Z-not-a-digest.json");
+  writeFileSync(expired, "old", { mode: 0o644 });
+  writeFileSync(retained, "current", { mode: 0o644 });
+  writeFileSync(unknown, "operator", { mode: 0o644 });
+  const old = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
+  utimesSync(expired, old, old);
+  await withEnv(UPSTREAM_REQUEST_CAPTURE_ENV, "1", () => record(failure(), { maxRawFiles: 3, maxRawBytes: 24 }));
+  assert.equal(existsSync(expired), false);
+  assert.equal(readFileSync(retained, "utf8"), "current");
+  assert.equal(statSync(retained).mode & 0o777, 0o600);
+  assert.equal(statSync(rawDir).mode & 0o777, 0o700);
+  assert.equal(readFileSync(unknown, "utf8"), "operator");
+  assert.equal(statSync(unknown).mode & 0o777, 0o644);
+  assert.ok(readRecords(file)[0].requestCapturePath);
+  assert.equal(readdirSync(rawDir).length, 3);
+}));
+
+test("legacy artifacts can be evicted for byte budget without touching legacy-looking links", async () => fixture(async (directory, file) => {
+  const rawDir = join(directory, "upstream-error-requests");
+  mkdirSync(rawDir);
+  const legacy = join(rawDir, "2026-11-01T01-02-03-004Z-abcdef12.json");
+  const hardlink = join(rawDir, "2026-11-01T01-02-03-004Z-abcdef13.json");
+  const symlink = join(rawDir, "2026-11-01T01-02-03-004Z-abcdef14.json");
+  const target = join(directory, "target");
+  writeFileSync(legacy, "x".repeat(40));
+  writeFileSync(target, "protected", { mode: 0o644 });
+  linkSync(target, hardlink);
+  symlinkSync(target, symlink);
+  const protectedBytes = statSync(hardlink).size + Buffer.byteLength(target);
+  await withEnv(UPSTREAM_REQUEST_CAPTURE_ENV, "1", () => record(failure(), { maxRawFiles: 3, maxRawBytes: protectedBytes + 10 }));
+  assert.equal(existsSync(legacy), false);
+  assert.equal(readFileSync(target, "utf8"), "protected");
+  assert.equal(statSync(target).mode & 0o777, 0o644);
+  assert.equal(readdirSync(rawDir).length, 3);
+  assert.ok(readRecords(file)[0].requestCapturePath);
+}));

@@ -64,7 +64,7 @@ const fixtureModel = (provider, upstreamModel, supportedEndpoints) => ({
   ...(supportedEndpoints ? { supportedEndpoints } : {}),
 });
 writeFileSync(userModelsPath, JSON.stringify({ version: 1, models: [
-  fixtureModel("opencode-go", "embed", ["/embeddings"]), fixtureModel("openrouter", "chat"),
+  fixtureModel("opencode-go", "embed", ["/embeddings"]), fixtureModel("openrouter", "chat"), fixtureModel("capture-generic", "chat"),
 ] }));
 
 // `responses` is the ordered list of upstream replies; any request past the
@@ -91,12 +91,19 @@ async function forwardOnce(replies, options = {}) {
     });
   });
   const upstreamPort = await listen(upstream);
+  const genericProvidersPath = path.join(root, `generic-${upstreamPort}.json`);
+  writeFileSync(genericProvidersPath, JSON.stringify({ version: 1, providers: [{
+    id: "capture-generic", displayName: "Loopback capture fixture",
+    baseUrl: `http://127.0.0.1:${upstreamPort}/v1`, adapter: "openai-chat",
+    headers: {}, allowPrivate: true, enabled: true,
+  }] }));
   const forwarderPort = await openPort();
   const child = spawn(process.execPath, [path.join(repoRoot, "src", "api-forwarder.mjs")], {
     cwd: repoRoot,
     env: {
       ...process.env,
       MODEL_ROUTER_USER_MODELS: userModelsPath,
+      MODEL_ROUTER_GENERIC_PROVIDERS: genericProvidersPath,
       OPENROUTER_API_BASE_URL: `http://127.0.0.1:${upstreamPort}/v1`,
       OPENROUTER_API_KEY: "LOOPBACK_TEST_OPENROUTER_KEY",
       MODEL_ROUTER_TARGET: "codex",
@@ -119,12 +126,21 @@ async function forwardOnce(replies, options = {}) {
   try {
     const baseUrl = `http://127.0.0.1:${forwarderPort}`;
     await waitForHealth(baseUrl, child, () => errors);
+    if (options.generic) {
+      const unauthorized = await fetch(`${baseUrl}/v1/chat/completions`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model: "capture-generic-fixture-chat", messages: [] }),
+      });
+      assert.equal(unauthorized.status, 401);
+      await unauthorized.text();
+      assert.equal(calls, 0, "internal authentication must precede generic transport");
+    }
     const response = await fetch(`${baseUrl}/v1/${options.route || "chat/completions"}`, {
       signal: AbortSignal.timeout(5000),
       method: "POST",
       headers: { Authorization: `Bearer ${internalKey}`, "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: options.route === "embeddings" ? "opencode-go-fixture-embed" : options.nonGo ? "openrouter-fixture-chat" : "opencode-go-deepseek-v4-1-flash",
+        model: options.generic ? "capture-generic-fixture-chat" : options.route === "embeddings" ? "opencode-go-fixture-embed" : options.nonGo ? "openrouter-fixture-chat" : "opencode-go-deepseek-v4-1-flash",
         messages: [{ role: "user", content: "test" }],
         stream: options.streaming || undefined,
         input: options.route === "embeddings" ? "test" : undefined,
@@ -146,7 +162,7 @@ async function forwardOnce(replies, options = {}) {
         while (!(await reader.read()).done) {}
       } finally { clearTimeout(timeout); releaseEOF(); }
     } else body = await response.text();
-    const expectedFailures = options.route === "embeddings" || options.nonGo ? 1
+    const expectedFailures = options.route === "embeddings" || options.nonGo || options.generic ? 1
       : replies.length === 1 && replies[0].status >= 300 ? 2
         : replies.filter((reply) => reply.status >= 300).length;
     let records = [];
@@ -223,4 +239,15 @@ test("another provider never replays the Go endpoint signature", async () => {
   assert.equal(result.status, 400);
   assert.equal(result.calls, 1);
   assert.equal(result.records.length, 1);
+});
+
+
+test("a generic-provider failure is captured exactly once after internal authentication", async () => {
+  const result = await forwardOnce([{ status: 422, body: '{"error":"generic failure"}' }], { generic: true });
+  assert.equal(result.status, 422);
+  assert.equal(result.body, '{"error":"generic failure"}');
+  assert.equal(result.calls, 1);
+  assert.equal(result.records.length, 1);
+  assert.equal(result.records[0].provider, "capture-generic");
+  assert.equal(result.records[0].responseBodyText, result.body);
 });

@@ -10,6 +10,9 @@ const MAX_REQUEST_BYTES = 24 * 1024 * 1024;
 const SECRET_HEADER = /(authorization|cookie|api[-_]?key|secret|token)/i;
 const DIAGNOSTIC_HEADER = /^(content-type|date|server|via|retry-after(-ms)?|request-id|x-request-id|x-amzn-requestid|cf-ray|x-ratelimit-.*|ratelimit-.*|x-opencode.*|x-zen.*|x-deepseek.*|openai-.*)$/i;
 const OWNED_NAME = /^capture-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json$/;
+// Original captures used ISO timestamps with ':' and '.' replaced by '-',
+// followed by an eight-character SHA256 prefix. Keep that exact legacy shape.
+const LEGACY_OWNED_NAME = /^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])T(?:[01]\d|2[0-3])-[0-5]\d-[0-5]\d-\d{3}Z-[0-9a-f]{8}\.json$/;
 const lanes = new Map();
 let active = 0;
 let retained = 0;
@@ -115,7 +118,13 @@ async function rawArtifact(dumpPath, buffer, options) {
       count++;
       bytes += stat.size;
       // Unknown occupants consume budget but are never deleted or chmodded.
-      if (OWNED_NAME.test(name) && stat.isFile() && stat.nlink === 1 && stat.uid === process.getuid()) {
+      if ((OWNED_NAME.test(name) || LEGACY_OWNED_NAME.test(name)) &&
+          stat.isFile() && stat.nlink === 1 && stat.uid === process.getuid()) {
+        await checkDirectory(directory, identity);
+        const handle = await openPrivate(file);
+        try {
+          if (!same(stat, await handle.stat())) throw new Error("artifact changed");
+        } finally { await handle.close(); }
         files.push({ file, stat });
       }
     }

@@ -28,12 +28,15 @@
   request bodies, capped at 24 MiB per file in `upstream-error-requests` beside
   the dump. Raw retention is at most 16 files / 64 MiB, reserved before create;
   seven-day pruning is best-effort maintenance during capture activity, not a
-  guaranteed expiry. Only recognized capture-owned files are pruned. Unknown
+  guaranteed expiry. Recognized UUID and legacy timestamp/digest artifacts are
+  hardened and eligible for pruning. Unknown
   occupants count against the budget and remain untouched; a blocked budget
   drops the new artifact. Existing owned artifact directories are hardened to
   0700 and diagnostic files to 0600. Symlinks, hardlinks, foreign-owned and
   nonregular file targets fail closed; arbitrary parent directories are never
-  chmodded. The dump parent must already exist. Both opt-ins remain off by
+  chmodded. Diagnostic writes fail closed when ownership cannot be verified
+  through `process.getuid`, including native Windows. The dump parent must
+  already exist. Both opt-ins remain off by
   default; response and raw request captures may contain sensitive content.
 - **A routed request can dump its prompt composition on demand.** Pointing
   `CODEX_ROUTER_REQUEST_DUMP` at a file appends one JSON line per routed turn

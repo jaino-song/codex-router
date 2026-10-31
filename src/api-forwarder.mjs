@@ -1443,6 +1443,7 @@ async function handleRequest(request, response) {
       },
     );
     try {
+      captureUpstreamFailure({ normalized, upstream, startedAt });
       await relayUpstreamResponse(normalized, upstream, response, startedAt);
     } finally {
       await dispatcher?.close().catch(() => undefined);
