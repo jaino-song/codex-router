@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import {
   existsSync,
   lstatSync,
@@ -9,10 +9,10 @@ import {
   writeFileSync,
 } from "node:fs";
 import path from "node:path";
+import { constants as osConstants } from "node:os";
 import { fileURLToPath } from "node:url";
 
 import { applyModelOverlayPublication, transactModelOverlayMutation } from "./model-overlay-publication.mjs";
-import { discoverProviderModels } from "./model-discovery.mjs";
 import { CHECKED_IN_MODELS, MODEL_SLUG_ALIASES } from "./model-registry.mjs";
 import { canonicalProviderId, configuredProviderIds } from "./provider-selection.mjs";
 import { discoveryDisabled } from "./discovery-mode.mjs";
@@ -22,10 +22,11 @@ import { CALLER_SECRET_PATH, INSTALL_MANIFEST_PATH, LAUNCH_AGENTS_DIR, PORTS, PR
 import { MODEL_PICKER_STATE_PATH } from "./model-picker-state.mjs";
 import { USER_MODELS_PATH, userModelEntry } from "./user-models.mjs";
 import { writePrivateFile } from "./file-security.mjs";
+import { loadManagedGoRuntimeEnvironment } from "./managed-go-runtime-environment.mjs";
 
 const SELF = fileURLToPath(import.meta.url);
 
-export const GO_DOCS_URL = "https://opencode.ai/docs/go/";
+export const GO_MODELS_URL = "https://opencode.ai/inference/go/v1/models";
 export const GO_AUTO_CATALOG_SCHEMA_VERSION = 1;
 export const GO_AUTO_INTERVAL_SECONDS = 300;
 export const GO_AUTO_QUIET_MS = 60_000;
@@ -177,116 +178,101 @@ function readPolicy(file) {
 }
 
 function statusError(error) {
-  if (error?.code === "docs_duplicate_model") return "duplicate documented model";
-  if (error?.code === "docs_missing_protocol") return "official documentation does not expose a supported endpoint table";
-  if (error?.code === "docs_unknown_endpoint") return "official documentation contains an unsupported endpoint";
+  if (error?.code === "inventory_duplicate_model") return "duplicate inventory model";
   if (error?.code === "invalid_user_models_state") return "user model state is malformed";
   if (error?.code === "invalid_picker_state") return "model picker state is malformed";
   if (error?.code === "invalid_seen_state") return "catalog history is malformed";
   if (error?.code === "foreign_state_owner") return "state belongs to another source checkout";
-  return error?.code || "catalog check failed";
+  const allowed = new Set([
+    "invalid_state", "invalid_policy", "invalid_manifest_owner",
+    "inventory_invalid", "inventory_unknown_endpoint", "inventory_url_not_allowed",
+    "inventory_fetch_failed", "inventory_content_type", "inventory_too_large", "inventory_timeout",
+    "model_identity_collision", "unsupported_platform", "unstable_source",
+    "install_rollback_failed", "disable_failed",
+  ]);
+  return allowed.has(error?.code) ? error.code : "catalog check failed";
 }
 
-function decodeHtml(text) {
-  return String(text)
-    .replace(/<!--[\s\S]*?-->/g, " ")
-    .replace(/<br\s*\/?>/gi, " ")
-    .replace(/<[^>]*>/g, " ")
-    .replace(/&nbsp;/gi, " ")
-    .replace(/&amp;/gi, "&")
-    .replace(/&lt;/gi, "<")
-    .replace(/&gt;/gi, ">")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;|&apos;/gi, "'")
-    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Math.min(0x10ffff, Number(n))))
-    .replace(/&#x([\da-f]+);/gi, (_, n) => String.fromCodePoint(Math.min(0x10ffff, parseInt(n, 16))))
-    .replace(/\s+/g, " ")
-    .trim();
+const GO_API_TUPLES = Object.freeze({
+  "chat-completions": { baseUrl: "https://opencode.ai/inference/go/openai/v1", endpoint: "/chat/completions" },
+  responses: { baseUrl: "https://opencode.ai/inference/go/openai/v1", endpoint: "/responses" },
+  messages: { baseUrl: "https://opencode.ai/inference/go/anthropic/v1", endpoint: "/messages" },
+  "generate-content": { baseUrl: "https://opencode.ai/inference/go/google/v1beta" },
+});
+
+function record(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function tableRows(table) {
-  return [...table.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/gi)].map((match) => [...match[1].matchAll(/<(?:th|td)\b[^>]*>([\s\S]*?)<\/(?:th|td)>/gi)].map((cell) => decodeHtml(cell[1]))).filter((row) => row.length > 0);
+function inventoryError() {
+  return makeError("inventory_invalid", "The public Go inventory metadata is malformed.");
 }
 
-function normalizeEndpoint(raw) {
-  const source = decodeHtml(raw).replace(/^POST\s+/, "");
-  const prefix = "https://opencode.ai/zen/go/v1";
-  const endpoint = Object.keys(GO_ENDPOINT_PROVIDERS).find((value) => source === `${prefix}${value}`);
-  if (!endpoint) throw makeError("docs_unknown_endpoint", "The official Go table has no exact supported endpoint.");
-  return endpoint;
+function positiveLimit(value) {
+  return Number.isSafeInteger(value) && value > 0;
 }
 
-function documentedContext(raw) {
-  const value = decodeHtml(raw).toLowerCase().replace(/,/g, "").trim();
-  const match = value.match(/^(\d+)(?:\s*(k|m))?(?:\s*tokens?)?$/);
-  if (!match) return undefined;
-  const multiplier = match[2] === "m" ? 1_000_000 : match[2] === "k" ? 1_000 : 1;
-  const result = Number(match[1]) * multiplier;
-  return Number.isSafeInteger(result) && result > 0 ? result : undefined;
+function validateModalities(value) {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 64 || value.some(item => typeof item !== "string" || (item !== "text" && !/^[a-z][a-z0-9.+-]*\/[a-z0-9][a-z0-9.+-]*$/.test(item)) || item.length > 160)) throw inventoryError();
+  return value;
 }
 
-function documentedModalities(raw) {
-  const value = decodeHtml(raw).toLowerCase();
-  const modalities = [];
-  if (/\btext\b/.test(value)) modalities.push("text");
-  if (/\bimage|vision\b/.test(value)) modalities.push("image");
-  return modalities.length ? modalities : undefined;
-}
-
-/** Parse the public OpenCode Go endpoint table into an allowlisted protocol map. */
-export function parseOfficialGoDocs(html) {
-  if (typeof html !== "string" || html.length === 0 || Buffer.byteLength(html, "utf8") > GO_AUTO_DOC_MAX_BYTES) throw makeError("docs_missing_protocol", "The official Go documentation is empty or too large.");
-  const tables = [...html.matchAll(/<table\b[^>]*>[\s\S]*?<\/table>/gi)].map((match) => tableRows(match[0]));
+/** A single validated public snapshot supplies both live ids and protocol rows. */
+export function parseOfficialGoInventory(payload) {
+  let inventory;
+  try {
+    if (typeof payload !== "string" || Buffer.byteLength(payload, "utf8") > GO_AUTO_DOC_MAX_BYTES) throw inventoryError();
+    inventory = JSON.parse(payload);
+  } catch { throw inventoryError(); }
+  if (!record(inventory) || !Array.isArray(inventory.data) || inventory.data.length > MAX_IDS) throw inventoryError();
+  const discovered = [];
   const rows = [];
-  for (const table of tables) {
-    const header = table[0]?.map((value) => value.toLowerCase()).join(" ") || "";
-    if (!/model|model id|id/.test(header) || !/endpoint|api|route|protocol/.test(header)) continue;
-    const headers = table[0].map((value) => value.toLowerCase());
-    const modelIndex = headers.findIndex((value) => /^(?:model\s+)?id$/.test(value));
-    if (modelIndex < 0) continue;
-    const endpointIndex = headers.findIndex((value) => /endpoint|api|route|protocol/.test(value));
-    const contextIndex = headers.findIndex((value) => /context|max.*token|window/.test(value));
-    const inputIndex = headers.findIndex((value) => /input|modal/.test(value));
-    const displayIndex = headers.findIndex((value, index) => index !== modelIndex && /display|model\s*name/.test(value));
-    for (const row of table.slice(1)) {
-      if (row.length <= Math.max(modelIndex, endpointIndex)) continue;
-      const modelId = row[modelIndex]?.trim();
-      if (!validString(modelId, { max: 512 }) || /model\s*id|model\s*name/i.test(modelId)) continue;
-      const endpoint = normalizeEndpoint(row[endpointIndex]);
-      if (!GO_ENDPOINT_PROVIDERS[endpoint]) throw makeError("docs_unknown_endpoint", "The official Go table contains an unsupported endpoint.");
-      const metadata = {};
-      const documentedWindow = contextIndex >= 0 ? documentedContext(row[contextIndex]) : undefined;
-      const documentedInput = inputIndex >= 0 ? documentedModalities(row[inputIndex]) : undefined;
-      if (documentedWindow) metadata.contextWindow = documentedWindow;
-      if (documentedInput) metadata.inputModalities = documentedInput;
-      if (displayIndex >= 0 && validString(row[displayIndex], { max: 240 })) metadata.displayName = row[displayIndex];
-      rows.push({ modelId, endpoint, providerId: GO_ENDPOINT_PROVIDERS[endpoint], cells: row, metadata });
-    }
-  }
-  if (rows.length === 0) throw makeError("docs_missing_protocol", "The official Go documentation has no supported model endpoint table.");
   const seen = new Set();
-  for (const row of rows) {
-    if (seen.has(row.modelId)) throw makeError("docs_duplicate_model", "The official Go documentation repeats a model id.");
-    seen.add(row.modelId);
+  for (const model of inventory.data) {
+    if (!record(model) || !validString(model.id) || !/^[a-zA-Z0-9][a-zA-Z0-9._/-]*$/.test(model.id) || !validString(model.name, { max: 240 })) throw inventoryError();
+    if (seen.has(model.id)) throw makeError("inventory_duplicate_model", "The public Go inventory repeats a model id.");
+    seen.add(model.id);
+    if (!record(model.limit) || !positiveLimit(model.limit.context) || !positiveLimit(model.limit.output) || (model.limit.input !== undefined && !positiveLimit(model.limit.input))) throw inventoryError();
+    if (!record(model.modalities)) throw inventoryError();
+    const input = validateModalities(model.modalities.input);
+    validateModalities(model.modalities.output);
+    if (!record(model.api) || Object.keys(model.api).length === 0 || Object.keys(model.api).length > 16) throw inventoryError();
+    let route;
+    for (const [protocol, api] of Object.entries(model.api)) {
+      // Exact source strings reject URL normalization tricks, credentials,
+      // query/fragment suffixes, alternate origins, and unexpected paths.
+      const tuple = Object.hasOwn(GO_API_TUPLES, protocol) ? GO_API_TUPLES[protocol] : undefined;
+      if (!tuple || !record(api) || api.base_url !== tuple.baseUrl) throw makeError("inventory_unknown_endpoint", "The public Go inventory contains an unsupported endpoint tuple.");
+      // sdk (including the public aisdk/opencodeai object), compatibility,
+      // and capabilities are unused: never interpret, execute, or copy them.
+      // The first supported protocol in the inventory determines the row.
+      if (!route && tuple.endpoint) route = { endpoint: `${tuple.baseUrl}${tuple.endpoint}`, providerId: GO_ENDPOINT_PROVIDERS[tuple.endpoint] };
+    }
+    discovered.push(model.id);
+    if (!route) continue; // Known Google protocol remains pending; never guess a chat route.
+    const inputModalities = [...new Set(input.flatMap(item => item === "text" ? ["text"] : item.startsWith("image/") ? ["image"] : []))];
+    rows.push({ modelId: model.id, ...route, metadata: { displayName: model.name, contextWindow: model.limit.context, inputModalities } });
   }
-  return rows;
+  return { discovered, rows };
 }
 
-export async function fetchOfficialGoDocs({ fetchImpl = globalThis.fetch, url = GO_DOCS_URL, timeoutMs = GO_AUTO_DOC_TIMEOUT_MS, maxBytes = GO_AUTO_DOC_MAX_BYTES, signal } = {}) {
-  if (url !== GO_DOCS_URL) throw makeError("docs_url_not_allowed", "Only the official OpenCode Go documentation URL is allowed.");
+export async function fetchOfficialGoInventory({ fetchImpl = globalThis.fetch, url = GO_MODELS_URL, timeoutMs = GO_AUTO_DOC_TIMEOUT_MS, maxBytes = GO_AUTO_DOC_MAX_BYTES, signal } = {}) {
+  if (url !== GO_MODELS_URL) throw makeError("inventory_url_not_allowed", "Only the public OpenCode Go inventory URL is allowed.");
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   timer.unref?.();
   const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
   try {
-    const response = await fetchImpl(GO_DOCS_URL, {
-      headers: { Accept: "text/html", "User-Agent": "codex-router-opencode-go-auto-catalog/1" },
+    const response = await fetchImpl(GO_MODELS_URL, {
+      headers: { Accept: "application/json", "User-Agent": "codex-router-opencode-go-auto-catalog/1" },
       redirect: "error",
       signal: combined,
     });
-    if (!response?.ok || response.status < 200 || response.status >= 300) throw makeError("docs_fetch_failed", "The official Go documentation could not be read.");
+    if (!response?.ok || !Number.isInteger(response.status) || response.status < 200 || response.status >= 300) throw makeError("inventory_fetch_failed", "The public Go inventory could not be read.");
+    const contentType = response.headers?.get?.("content-type")?.split(";", 1)[0].trim().toLowerCase();
+    if (contentType !== "application/json") throw makeError("inventory_content_type", "The public Go inventory must be JSON.");
     const declaredLength = Number(response.headers?.get?.("content-length"));
-    if (Number.isFinite(declaredLength) && declaredLength > maxBytes) throw makeError("docs_too_large", "The official Go documentation exceeds the bounded size.");
+    if (Number.isFinite(declaredLength) && declaredLength > maxBytes) throw makeError("inventory_too_large", "The public Go inventory exceeds the bounded size.");
     let bytes = 0;
     if (response.body?.getReader) {
       const reader = response.body.getReader();
@@ -297,23 +283,28 @@ export async function fetchOfficialGoDocs({ fetchImpl = globalThis.fetch, url = 
         bytes += next.value?.byteLength || 0;
         if (bytes > maxBytes) {
           await reader.cancel().catch(() => {});
-          throw makeError("docs_too_large", "The official Go documentation exceeds the bounded size.");
+          throw makeError("inventory_too_large", "The public Go inventory exceeds the bounded size.");
         }
         chunks.push(Buffer.from(next.value));
       }
       return Buffer.concat(chunks).toString("utf8");
     }
     const buffer = response.arrayBuffer ? Buffer.from(await response.arrayBuffer()) : Buffer.from(await response.text(), "utf8");
-    if (buffer.byteLength > maxBytes) throw makeError("docs_too_large", "The official Go documentation exceeds the bounded size.");
+    if (buffer.byteLength > maxBytes) throw makeError("inventory_too_large", "The public Go inventory exceeds the bounded size.");
     return buffer.toString("utf8");
   } catch (error) {
+    if (error?.name === "AbortError" || error?.name === "TimeoutError") throw makeError("inventory_timeout", "The public Go inventory request timed out.");
     if (error?.code) throw error;
-    if (error?.name === "AbortError" || error?.name === "TimeoutError") throw makeError("docs_timeout", "The official Go documentation request timed out.");
-    throw makeError("docs_fetch_failed", "The official Go documentation could not be read.");
+    throw makeError("inventory_fetch_failed", "The public Go inventory could not be read.");
   } finally {
     clearTimeout(timer);
   }
 }
+
+// Retain the module's original export names for callers during the transition.
+// Both now accept only JSON inventory, never the retired HTML table.
+export const parseOfficialGoDocs = parseOfficialGoInventory;
+export const fetchOfficialGoDocs = fetchOfficialGoInventory;
 
 function strictProviderSelection(file, providers) {
   let text;
@@ -349,7 +340,7 @@ function normalizeMetadata(discovery, id, endpoint, documented = {}) {
     const supported = source.inputModalities.filter(item => item === "text" || item === "image");
     metadata.inputModalities = supported.length ? [...new Set(supported)] : ["text"];
   }
-  const description = `OpenCode Go model ${id} via documented ${endpoint}; other picker metadata uses conservative defaults and can be edited in the user model file.`;
+  const description = `OpenCode Go model ${id} via public inventory endpoint ${endpoint}; other picker metadata uses conservative defaults and can be edited in the user model file.`;
   metadata.description = description;
   return metadata;
 }
@@ -365,11 +356,8 @@ function buildPlan({ discovery, docs, currentModels, picker, seen }) {
   const byId = new Map(docs.map((row) => [row.modelId, row]));
   const missing = live.filter((id) => !byId.has(id));
   const documentedLive = live.filter((id) => byId.has(id));
-  // Go's live catalog can retain legacy aliases that the public page no
-  // longer documents. Keep those ids pending, while still adopting the exact
-  // documented intersection so one stale alias cannot prevent a new model
-  // from being added forever.
-  if (documentedLive.length === 0) throw makeError("docs_missing_protocol", "The official Go documentation does not cover a live model id.");
+  // Valid protocols without a supported router adapter remain pending while
+  // supported rows from the same validated snapshot can still activate.
   const currentByKey = new Map(currentModels.filter((model) => GO_FAMILY.has(model.provider)).map((model) => [key(model.provider, model.upstreamModel), model]));
   const currentByUpstream = new Map();
   for (const model of currentModels) {
@@ -672,11 +660,10 @@ export async function checkGoAutoCatalog(options = {}) {
     let discovery;
     let docs;
     try {
-      discovery = await (options.discover || discoverProviderModels)(GO_PROVIDER, { refresh: true });
-      const fetchedDocs = await (options.fetchDocs || fetchOfficialGoDocs)({});
-      docs = Array.isArray(fetchedDocs)
-        ? fetchedDocs
-        : parseOfficialGoDocs(typeof fetchedDocs === "string" ? fetchedDocs : fetchedDocs?.html);
+      const payload = await (options.fetchInventory || fetchOfficialGoInventory)({ fetchImpl: options.fetchImpl });
+      const snapshot = parseOfficialGoInventory(payload);
+      discovery = { discovered: snapshot.discovered };
+      docs = snapshot.rows;
     } catch (error) {
       const result = { state: "pending", reason: statusError(error), checkedAt: new Date(now()).toISOString() };
       updateStatus(paths.statusPath, result);
@@ -793,9 +780,86 @@ export async function checkGoAutoCatalog(options = {}) {
     } catch (error) {
       const result = { state: "error", reason: statusError(error), checkedAt: new Date(now()).toISOString(), observations: [firstObservation, finalObservation] };
       updateStatus(paths.statusPath, result);
-      return { ...result, error };
+      return { ...result, error: makeError("catalog_update_failed", "Catalog update failed.") };
     }
   }, { acquire, release });
+}
+
+// The scheduled parent transports auth once. This fixed command enters the
+// ordinary updater directly, whose lock remains held through publication and
+// rollback. It cannot recurse into managed-environment extraction.
+export const GO_MANAGED_CHILD_COMMAND = "--managed-environment-child";
+const FORWARDED_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"];
+
+export function spawnManagedGoUpdater({ environment, spawnImpl = spawn, signalSource = process } = {}) {
+  return new Promise(resolve => {
+    let child;
+    try {
+      child = spawnImpl(process.execPath, [SELF, GO_MANAGED_CHILD_COMMAND], {
+        env: environment,
+        // Provider errors may contain credentials. Neither channel is relayed,
+        // parsed, persisted, or attached to an error from this parent.
+        stdio: ["ignore", "ignore", "ignore"],
+      });
+    } catch { resolve({ code: 1, signal: null, failed: true }); return; }
+    const handlers = new Map(FORWARDED_SIGNALS.map(signal => [signal, () => { try { child.kill(signal); } catch { /* wait for close */ } }]));
+    for (const [signal, handler] of handlers) signalSource.on(signal, handler);
+    let failed = false;
+    child.once("error", () => { failed = true; });
+    // No short deadline: killing an updater in publication would release the
+    // single-flight lock before a transaction had finished or rolled back.
+    child.once("close", (code, signal) => {
+      for (const [name, handler] of handlers) signalSource.removeListener(name, handler);
+      resolve({ code, signal, ...(failed ? { failed: true } : {}) });
+    });
+  });
+}
+
+export async function runScheduledGoAutoCatalog(options = {}) {
+  const paths = statePath(options);
+  const now = options.now || Date.now;
+  const pending = (reason, extra = {}) => {
+    const result = { state: "pending", reason, checkedAt: new Date(now()).toISOString(), ...extra };
+    updateStatus(paths.statusPath, result);
+    return result;
+  };
+  const gate = () => {
+    const policy = readPolicy(paths.policyPath);
+    if (!policy.enabled) return { state: "disabled", reason: "disabled" };
+    if ((options.discoveryDisabledCheck || discoveryDisabled)()) return { state: "skipped", reason: "discovery_disabled" };
+    if (!strictProviderSelection(selectionFile(options, paths), [...GO_FAMILY])) return { state: "skipped", reason: "provider_disabled" };
+    ownerGuard({ sourceRoot: options.sourceRoot || SOURCE_ROOT, stateDir: paths.stateDir, policyPath: paths.policyPath, installManifestPath: installManifestFile(options, paths) });
+    return undefined;
+  };
+  let environment;
+  try {
+    const stopped = gate();
+    if (stopped) return stopped;
+    environment = (options.loadEnvironment || loadManagedGoRuntimeEnvironment)({
+      environment: options.environment || process.env,
+      sourceRoot: options.sourceRoot || SOURCE_ROOT,
+      stateDir: paths.stateDir,
+      installManifestPath: installManifestFile(options, paths),
+    });
+    const changed = gate();
+    if (changed) return changed;
+  } catch (error) {
+    return pending(error?.code === "managed_go_environment_conflict" ? "managed_go_environment_conflict" : "managed_go_environment_untrusted");
+  }
+  let outcome;
+  try { outcome = await (options.spawnUpdater || spawnManagedGoUpdater)({ environment }); }
+  catch { return pending("managed_updater_child_failed", { exitCode: 1 }); }
+  if (outcome?.signal) {
+    const signal = Object.hasOwn(osConstants.signals, outcome.signal) ? outcome.signal : undefined;
+    return pending("managed_updater_child_interrupted", { exitCode: 1, ...(signal ? { signal } : {}) });
+  }
+  if (outcome?.failed || outcome?.code !== 0) {
+    const exitCode = Number.isInteger(outcome?.code) && outcome.code > 0 && outcome.code <= 255 ? outcome.code : 1;
+    return pending("managed_updater_child_failed", { exitCode });
+  }
+  // The child's ordinary status file holds catalog/idle evidence. The parent
+  // returns only a fixed outcome, never the child's potentially secret output.
+  return { state: "completed", reason: "updater_child_completed" };
 }
 
 function usage() { return "Usage: opencode-go-auto-catalog install|disable|status|check|--scheduled"; }
@@ -807,7 +871,8 @@ async function main(argv = process.argv.slice(2)) {
     if (command === "install") result = await installGoAutoCatalog();
     else if (command === "disable") result = await disableGoAutoCatalog();
     else if (command === "status") result = statusGoAutoCatalog();
-    else if (command === "check" || command === "--scheduled") result = await checkGoAutoCatalog();
+    else if (command === "--scheduled") result = await runScheduledGoAutoCatalog();
+    else if (command === "check" || command === GO_MANAGED_CHILD_COMMAND) result = await checkGoAutoCatalog();
     else { console.error(usage()); process.exitCode = 2; return; }
     const output = { ...result };
     if (output.plan) {
@@ -818,9 +883,11 @@ async function main(argv = process.argv.slice(2)) {
     delete output.publication;
     delete output.error;
     process.stdout.write(`${JSON.stringify(output, null, 2)}\n`);
-    if (result?.state === "error") process.exitCode = 1;
+    if (result?.signal && Object.hasOwn(osConstants.signals, result.signal)) process.kill(process.pid, result.signal);
+    else if (result?.exitCode) process.exitCode = result.exitCode;
+    else if (result?.state === "error") process.exitCode = 1;
   } catch (error) {
-    console.error(statusError(error));
+    console.error(command === GO_MANAGED_CHILD_COMMAND ? "managed_updater_child_failed" : statusError(error));
     process.exitCode = 1;
   }
 }
