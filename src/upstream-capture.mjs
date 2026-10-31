@@ -82,7 +82,7 @@ async function openPrivate(file, exclusive = false) {
     return handle;
   } catch (error) { await handle.close(); throw error; }
 }
-async function privateDirectory(directory) {
+async function privateDirectory(directory, harden = true, expected) {
   try { await fs.mkdir(directory, { mode: 0o700 }); }
   catch (error) { if (error.code !== "EEXIST") throw error; }
   const before = await fs.lstat(directory);
@@ -91,8 +91,9 @@ async function privateDirectory(directory) {
   try {
     const opened = await handle.stat();
     owned(opened, true);
-    if (!same(before, opened) || !same(opened, await fs.lstat(directory))) throw new Error("directory identity changed");
-    await handle.chmod(0o700);
+    if (!same(before, opened) || !same(opened, await fs.lstat(directory)) ||
+        (expected && !same(expected, opened))) throw new Error("directory identity changed");
+    if (harden) await handle.chmod(0o700);
     return opened;
   } finally { await handle.close(); }
 }
@@ -107,39 +108,53 @@ async function rawArtifact(dumpPath, buffer, options) {
   // All dumps sharing this directory share a retention lane. The lane remains
   // held through create/write/close, so pending writes reserve their disk usage.
   return serialize(directory, async () => {
-    const identity = await privateDirectory(directory);
+    const identity = await privateDirectory(directory, false);
     const files = [];
     let count = 0;
     let bytes = 0;
-    for (const name of await fs.readdir(directory)) {
-      const file = path.join(directory, name);
-      const stat = await fs.lstat(file);
+    const maxInventoryEntries = limit(options.maxInventoryEntries, 256);
+    // Read one entry at a time. Overflow detection reads one extra entry but
+    // retains no state for it; returning closes the async directory iterator.
+    // Defer all chmod/pruning until this bounded inventory succeeds.
+    for await (const entry of await fs.opendir(directory, { bufferSize: 1 })) {
+      options.onInventoryEntry?.();
+      if (++count > maxInventoryEntries) return;
+      const name = entry.name;
+      const stat = await fs.lstat(path.join(directory, name));
       if (!stat.isFile() && !stat.isSymbolicLink()) return;
-      count++;
       bytes += stat.size;
       // Unknown occupants consume budget but are never deleted or chmodded.
       if ((OWNED_NAME.test(name) || LEGACY_OWNED_NAME.test(name)) &&
           stat.isFile() && stat.nlink === 1 && stat.uid === process.getuid()) {
-        await checkDirectory(directory, identity);
-        const handle = await openPrivate(file);
-        try {
-          if (!same(stat, await handle.stat())) throw new Error("artifact changed");
-        } finally { await handle.close(); }
-        files.push({ file, stat });
+        files.push({ name, size: stat.size, mtimeMs: stat.mtimeMs, dev: stat.dev, ino: stat.ino });
       }
     }
-    files.sort((a, b) => a.stat.mtimeMs - b.stat.mtimeMs);
+    await privateDirectory(directory, true, identity);
+    for (const item of files) {
+      await checkDirectory(directory, identity);
+      const handle = await openPrivate(path.join(directory, item.name));
+      try {
+        const current = await handle.stat();
+        if (!same(item, current) || item.size !== current.size || item.mtimeMs !== current.mtimeMs) {
+          throw new Error("artifact changed");
+        }
+      } finally { await handle.close(); }
+    }
+    files.sort((a, b) => a.mtimeMs - b.mtimeMs);
     const maxFiles = limit(options.maxRawFiles, 16);
     const maxBytes = limit(options.maxRawBytes, 64 * 1024 * 1024);
     for (const item of files) {
-      const expired = Date.now() - item.stat.mtimeMs > 7 * 24 * 60 * 60 * 1000;
+      const expired = Date.now() - item.mtimeMs > 7 * 24 * 60 * 60 * 1000;
       if (!expired && count + 1 <= maxFiles && bytes + buffer.length <= maxBytes) continue;
       await checkDirectory(directory, identity);
-      const current = await fs.lstat(item.file);
+      const file = path.join(directory, item.name);
+      const current = await fs.lstat(file);
       owned(current);
-      if (!same(current, item.stat)) throw new Error("artifact changed");
-      await fs.unlink(item.file);
-      count--; bytes -= item.stat.size;
+      if (!same(current, item) || current.size !== item.size || current.mtimeMs !== item.mtimeMs) {
+        throw new Error("artifact changed");
+      }
+      await fs.unlink(file);
+      count--; bytes -= item.size;
     }
     if (count + 1 > maxFiles || bytes + buffer.length > maxBytes) return;
     await checkDirectory(directory, identity);
@@ -208,8 +223,9 @@ export function recordUpstreamFailure({ normalized, upstream, upstreamClone, sta
     const requestBytes = typeof body === "string" ? Buffer.byteLength(body) : body?.byteLength;
     const raw = upstreamRequestCaptureEnabled() && Number.isFinite(requestBytes) && requestBytes <= MAX_REQUEST_BYTES;
     // Include retained input, its possible encoded copy, the response prefix,
-    // bounded metadata, JSON escaping and the serialized line in this lease.
-    const reservation = 1024 * 1024 + (raw ? (typeof body === "string" ? 3 : 2) * requestBytes : 0);
+    // bounded inventory/header metadata, JSON escaping and the serialized line
+    // in this conservative 2 MiB metadata lease plus retained request bytes.
+    const reservation = 2 * 1024 * 1024 + (raw ? (typeof body === "string" ? 3 : 2) * requestBytes : 0);
     if (active >= limit(options.maxInFlight, 8) || retained + reservation > limit(options.maxRetainedBytes, 64 * 1024 * 1024)) return Promise.resolve();
     active++; retained += reservation;
     let clone;

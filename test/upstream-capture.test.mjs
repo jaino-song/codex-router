@@ -205,16 +205,17 @@ test("admission is held through slow filesystem work and drops before clone", as
   const started = new Promise((resolve) => { entered = resolve; });
   const first = record(failure(), { maxInFlight: 1, beforeWrite: () => { entered(); return gate; } });
   await started;
-  let clones = 0;
-  const second = failure();
-  second.clone = () => { clones++; throw new Error("must be dropped before cloning"); };
-  await record(second, { maxInFlight: 1 });
-  assert.equal(clones, 0);
-  await record(second, { maxRetainedBytes: 1536 * 1024 });
-  assert.equal(clones, 0, "byte lease must remain held while the first writer is blocked");
-  unblock(); await first;
+  try {
+    let clones = 0;
+    const second = failure();
+    second.clone = () => { clones++; throw new Error("must be dropped before cloning"); };
+    await record(second, { maxInFlight: 1 });
+    assert.equal(clones, 0);
+    await record(second, { maxRetainedBytes: 3 * 1024 * 1024 });
+    assert.equal(clones, 0, "byte lease must remain held while the first writer is blocked");
+  } finally { unblock(); await first; }
   assert.equal(readRecords(file).length, 1);
-  await record(failure("later"));
+  await record(failure("later"), { maxRetainedBytes: 3 * 1024 * 1024 });
   assert.equal(readRecords(file).length, 2);
 }));
 
@@ -349,3 +350,34 @@ test("legacy artifacts can be evicted for byte budget without touching legacy-lo
   assert.equal(readdirSync(rawDir).length, 3);
   assert.ok(readRecords(file)[0].requestCapturePath);
 }));
+
+
+test("oversized raw inventories stop scanning before any artifact mutation", async () => {
+  for (const settings of [
+    { entries: 7, options: { maxInventoryEntries: 2 }, maximumVisited: 3 },
+    { entries: 300, options: { maxInventoryEntries: 1000 }, maximumVisited: 257 },
+  ]) await fixture(async (directory, file) => {
+    const rawDir = join(directory, "upstream-error-requests");
+    mkdirSync(rawDir, { mode: 0o755 });
+    const owned = join(rawDir, "2026-01-02T03-04-05-006Z-0123abcd.json");
+    writeFileSync(owned, "expired but must stay", { mode: 0o644 });
+    const old = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000);
+    utimesSync(owned, old, old);
+    for (let index = 1; index < settings.entries; index++) {
+      writeFileSync(join(rawDir, `operator-${index}.json`), "unknown", { mode: 0o644 });
+    }
+    const originalMtime = statSync(owned).mtimeMs;
+    const before = readdirSync(rawDir).sort();
+    let visited = 0;
+    await withEnv(UPSTREAM_REQUEST_CAPTURE_ENV, "1", () => record(failure(), {
+      ...settings.options, onInventoryEntry: () => { visited++; },
+    }));
+    assert.equal(visited, settings.maximumVisited, "iteration must stop immediately after detecting overflow");
+    assert.deepEqual(readdirSync(rawDir).sort(), before);
+    assert.equal(readFileSync(owned, "utf8"), "expired but must stay");
+    assert.equal(statSync(owned).mode & 0o777, 0o644, "failed inventory scans must not harden files");
+    assert.equal(statSync(rawDir).mode & 0o777, 0o755, "failed inventory scans must not harden directories");
+    assert.equal(statSync(owned).mtimeMs, originalMtime);
+    assert.equal(readRecords(file)[0].requestCapturePath, undefined);
+  });
+});
