@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import {
   existsSync,
   lstatSync,
@@ -9,6 +9,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import path from "node:path";
+import { constants as osConstants } from "node:os";
 import { fileURLToPath } from "node:url";
 
 import { applyModelOverlayPublication, transactModelOverlayMutation } from "./model-overlay-publication.mjs";
@@ -21,6 +22,7 @@ import { CALLER_SECRET_PATH, INSTALL_MANIFEST_PATH, LAUNCH_AGENTS_DIR, PORTS, PR
 import { MODEL_PICKER_STATE_PATH } from "./model-picker-state.mjs";
 import { USER_MODELS_PATH, userModelEntry } from "./user-models.mjs";
 import { writePrivateFile } from "./file-security.mjs";
+import { loadManagedGoRuntimeEnvironment } from "./managed-go-runtime-environment.mjs";
 
 const SELF = fileURLToPath(import.meta.url);
 
@@ -181,7 +183,14 @@ function statusError(error) {
   if (error?.code === "invalid_picker_state") return "model picker state is malformed";
   if (error?.code === "invalid_seen_state") return "catalog history is malformed";
   if (error?.code === "foreign_state_owner") return "state belongs to another source checkout";
-  return error?.code || "catalog check failed";
+  const allowed = new Set([
+    "invalid_state", "invalid_policy", "invalid_manifest_owner",
+    "inventory_invalid", "inventory_unknown_endpoint", "inventory_url_not_allowed",
+    "inventory_fetch_failed", "inventory_content_type", "inventory_too_large", "inventory_timeout",
+    "model_identity_collision", "unsupported_platform", "unstable_source",
+    "install_rollback_failed", "disable_failed",
+  ]);
+  return allowed.has(error?.code) ? error.code : "catalog check failed";
 }
 
 const GO_API_TUPLES = Object.freeze({
@@ -770,9 +779,86 @@ export async function checkGoAutoCatalog(options = {}) {
     } catch (error) {
       const result = { state: "error", reason: statusError(error), checkedAt: new Date(now()).toISOString(), observations: [firstObservation, finalObservation] };
       updateStatus(paths.statusPath, result);
-      return { ...result, error };
+      return { ...result, error: makeError("catalog_update_failed", "Catalog update failed.") };
     }
   }, { acquire, release });
+}
+
+// The scheduled parent transports auth once. This fixed command enters the
+// ordinary updater directly, whose lock remains held through publication and
+// rollback. It cannot recurse into managed-environment extraction.
+export const GO_MANAGED_CHILD_COMMAND = "--managed-environment-child";
+const FORWARDED_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"];
+
+export function spawnManagedGoUpdater({ environment, spawnImpl = spawn, signalSource = process } = {}) {
+  return new Promise(resolve => {
+    let child;
+    try {
+      child = spawnImpl(process.execPath, [SELF, GO_MANAGED_CHILD_COMMAND], {
+        env: environment,
+        // Provider errors may contain credentials. Neither channel is relayed,
+        // parsed, persisted, or attached to an error from this parent.
+        stdio: ["ignore", "ignore", "ignore"],
+      });
+    } catch { resolve({ code: 1, signal: null, failed: true }); return; }
+    const handlers = new Map(FORWARDED_SIGNALS.map(signal => [signal, () => { try { child.kill(signal); } catch { /* wait for close */ } }]));
+    for (const [signal, handler] of handlers) signalSource.on(signal, handler);
+    let failed = false;
+    child.once("error", () => { failed = true; });
+    // No short deadline: killing an updater in publication would release the
+    // single-flight lock before a transaction had finished or rolled back.
+    child.once("close", (code, signal) => {
+      for (const [name, handler] of handlers) signalSource.removeListener(name, handler);
+      resolve({ code, signal, ...(failed ? { failed: true } : {}) });
+    });
+  });
+}
+
+export async function runScheduledGoAutoCatalog(options = {}) {
+  const paths = statePath(options);
+  const now = options.now || Date.now;
+  const pending = (reason, extra = {}) => {
+    const result = { state: "pending", reason, checkedAt: new Date(now()).toISOString(), ...extra };
+    updateStatus(paths.statusPath, result);
+    return result;
+  };
+  const gate = () => {
+    const policy = readPolicy(paths.policyPath);
+    if (!policy.enabled) return { state: "disabled", reason: "disabled" };
+    if ((options.discoveryDisabledCheck || discoveryDisabled)()) return { state: "skipped", reason: "discovery_disabled" };
+    if (!strictProviderSelection(selectionFile(options, paths), [...GO_FAMILY])) return { state: "skipped", reason: "provider_disabled" };
+    ownerGuard({ sourceRoot: options.sourceRoot || SOURCE_ROOT, stateDir: paths.stateDir, policyPath: paths.policyPath, installManifestPath: installManifestFile(options, paths) });
+    return undefined;
+  };
+  let environment;
+  try {
+    const stopped = gate();
+    if (stopped) return stopped;
+    environment = (options.loadEnvironment || loadManagedGoRuntimeEnvironment)({
+      environment: options.environment || process.env,
+      sourceRoot: options.sourceRoot || SOURCE_ROOT,
+      stateDir: paths.stateDir,
+      installManifestPath: installManifestFile(options, paths),
+    });
+    const changed = gate();
+    if (changed) return changed;
+  } catch (error) {
+    return pending(error?.code === "managed_go_environment_conflict" ? "managed_go_environment_conflict" : "managed_go_environment_untrusted");
+  }
+  let outcome;
+  try { outcome = await (options.spawnUpdater || spawnManagedGoUpdater)({ environment }); }
+  catch { return pending("managed_updater_child_failed", { exitCode: 1 }); }
+  if (outcome?.signal) {
+    const signal = Object.hasOwn(osConstants.signals, outcome.signal) ? outcome.signal : undefined;
+    return pending("managed_updater_child_interrupted", { exitCode: 1, ...(signal ? { signal } : {}) });
+  }
+  if (outcome?.failed || outcome?.code !== 0) {
+    const exitCode = Number.isInteger(outcome?.code) && outcome.code > 0 && outcome.code <= 255 ? outcome.code : 1;
+    return pending("managed_updater_child_failed", { exitCode });
+  }
+  // The child's ordinary status file holds catalog/idle evidence. The parent
+  // returns only a fixed outcome, never the child's potentially secret output.
+  return { state: "completed", reason: "updater_child_completed" };
 }
 
 function usage() { return "Usage: opencode-go-auto-catalog install|disable|status|check|--scheduled"; }
@@ -784,7 +870,8 @@ async function main(argv = process.argv.slice(2)) {
     if (command === "install") result = await installGoAutoCatalog();
     else if (command === "disable") result = await disableGoAutoCatalog();
     else if (command === "status") result = statusGoAutoCatalog();
-    else if (command === "check" || command === "--scheduled") result = await checkGoAutoCatalog();
+    else if (command === "--scheduled") result = await runScheduledGoAutoCatalog();
+    else if (command === "check" || command === GO_MANAGED_CHILD_COMMAND) result = await checkGoAutoCatalog();
     else { console.error(usage()); process.exitCode = 2; return; }
     const output = { ...result };
     if (output.plan) {
@@ -795,9 +882,11 @@ async function main(argv = process.argv.slice(2)) {
     delete output.publication;
     delete output.error;
     process.stdout.write(`${JSON.stringify(output, null, 2)}\n`);
-    if (result?.state === "error") process.exitCode = 1;
+    if (result?.signal && Object.hasOwn(osConstants.signals, result.signal)) process.kill(process.pid, result.signal);
+    else if (result?.exitCode) process.exitCode = result.exitCode;
+    else if (result?.state === "error") process.exitCode = 1;
   } catch (error) {
-    console.error(statusError(error));
+    console.error(command === GO_MANAGED_CHILD_COMMAND ? "managed_updater_child_failed" : statusError(error));
     process.exitCode = 1;
   }
 }

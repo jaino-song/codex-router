@@ -13,7 +13,7 @@ bin/opencode-go-auto-catalog disable
 ```
 
 After the existing discovery-enabled, configured-provider, and provider-selection
-gates pass, the job makes one credential-free public inventory request to
+gates pass in the updater child, the job makes one credential-free public inventory request to
 `https://opencode.ai/inference/go/v1/models`. That single validated JSON snapshot
 supplies both live model ids and metadata; the updater does not call the
 credential-backed discovery path or fetch the retired HTML endpoint table.
@@ -81,6 +81,48 @@ arguments. It is independent of the managed router service, so the updater
 survives a router restart. It never restarts the Codex app and never sends
 credentials to the public inventory request.
 
-This parser update has only offline fixture and temporary-state verification.
-It does not establish that the installed updater is operationally restored:
-credential restoration and a live operational check remain a separate phase.
+The installed updater definition remains path-only: it contains the source and
+state locators, with no provider keys. On `--scheduled`, a small parent first
+checks that the policy and discovery are enabled and Go remains selected. It
+then reads the existing managed router LaunchAgent at the canonical
+`LAUNCH_AGENT_PATH` from `paths.mjs`; there is no extra credential path setting.
+
+That router plist must be a bounded regular file, owned by the current user,
+with mode `0600`. Symlinks and writable or foreign-owned path components are
+rejected. The loader verifies the opened file against the path before and after
+the bounded read, including replacement and metadata changes. The exact service
+label, two program arguments (the running Node executable and stable
+`src/start.mjs`), canonical working directory, and three managed state aliases
+must agree with the updater and current install-manifest owner. The optional
+`CODEX_ROUTER_SOURCE_ROOT`, when present, must also agree.
+
+The verified snapshot goes to `/usr/bin/plutil` on stdin with bounded output and
+no shell, temporary credential files, or raw diagnostics. Only installation
+locators and registry-declared Go credential variables are extracted. The
+existing `providerApiKeyServiceEnvironment` policy filters that candidate-only
+map to active references in authoritative pools. It does not select accounts or
+fall back to another credential source. No unrelated managed-service environment
+is copied. Legitimate inherited environment is preserved; an equal same-name Go
+value is accepted, while a different value fails closed. The parent environment
+is never mutated.
+
+After repeating the policy/discovery/selection checks, the parent spawns this
+same updater module once with a fixed internal child command. Recovered keys
+appear only in that child's environment. The child enters the normal updater
+checks directly, including configured-provider eligibility before the public
+fetch and again under the overlay transaction. Publication and its descendants
+inherit that same effective environment. The normal updater lock stays held
+through publication or rollback. The parent waits for completion without a
+short publication timeout, forwards termination signals, and preserves the
+child's exit or termination outcome. Child stdout/stderr are suppressed because
+provider diagnostics may include credentials; status uses fixed failure codes.
+
+Trust, parsing, or environment conflicts produce sanitized pending status before
+any updater child, inventory request, publication, or restart. There is no
+automatic retry or fallback credential source. A disabled or discovery-off job
+performs no managed credential extraction.
+
+This bridge has only offline synthetic-plist and temporary-state verification,
+including real macOS `plutil` parsing and controlled child processes. It does not
+establish that the installed updater is operationally restored. Installation,
+service activation, and a live operational check remain separate steps.

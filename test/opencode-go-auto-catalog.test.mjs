@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { CHECKED_IN_MODELS } from "../src/model-registry.mjs";
-import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { execFileSync, spawn as realSpawn } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, existsSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -17,6 +17,9 @@ import {
   observeRouterIdle,
   parseOfficialGoInventory,
   renderLaunchdPlist,
+  runScheduledGoAutoCatalog,
+  spawnManagedGoUpdater,
+  GO_MANAGED_CHILD_COMMAND,
 } from "../src/opencode-go-auto-catalog.mjs";
 import { transactModelOverlayMutation } from "../src/model-overlay-publication.mjs";
 
@@ -562,4 +565,178 @@ test("fresh overlay state wins over the earlier inventory plan under the transac
   assert.equal(result.state, "active"); assert.equal(publications, 0);
   assert.deepEqual(JSON.parse(readFileSync(options.userModelsPath, "utf8")).models, [model]);
   assert.deepEqual(JSON.parse(readFileSync(options.pickerPath, "utf8")).hidden, [model.slug]);
+});
+
+
+const MANAGED_DUMMY = "managed-go-integration-fixture";
+
+test("scheduled entry creates one updater child with transient auth only in env", async () => {
+  const options = checkFixture();
+  let launches = 0;
+  const inherited = { LEGITIMATE: "preserved" };
+  const result = await runScheduledGoAutoCatalog({ ...options, environment: inherited,
+    loadEnvironment: input => { assert.equal(input.environment === inherited, true); return { ...inherited, OPENCODE_API_KEY: MANAGED_DUMMY }; },
+    spawnUpdater: async ({ environment }) => {
+      launches += 1;
+      assert.equal(environment.OPENCODE_API_KEY === MANAGED_DUMMY && environment.LEGITIMATE === "preserved", true, "child environment differs");
+      return { code: 0, signal: null };
+    },
+  });
+  assert.equal(result.state, "completed"); assert.equal(launches, 1);
+  assert.equal(Object.hasOwn(inherited, "OPENCODE_API_KEY"), false);
+  for (const file of [options.policyPath, options.statusPath, options.seenPath]) if (existsSync(file)) assert.equal(readFileSync(file, "utf8").includes(MANAGED_DUMMY), false);
+  assert.equal(renderLaunchdPlist().includes(MANAGED_DUMMY), false);
+});
+
+test("scheduled disabled and discovery gates precede extraction and run again before spawning", async () => {
+  for (const mode of ["disabled", "discovery", "selection", "changed-policy", "changed-discovery"]) {
+    const options = checkFixture();
+    if (mode === "disabled") policy(options, false);
+    if (mode === "selection") writeFileSync(path.join(options.stateDir, "enabled-providers.json"), JSON.stringify({ version: 1, providers: ["deepseek"] }));
+    let extraction = 0;
+    const result = await runScheduledGoAutoCatalog({ ...options,
+      discoveryDisabledCheck: () => mode === "discovery" || (mode === "changed-discovery" && extraction > 0),
+      loadEnvironment: () => { extraction += 1; if (mode === "changed-policy") policy(options, false); return {}; },
+      spawnUpdater: async () => assert.fail("gated scheduled child started"),
+    });
+    assert.equal(["disabled", "skipped"].includes(result.state), true);
+    assert.equal(extraction, mode.startsWith("changed-") ? 1 : 0);
+  }
+});
+
+test("scheduled trust failures and abnormal child exits expose only fixed pending codes", async () => {
+  for (const mode of ["loader", "spawn", "exit", "signal", "killed", "malformed-policy"]) {
+    const options = checkFixture();
+    if (mode === "malformed-policy") writeFileSync(options.policyPath, MANAGED_DUMMY);
+    let launches = 0;
+    const result = await runScheduledGoAutoCatalog({ ...options,
+      loadEnvironment: () => { if (mode === "loader") { const error = new Error(MANAGED_DUMMY); error.code = MANAGED_DUMMY; throw error; } return { OPENCODE_API_KEY: MANAGED_DUMMY }; },
+      spawnUpdater: async () => { launches += 1; if (mode === "spawn") throw new Error(MANAGED_DUMMY); return ["signal", "killed"].includes(mode) ? { code: null, signal: mode === "killed" ? "SIGKILL" : "SIGTERM" } : { code: 7, signal: null }; },
+    });
+    assert.equal(result.state, "pending");
+    assert.equal(launches, ["loader", "malformed-policy"].includes(mode) ? 0 : 1);
+    assert.equal(JSON.stringify(result).includes(MANAGED_DUMMY), false);
+    assert.equal(readFileSync(options.statusPath, "utf8").includes(MANAGED_DUMMY), false);
+    for (const file of [options.userModelsPath, options.pickerPath, options.seenPath]) assert.equal(existsSync(file), false);
+    if (mode === "exit") assert.equal(result.exitCode, 7);
+    if (mode === "signal") assert.equal(result.signal, "SIGTERM");
+    if (mode === "killed") assert.equal(result.signal, "SIGKILL");
+  }
+});
+
+test("updater spawn has fixed argv, no output channels or timeout, and forwards signals until close", async () => {
+  const { EventEmitter } = await import("node:events");
+  const signals = new EventEmitter();
+  const child = new EventEmitter();
+  const killed = [];
+  child.kill = signal => { killed.push(signal); return true; };
+  let spawnCount = 0;
+  const promise = spawnManagedGoUpdater({ environment: { OPENCODE_API_KEY: MANAGED_DUMMY }, signalSource: signals,
+    spawnImpl: (command, args, options) => {
+      spawnCount += 1;
+      assert.equal(command, process.execPath);
+      assert.equal(args.length === 2 && args[1] === GO_MANAGED_CHILD_COMMAND && args[0].endsWith("/src/opencode-go-auto-catalog.mjs"), true);
+      assert.equal(JSON.stringify(args).includes(MANAGED_DUMMY), false);
+      assert.equal(options.env.OPENCODE_API_KEY === MANAGED_DUMMY, true, "auth absent from child env");
+      assert.deepEqual(options.stdio, ["ignore", "ignore", "ignore"]);
+      assert.equal(options.timeout, undefined); assert.equal(options.shell, undefined);
+      return child;
+    },
+  });
+  signals.emit("SIGTERM"); assert.deepEqual(killed, ["SIGTERM"]);
+  let completed = false; promise.then(() => { completed = true; });
+  await Promise.resolve(); assert.equal(completed, false);
+  child.emit("close", null, "SIGTERM");
+  assert.deepEqual(await promise, { code: null, signal: "SIGTERM" });
+  assert.equal(spawnCount, 1); assert.equal(signals.listenerCount("SIGTERM"), 0);
+});
+
+test("child catalog failures cannot copy credential-bearing errors into status or results", async () => {
+  const options = checkFixture();
+  const error = new Error(MANAGED_DUMMY); error.code = MANAGED_DUMMY;
+  const result = await checkGoAutoCatalog({ ...options, fetchInventory: async () => inventory([["error-sanitization", protocolRoutes.responses]]), transact: async () => { throw error; } });
+  assert.equal(result.state, "error");
+  assert.equal(JSON.stringify(result).includes(MANAGED_DUMMY), false, "unsafe error escaped updater");
+  assert.equal(readFileSync(options.statusPath, "utf8").includes(MANAGED_DUMMY), false, "unsafe error persisted");
+  assert.equal(String(result.error?.stack).includes(MANAGED_DUMMY), false, "unsafe error stack escaped updater");
+});
+
+
+test("effective child env reaches initial and final configured gates and publication", async t => {
+  const root = mkdtempSync(path.join(process.cwd(), ".managed-child-test-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const stateDir = path.join(root, "state"); mkdirSync(stateDir, { mode: 0o700 });
+  const policyPath = path.join(stateDir, "opencode-go-auto-catalog-policy.json");
+  const statusPath = path.join(stateDir, "opencode-go-auto-catalog-status.json");
+  policy({ policyPath, stateDir });
+  const proofPath = path.join(root, "proof.json");
+  const script = `
+    import { checkGoAutoCatalog, GO_AUTO_QUIET_MS } from ${JSON.stringify(new URL("../src/opencode-go-auto-catalog.mjs", import.meta.url).href)};
+    import { writeFileSync, readFileSync, existsSync } from "node:fs";
+    const now = Date.now();
+    const observation = { ok: true, instanceId: "fixture-router", inFlightRequests: 0, activeCount: 0, observedAt: now - GO_AUTO_QUIET_MS - 1000, latestActivityAt: 0 };
+    writeFileSync(${JSON.stringify(statusPath)}, JSON.stringify({ version: 1, observations: [observation] }));
+    let configuredCalls = 0, published = false, held = false, released = false;
+    const hasAuth = () => typeof process.env.OPENCODE_API_KEY === "string" && process.env.OPENCODE_API_KEY.length > 0;
+    const result = await checkGoAutoCatalog({
+      configuredCheck: () => { configuredCalls++; return hasAuth() ? ["opencode-go"] : []; },
+      discoveryDisabledCheck: () => false,
+      fetchInventory: async () => ${JSON.stringify(inventory([["synthetic-child-model", protocolRoutes.responses]]))},
+      observeIdle: async () => ({ ...observation, observedAt: now }), now: () => now,
+      acquireLock: async () => { held = true; return () => { held = false; released = true; }; },
+      transact: async transaction => { await transaction.restart(); await transaction.mutate(); await transaction.applyPublication({}); return {}; },
+      applyPublication: async () => { published = hasAuth() && held; },
+    });
+    writeFileSync(${JSON.stringify(proofPath)}, JSON.stringify({ passed: result.state === "active", configuredCalls, published, released }));
+  `;
+  const inherited = { HOME: root, CODEX_HOME: root, MODEL_ROUTER_STATE_DIR: stateDir, CODEX_ROUTER_SOURCE_ROOT: process.cwd(), CODEX_ROUTER_NO_DISCOVERY: "0", LEGITIMATE: "preserved" };
+  let launches = 0;
+  const result = await runScheduledGoAutoCatalog({ stateDir, environment: inherited, discoveryDisabledCheck: () => false,
+    loadEnvironment: () => ({ ...inherited, OPENCODE_API_KEY: MANAGED_DUMMY }),
+    spawnUpdater: ({ environment }) => spawnManagedGoUpdater({ environment,
+      spawnImpl: (command, args, spawnOptions) => {
+        launches++;
+        assert.equal(args.length === 2 && args[1] === GO_MANAGED_CHILD_COMMAND && !JSON.stringify(args).includes(MANAGED_DUMMY), true, "updater child argv differs");
+        // Run the updater's existing seams inside a real child so process.env
+        // inheritance, both gates and publication share the same environment.
+        return realSpawn(command, ["--input-type=module", "-e", script], spawnOptions);
+      },
+    }),
+  });
+  assert.equal(result.state, "completed"); assert.equal(launches, 1);
+  const proof = JSON.parse(readFileSync(proofPath, "utf8"));
+  assert.equal(proof.passed && proof.published && proof.released && proof.configuredCalls >= 2, true, "child environment did not reach every activation stage");
+  assert.equal(Object.hasOwn(inherited, "OPENCODE_API_KEY"), false);
+  for (const name of ["opencode-go-auto-catalog-policy.json", "opencode-go-auto-catalog-status.json", "opencode-go-auto-catalog-seen.json", "user-models.json", "model-picker.json"]) {
+    const file = path.join(stateDir, name);
+    if (existsSync(file)) assert.equal(readFileSync(file, "utf8").includes(MANAGED_DUMMY), false, "credential persisted in updater state");
+  }
+});
+
+test("fixed internal child rechecks discovery without recursion or inventory side effects", async t => {
+  const root = mkdtempSync(path.join(process.cwd(), ".managed-fixed-child-test-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const stateDir = path.join(root, "state"); mkdirSync(stateDir, { mode: 0o700 });
+  const policyPath = path.join(stateDir, "opencode-go-auto-catalog-policy.json");
+  policy({ policyPath, stateDir });
+  const outcome = await spawnManagedGoUpdater({ environment: { HOME: root, CODEX_HOME: root, MODEL_ROUTER_STATE_DIR: stateDir, CODEX_ROUTER_SOURCE_ROOT: process.cwd(), CODEX_ROUTER_NO_DISCOVERY: "1", OPENCODE_API_KEY: MANAGED_DUMMY } });
+  assert.equal(outcome.code, 0);
+  const saved = JSON.parse(readFileSync(path.join(stateDir, "opencode-go-auto-catalog-status.json"), "utf8"));
+  assert.equal(saved.reason, "discovery_disabled");
+  for (const file of ["user-models.json", "model-picker.json", "opencode-go-auto-catalog-seen.json"]) assert.equal(existsSync(path.join(stateDir, file)), false);
+});
+
+test("spawn errors never relay diagnostics and remain attached until child close", async () => {
+  const { EventEmitter } = await import("node:events");
+  const child = new EventEmitter(); child.kill = () => true;
+  const signals = new EventEmitter();
+  const result = spawnManagedGoUpdater({ environment: { OPENCODE_API_KEY: MANAGED_DUMMY }, signalSource: signals, spawnImpl: () => child });
+  child.emit("error", new Error(MANAGED_DUMMY));
+  let completed = false; result.then(() => { completed = true; });
+  await Promise.resolve(); assert.equal(completed, false);
+  child.emit("close", -2, null);
+  const outcome = await result;
+  assert.equal(outcome.failed, true);
+  assert.equal(JSON.stringify(outcome).includes(MANAGED_DUMMY), false);
+  assert.equal(signals.listenerCount("SIGTERM"), 0);
 });
