@@ -12,27 +12,45 @@ bin/opencode-go-auto-catalog check
 bin/opencode-go-auto-catalog disable
 ```
 
-The job reads the provider's live `/models` catalog through the existing
-credential-aware discovery path and reads the public OpenCode Go page at
-`https://opencode.ai/docs/go/`. The documentation table is the protocol
-authority. Only these exact documented endpoints are accepted:
+After the existing discovery-enabled, configured-provider, and provider-selection
+gates pass, the job makes one credential-free public inventory request to
+`https://opencode.ai/inference/go/v1/models`. That single validated JSON snapshot
+supplies both live model ids and metadata; the updater does not call the
+credential-backed discovery path or fetch the retired HTML endpoint table.
 
-| Documentation endpoint | Router provider variant |
-| --- | --- |
-| `https://opencode.ai/zen/go/v1/chat/completions` | `opencode-go` |
-| `https://opencode.ai/zen/go/v1/messages` | `opencode-go-messages` |
-| `https://opencode.ai/zen/go/v1/responses` | `opencode-go-responses` |
+The response must have a successful 2xx status and `application/json` content
+type. Redirects fail closed. The request and body share a 10-second deadline,
+and both the declared size and streamed body are limited to 2 MiB. The top-level
+object must contain a `data` array with unique bounded model ids. Names, positive
+integer context/input/output limits, text/MIME modality arrays, and API entries
+are validated before any model is adopted.
 
-Redirects, oversized or malformed pages, duplicate model rows, arbitrary
-endpoint hosts, and rows missing a protocol fail closed. A model is eligible
-only when the same id is present in the fresh live Go catalog and the official
-page documents its endpoint. A documentation or protocol gap records a
-pending status for that id while eligible documented models continue to activate.
+Each `model.api` entry is keyed by protocol and contains a `base_url` and `sdk`.
+Only these exact protocol/base URL tuples map to existing router variants:
+
+| Inventory protocol | Exact base URL | Operation appended to the plan row | Router provider variant |
+| --- | --- | --- | --- |
+| `chat-completions` | `https://opencode.ai/inference/go/openai/v1` | `/chat/completions` | `opencode-go` |
+| `responses` | `https://opencode.ai/inference/go/openai/v1` | `/responses` | `opencode-go-responses` |
+| `messages` | `https://opencode.ai/inference/go/anthropic/v1` | `/messages` | `opencode-go-messages` |
+
+The known `generate-content` protocol with
+`https://opencode.ai/inference/go/google/v1beta` is valid but has no supported
+router adapter. Its ids remain pending while supported rows can activate.
+Other tuples, userinfo, query strings, fragments, alternate origins, and
+unexpected paths reject the entire snapshot. Existing legacy Zen routes and
+user-owned route choices remain intact; the inventory does not rewrite them.
+
+Only display name, context window (with the existing derived auto-compact
+threshold), and supported text/image input modalities enter new model metadata.
+Output limits/modalities are validated without adding registry fields. Remote
+SDK names, capability/compatibility objects, descriptions, instructions, and
+other unused fields are never executed or copied into registry metadata.
 
 Unknown eligible ids are written as user-owned models with the existing
 `userModelEntry` conservative defaults. Their description identifies the
-documented endpoint and says which metadata remains conservative. Existing
-models, routes, providers, and user edits are preserved. On first activation,
+validated inventory endpoint and says which metadata remains conservative.
+Existing models, routes, providers, and user edits are preserved. On first activation,
 currently listed Go presets are shown unless the picker already records them
 as hidden. Later checks remember every seen provider/id pair, so a model the
 operator removed or hid is not silently re-added or made visible.
@@ -61,4 +79,8 @@ The independent launchd definition is stored at
 The launchd program invokes the stable source root directly with quoted XML
 arguments. It is independent of the managed router service, so the updater
 survives a router restart. It never restarts the Codex app and never sends
-credentials to the public documentation request.
+credentials to the public inventory request.
+
+This parser update has only offline fixture and temporary-state verification.
+It does not establish that the installed updater is operationally restored:
+credential restoration and a live operational check remain a separate phase.
