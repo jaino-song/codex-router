@@ -92,3 +92,26 @@ test("scheduled bridge uses the trusted loader and leaves its path-only state fr
   assert.equal(result.state === "completed" && launched, true, "trusted auth did not reach child");
   assert.equal(fs.readFileSync(policyPath, "utf8").includes(DUMMY) || renderLaunchdPlist().includes(DUMMY) || JSON.stringify(result).includes(DUMMY), false, "credential persisted outside child environment");
 });
+
+test("an absolute Node alias is accepted only for the expected executable identity", mac, t => {
+  const f = fixture(t);
+  const alias = path.join(f.root, "node-alias");
+  fs.symlinkSync(process.execPath, alias);
+  f.document.ProgramArguments[0] = alias; f.save();
+  assert.equal(loadManagedGoRuntimeEnvironment(f).OPENCODE_API_KEY === DUMMY, true, "same executable alias was rejected");
+
+  const different = path.join(f.root, "different-node");
+  fs.writeFileSync(different, "synthetic executable fixture", { mode: 0o755 });
+  fs.unlinkSync(alias); fs.symlinkSync(different, alias);
+  assert.throws(() => loadManagedGoRuntimeEnvironment(f), { code: "managed_go_environment_untrusted" });
+  fs.unlinkSync(alias); fs.symlinkSync(process.execPath, alias);
+  let replaced = false;
+  assert.throws(() => loadManagedGoRuntimeEnvironment({ ...f, filesystem: { ...fs, statSync(file) {
+    const stat = fs.statSync(file);
+    if (file === alias && !replaced) { replaced = true; fs.unlinkSync(alias); fs.symlinkSync(different, alias); }
+    return stat;
+  } } }), { code: "managed_go_environment_untrusted" });
+  fs.unlinkSync(alias); fs.symlinkSync(process.execPath, alias);
+  f.document.ProgramArguments[0] = path.relative(process.cwd(), alias); f.save();
+  assert.throws(() => loadManagedGoRuntimeEnvironment(f), { code: "managed_go_environment_untrusted" });
+});

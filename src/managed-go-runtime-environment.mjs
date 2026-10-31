@@ -20,6 +20,24 @@ function sameFile(a, b) {
   return ["dev", "ino", "uid", "mode", "size", "mtimeMs", "ctimeMs"].every(key => a[key] === b[key]);
 }
 
+// The service renderer may retain a Node symlink spelling while the updater
+// runs the resolved executable. Accept only an absolute alias of that same
+// canonical, regular executable, with stable file identity across resolution.
+// This validates a locator; the child still launches with process.execPath.
+function sameExecutable(actual, expected, filesystem) {
+  if (typeof actual !== "string" || !path.isAbsolute(actual) || !path.isAbsolute(expected)) return false;
+  const canonical = filesystem.realpathSync(expected);
+  if (filesystem.realpathSync(actual) !== canonical) return false;
+  const expectedStat = filesystem.lstatSync(canonical);
+  const actualStat = filesystem.statSync(actual);
+  return expectedStat.isFile() && !expectedStat.isSymbolicLink() && (expectedStat.mode & 0o111) !== 0
+    && sameFile(expectedStat, actualStat)
+    && filesystem.realpathSync(actual) === canonical
+    && filesystem.realpathSync(expected) === canonical
+    && sameFile(expectedStat, filesystem.statSync(expected))
+    && sameFile(expectedStat, filesystem.lstatSync(canonical));
+}
+
 // Check every component without following links. Root-owned ancestors are
 // permitted; writable directories and links can redirect an otherwise private
 // final file and are never trusted. Recheck the same identities after reading.
@@ -124,7 +142,7 @@ export function loadManagedGoRuntimeEnvironment({
     if (manifest.version !== 1 || manifest.current?.sourceRoot !== source) throw failure();
     const read = plistReader(trustedRead(plistPath, filesystem, currentUid));
     const args = read("ProgramArguments");
-    if (read("Label") !== SERVICE_LABEL || !Array.isArray(args) || args.length !== 2 || args[0] !== nodeBinary || args[1] !== path.join(source, "src", "start.mjs") || read("WorkingDirectory") !== source) throw failure();
+    if (read("Label") !== SERVICE_LABEL || !Array.isArray(args) || args.length !== 2 || !sameExecutable(args[0], nodeBinary, filesystem) || args[1] !== path.join(source, "src", "start.mjs") || read("WorkingDirectory") !== source) throw failure();
     for (const name of STATE_FIELDS) if (read(`EnvironmentVariables.${name}`) !== state) throw failure();
     const optionalSource = read("EnvironmentVariables.CODEX_ROUTER_SOURCE_ROOT", true);
     if (optionalSource !== undefined && optionalSource !== source) throw failure();

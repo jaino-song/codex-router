@@ -94,7 +94,10 @@ the bounded read, including replacement and metadata changes. The exact service
 label, two program arguments (the running Node executable and stable
 `src/start.mjs`), canonical working directory, and three managed state aliases
 must agree with the updater and current install-manifest owner. The optional
-`CODEX_ROUTER_SOURCE_ROOT`, when present, must also agree.
+`CODEX_ROUTER_SOURCE_ROOT`, when present, must also agree. An absolute Node alias
+is accepted only when it resolves to the expected canonical executable with
+the same stable file identity; a different executable or relative path fails
+closed. The child continues to launch using the updater's `process.execPath`.
 
 The verified snapshot goes to `/usr/bin/plutil` on stdin with bounded output and
 no shell, temporary credential files, or raw diagnostics. Only installation
