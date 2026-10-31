@@ -70,6 +70,8 @@ import {
 } from "./openai-adapters.mjs";
 import { threadIdFromHeaders } from "./codex-session-names.mjs";
 import { applyOpenCodeSessionHeaders } from "./opencode-session.mjs";
+import { captureUpstreamFailure } from "./upstream-capture.mjs";
+import { isGoEndpointProvider, retryEndpointRejectionOnce } from "./endpoint-retry.mjs";
 import {
   effectiveProviderCredentialStatus,
   providerApiKeyAuthoritySnapshot,
@@ -1441,6 +1443,7 @@ async function handleRequest(request, response) {
       },
     );
     try {
+      captureUpstreamFailure({ normalized, upstream, startedAt });
       await relayUpstreamResponse(normalized, upstream, response, startedAt);
     } finally {
       await dispatcher?.close().catch(() => undefined);
@@ -1584,21 +1587,27 @@ async function handleRequest(request, response) {
           normalized.endpoint,
         );
         let attemptTarget = `${attemptSession.baseUrl}${route}${requestUrl.search}`;
-        const sendAttempt = () => fetchUpstream(normalized, attemptTarget, {
-          method: request.method,
-          headers: upstreamHeaders(
-            request.headers,
-            upstreamBody,
-            attemptSession.apiKey,
-            normalized.provider,
-            attemptSession.headers,
-            normalized.endpoint,
-          ),
-          body: upstreamBody,
-          signal: controller.signal,
-          redirect: route === "/embeddings" ? "error" : "follow",
+        const sendAttempt = async () => {
+          const result = await fetchUpstream(normalized, attemptTarget, {
+            method: request.method,
+            headers: upstreamHeaders(
+              request.headers,
+              upstreamBody,
+              attemptSession.apiKey,
+              normalized.provider,
+              attemptSession.headers,
+              normalized.endpoint,
+            ),
+            body: upstreamBody,
+            signal: controller.signal,
+            redirect: route === "/embeddings" ? "error" : "follow",
+          });
+          captureUpstreamFailure({ normalized, upstream: result, startedAt });
+          return result;
+        };
+        let attemptResponse = await retryEndpointRejectionOnce(sendAttempt, {
+          signal: controller.signal, eligible: isGoEndpointProvider(normalized.provider.id),
         });
-        let attemptResponse = await sendAttempt();
         // The source credential can still be valid when Copilot changes the
         // account's inference endpoint or short-lived routing token. Preserve
         // the existing same-key force-refresh contract inside each pool
@@ -1715,20 +1724,32 @@ async function handleRequest(request, response) {
       normalized.endpoint,
     );
     target = `${session.baseUrl}${route}${requestUrl.search}`;
-    upstream = await fetchUpstream(normalized, target, {
-      method: request.method,
-      headers: upstreamHeaders(
-        request.headers,
-        upstreamBody,
-        session.apiKey,
-        normalized.provider,
-        session.headers,
-        normalized.endpoint,
-      ),
-      body: upstreamBody,
-      signal: controller.signal,
-      redirect: route === "/embeddings" ? "error" : "follow",
-    });
+    const sendUpstream = async () => {
+      const result = await fetchUpstream(normalized, target, {
+        method: request.method,
+        headers: upstreamHeaders(
+          request.headers,
+          upstreamBody,
+          session.apiKey,
+          normalized.provider,
+          session.headers,
+          normalized.endpoint,
+        ),
+        body: upstreamBody,
+        signal: controller.signal,
+        redirect: route === "/embeddings" ? "error" : "follow",
+      });
+      captureUpstreamFailure({ normalized, upstream: result, startedAt });
+      return result;
+    };
+    // Embeddings are billed even when the response never reaches the caller, so
+    // they are sent exactly once; the same endpoint-level re-send that chat and
+    // Responses routes earn is refused for them.
+    upstream = route === "/embeddings"
+      ? await sendUpstream()
+      : await retryEndpointRejectionOnce(sendUpstream, {
+          signal: controller.signal, eligible: isGoEndpointProvider(normalized.provider.id),
+        });
     // Embeddings can be billed even when the response never reaches the
     // caller. Select one pool credential above and record its outcome, but do
     // not replay the same input through another credential after a 401, 429,
@@ -1775,6 +1796,7 @@ async function handleRequest(request, response) {
       body: upstreamBody,
       signal: controller.signal,
     });
+    captureUpstreamFailure({ normalized, upstream, startedAt });
   }
   // Falling back here is legal for the same reason the Copilot replay above
   // is: nothing has been relayed yet. The refusal is read rather than piped
