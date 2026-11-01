@@ -1,27 +1,58 @@
 import assert from "node:assert/strict";
 import { CHECKED_IN_MODELS } from "../src/model-registry.mjs";
-import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { execFileSync, spawn as realSpawn } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, existsSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
 import {
   GO_AUTO_QUIET_MS,
+  GO_AUTO_INTERVAL_SECONDS,
   checkGoAutoCatalog,
   disableGoAutoCatalog,
-  fetchOfficialGoDocs,
+  fetchOfficialGoInventory,
   goProviderEligibility,
   installGoAutoCatalog,
   observeRouterIdle,
-  parseOfficialGoDocs,
+  parseOfficialGoInventory,
   renderLaunchdPlist,
+  runScheduledGoAutoCatalog,
+  spawnManagedGoUpdater,
+  GO_MANAGED_CHILD_COMMAND,
 } from "../src/opencode-go-auto-catalog.mjs";
 import { transactModelOverlayMutation } from "../src/model-overlay-publication.mjs";
 
-function html(rows) {
-  return `<table><thead><tr><th>Model ID</th><th>Endpoint</th></tr></thead><tbody>${rows.map(([id, endpoint]) => `<tr><td>${id}</td><td>${endpoint}</td></tr>`).join("")}</tbody></table>`;
+const protocolRoutes = {
+  "chat-completions": "https://opencode.ai/inference/go/openai/v1/chat/completions",
+  responses: "https://opencode.ai/inference/go/openai/v1/responses",
+  messages: "https://opencode.ai/inference/go/anthropic/v1/messages",
+  "generate-content": "https://opencode.ai/inference/go/google/v1beta",
+};
+
+function inventory(rows) {
+  return JSON.stringify({ data: rows.map(([id, endpoint]) => {
+    const protocol = Object.keys(protocolRoutes).find(key => protocolRoutes[key] === endpoint);
+    assert.ok(protocol, `fixture protocol required for ${endpoint}`);
+    const base_url = protocol === "generate-content" ? endpoint : endpoint.slice(0, -({ "chat-completions": "/chat/completions", responses: "/responses", messages: "/messages" }[protocol].length));
+    return { id, name: id, limit: { context: 131072, output: 8192 }, modalities: { input: ["text"], output: ["text"] }, api: { [protocol]: { base_url, sdk: "@ai-sdk/test-fixture" } } };
+  }) });
 }
+
+function publicInventory() {
+  return { data: [{
+    id: "deepseek-v4.1-flash", name: "DeepSeek V4.1 Flash",
+    limit: { context: 1000000, output: 384000 },
+    modalities: { input: ["text", "image/jpeg", "image/png", "image/gif", "image/webp"], output: ["text"] },
+    api: { "chat-completions": { base_url: "https://opencode.ai/inference/go/openai/v1", sdk: "@ai-sdk/openai-compatible" } },
+  }] };
+}
+
+test("public JSON inventory replaces the removed HTML endpoint table", () => {
+  const snapshot = parseOfficialGoInventory(JSON.stringify(publicInventory()));
+  assert.equal(snapshot.rows[0].modelId, "deepseek-v4.1-flash");
+  assert.equal(snapshot.rows[0].metadata.contextWindow, 1000000);
+});
 
 function tempPaths() {
   const root = mkdtempSync(path.join(os.tmpdir(), "go-auto-catalog-"));
@@ -47,32 +78,33 @@ function idleSeams(now) {
   return { readHealth: async () => health, readActivity: async () => activity };
 }
 
-test("official docs accept only the three exact Go protocol endpoints", () => {
-  const rows = parseOfficialGoDocs(html([
-    ["chat-model", "https://opencode.ai/zen/go/v1/chat/completions"],
-    ["messages-model", "POST https://opencode.ai/zen/go/v1/messages"],
-    ["responses-model", "https://opencode.ai/zen/go/v1/responses"],
+test("inventory accepts only exact public protocol tuples", () => {
+  const snapshot = parseOfficialGoInventory(inventory([
+    ["chat-model", protocolRoutes["chat-completions"]],
+    ["messages-model", protocolRoutes.messages],
+    ["responses-model", protocolRoutes.responses],
   ]));
-  assert.deepEqual(rows.map((row) => [row.modelId, row.providerId]), [
-    ["chat-model", "opencode-go"],
-    ["messages-model", "opencode-go-messages"],
-    ["responses-model", "opencode-go-responses"],
+  assert.deepEqual(snapshot.rows.map(row => [row.modelId, row.providerId, row.endpoint]), [
+    ["chat-model", "opencode-go", protocolRoutes["chat-completions"]],
+    ["messages-model", "opencode-go-messages", protocolRoutes.messages],
+    ["responses-model", "opencode-go-responses", protocolRoutes.responses],
   ]);
-  assert.throws(() => parseOfficialGoDocs(html([["bad", "https://example.com/zen/go/v1/responses"]])), /endpoint/i);
-  assert.throws(() => parseOfficialGoDocs(html([["same", "https://opencode.ai/zen/go/v1/responses"], ["same", "https://opencode.ai/zen/go/v1/responses"]])), /repeats|duplicate/i);
-  assert.throws(() => parseOfficialGoDocs("<p>Model ID only</p>"), /table|protocol/i);
+  assert.deepEqual(snapshot.discovered, ["chat-model", "messages-model", "responses-model"]);
+  assert.throws(() => parseOfficialGoInventory(inventory([["same", protocolRoutes.responses], ["same", protocolRoutes.responses]])), /repeats|duplicate/i);
+  assert.throws(() => parseOfficialGoInventory("<p>Model ID only</p>"), /malformed/i);
 });
 
-test("docs fetch is bounded, rejects redirects, and sends no credentials", async () => {
+test("inventory fetch is bounded, rejects redirects, and sends no credentials", async () => {
   let request;
-  const response = { ok: true, status: 200, headers: new Headers({ "content-length": "20" }), text: async () => "<table></table>" };
-  const result = await fetchOfficialGoDocs({ fetchImpl: async (url, options) => { request = { url, options }; return response; } });
-  assert.equal(result, "<table></table>");
-  assert.equal(request.url, "https://opencode.ai/docs/go/");
+  const payload = JSON.stringify(publicInventory());
+  const result = await fetchOfficialGoInventory({ fetchImpl: async (url, options) => { request = { url, options }; return new Response(payload, { headers: { "content-type": "application/json; charset=utf-8" } }); } });
+  assert.equal(result, payload);
+  assert.equal(request.url, "https://opencode.ai/inference/go/v1/models");
   assert.equal(request.options.redirect, "error");
   assert.equal(request.options.credentials, undefined);
+  assert.equal(request.options.headers.Accept, "application/json");
   assert.equal(Object.hasOwn(request.options.headers, "Authorization"), false);
-  await assert.rejects(fetchOfficialGoDocs({ fetchImpl: async () => ({ ok: true, status: 200, headers: new Headers({ "content-length": "200" }), text: async () => "x" }), maxBytes: 20 }), /bounded|large/i);
+  await assert.rejects(fetchOfficialGoInventory({ fetchImpl: async () => new Response("x", { headers: { "content-type": "application/json", "content-length": "200" } }), maxBytes: 20 }), /bounded|large/i);
 });
 
 test("all three newly documented protocols are adopted while existing state is preserved", async () => {
@@ -98,8 +130,7 @@ test("all three newly documented protocols are adopted while existing state is p
     sourceRoot: process.cwd(),
     configuredCheck: () => ["opencode-go"],
     discoveryDisabledCheck: () => false,
-    discover: async () => ({ discovered: ["new-chat", "new-messages", "new-responses"], modelMetadata: { "new-chat": { inputModalities: ["text", "audio"] } } }),
-    fetchDocs: async () => html([["new-chat", "https://opencode.ai/zen/go/v1/chat/completions"], ["new-messages", "https://opencode.ai/zen/go/v1/messages"], ["new-responses", "https://opencode.ai/zen/go/v1/responses"]]),
+    fetchInventory: async () => inventory([["new-chat", "https://opencode.ai/inference/go/openai/v1/chat/completions"], ["new-messages", "https://opencode.ai/inference/go/anthropic/v1/messages"], ["new-responses", "https://opencode.ai/inference/go/openai/v1/responses"]]),
     readHealth: async () => ({ ok: true, resources: { inFlightRequests: 0 } }),
     readActivity: async () => activity,
     observeIdle: observeRouterIdle,
@@ -127,7 +158,7 @@ test("busy router, unknown health, and no-op checks defer without restarting", a
   const p = tempPaths();
   Object.assign(p, { policyPath: path.join(p.stateDir, "policy.json"), statusPath: path.join(p.stateDir, "status.json"), seenPath: path.join(p.stateDir, "seen.json"), lockPath: path.join(p.stateDir, "lock"), pickerPath: path.join(p.stateDir, "picker.json"), userModelsPath: path.join(p.stateDir, "user-models.json") });
   mkdirSync(p.stateDir, { recursive: true, mode: 0o700 }); policy(p);
-  const base = { ...p, configuredCheck: () => ["opencode-go"], discoveryDisabledCheck: () => false, discover: async () => ({ discovered: ["new"], modelMetadata: {} }), fetchDocs: async () => html([["new", "https://opencode.ai/zen/go/v1/responses"]]), now: () => Date.now(), transact: async () => { throw new Error("should not transact"); } };
+  const base = { ...p, configuredCheck: () => ["opencode-go"], discoveryDisabledCheck: () => false, fetchInventory: async () => inventory([["new", "https://opencode.ai/inference/go/openai/v1/responses"]]), now: () => Date.now(), transact: async () => { throw new Error("should not transact"); } };
   let result = await checkGoAutoCatalog({ ...base, readHealth: async () => ({ ok: true, resources: { inFlightRequests: 1 } }), readActivity: async () => ({ ok: true, instanceId: "r", observedAt: Date.now(), active: [{}], recent: [] }) });
   assert.equal(result.state, "deferred");
   result = await checkGoAutoCatalog({ ...base, readHealth: async () => ({ ok: false }), readActivity: async () => ({ ok: false }) });
@@ -152,7 +183,7 @@ test("idle activation still requires a sixty-second gap between persisted observ
   mkdirSync(p.stateDir, { recursive: true, mode: 0o700 }); policy(p);
   const now = Date.now(); const activity = { ok: true, version: 1, instanceId: "router-1", observedAt: now - 1_000, active: [], recent: [] };
   status(p, { instanceId: "router-1", inFlightRequests: 0, activeCount: 0, observedAt: now - 1_000, latestActivityAt: 0 });
-  const result = await checkGoAutoCatalog({ ...p, sourceRoot: process.cwd(), configuredCheck: () => ["opencode-go"], discoveryDisabledCheck: () => false, discover: async () => ({ discovered: ["gap"], modelMetadata: {} }), fetchDocs: async () => html([["gap", "https://opencode.ai/zen/go/v1/chat/completions"]]), readHealth: async () => ({ ok: true, resources: { inFlightRequests: 0 } }), readActivity: async () => activity, now: () => now, transact: async () => { throw new Error("should not transact"); } });
+  const result = await checkGoAutoCatalog({ ...p, sourceRoot: process.cwd(), configuredCheck: () => ["opencode-go"], discoveryDisabledCheck: () => false, fetchInventory: async () => inventory([["gap", "https://opencode.ai/inference/go/openai/v1/chat/completions"]]), readHealth: async () => ({ ok: true, resources: { inFlightRequests: 0 } }), readActivity: async () => activity, now: () => now, transact: async () => { throw new Error("should not transact"); } });
   assert.equal(result.state, "deferred");
   assert.equal(result.reason, "quiet_window");
 });
@@ -165,12 +196,12 @@ test("a failed final gate cannot be followed by a mutation after a healthy reche
   status(p, { instanceId: "router-1", inFlightRequests: 0, activeCount: 0, observedAt: activity.observedAt, latestActivityAt: activity.observedAt });
   const before = ["user-models.json", "picker.json", "seen.json"].map((name) => [name, existsSync(path.join(p.stateDir, name)) ? readFileSync(path.join(p.stateDir, name)) : null]);
   let observations = 0;
-  const result = await checkGoAutoCatalog({ ...p, sourceRoot: process.cwd(), configuredCheck: () => ["opencode-go"], discoveryDisabledCheck: () => false, discover: async () => ({ discovered: ["gate-race"], modelMetadata: {} }), fetchDocs: async () => html([["gate-race", "https://opencode.ai/zen/go/v1/responses"]]), readHealth: async () => ({ ok: true, resources: { inFlightRequests: 0 } }), readActivity: async () => { observations += 1; return observations === 3 ? { ok: false } : activity; }, now: () => now, transact: (transaction) => transactModelOverlayMutation({ ...transaction, lock: false }), applyPublication: async () => { throw new Error("must not publish"); } });
+  const result = await checkGoAutoCatalog({ ...p, sourceRoot: process.cwd(), configuredCheck: () => ["opencode-go"], discoveryDisabledCheck: () => false, fetchInventory: async () => inventory([["gate-race", "https://opencode.ai/inference/go/openai/v1/responses"]]), readHealth: async () => ({ ok: true, resources: { inFlightRequests: 0 } }), readActivity: async () => { observations += 1; return observations === 3 ? { ok: false } : activity; }, now: () => now, transact: (transaction) => transactModelOverlayMutation({ ...transaction, lock: false }), applyPublication: async () => { throw new Error("must not publish"); } });
   assert.equal(result.state, "deferred");
   for (const [name, bytes] of before) assert.equal(existsSync(path.join(p.stateDir, name)) ? readFileSync(path.join(p.stateDir, name)).toString() : null, bytes?.toString() || null);
 });
 
-test("undocumented legacy live ids remain pending while documented ids still activate", async () => {
+test("valid unsupported protocols stay pending while supported inventory rows activate", async () => {
   const p = tempPaths();
   Object.assign(p, { policyPath: path.join(p.stateDir, "policy.json"), statusPath: path.join(p.stateDir, "status.json"), seenPath: path.join(p.stateDir, "seen.json"), lockPath: path.join(p.stateDir, "lock"), pickerPath: path.join(p.stateDir, "picker.json"), userModelsPath: path.join(p.stateDir, "user-models.json") });
   mkdirSync(p.stateDir, { recursive: true, mode: 0o700 }); policy(p);
@@ -178,7 +209,7 @@ test("undocumented legacy live ids remain pending while documented ids still act
   status(p, { instanceId: "router-1", inFlightRequests: 0, activeCount: 0, observedAt: activity.observedAt, latestActivityAt: activity.observedAt });
   writeFileSync(p.pickerPath, JSON.stringify({ version: 1, hidden: ["other/hidden"], seeded: [] }));
   let published = 0;
-  const options = { ...p, sourceRoot: process.cwd(), configuredCheck: () => ["opencode-go"], discoveryDisabledCheck: () => false, discover: async () => ({ discovered: ["legacy-alias", "documented"], modelMetadata: {} }), fetchDocs: async () => html([["documented", "https://opencode.ai/zen/go/v1/chat/completions"]]), readHealth: async () => ({ ok: true, resources: { inFlightRequests: 0 } }), readActivity: async () => activity, now: () => now, transact: (transaction) => transactModelOverlayMutation({ ...transaction, lock: false }), applyPublication: async () => { published += 1; } };
+  const options = { ...p, sourceRoot: process.cwd(), configuredCheck: () => ["opencode-go"], discoveryDisabledCheck: () => false, fetchInventory: async () => inventory([["legacy-alias", protocolRoutes["generate-content"]], ["documented", "https://opencode.ai/inference/go/openai/v1/chat/completions"]]), readHealth: async () => ({ ok: true, resources: { inFlightRequests: 0 } }), readActivity: async () => activity, now: () => now, transact: (transaction) => transactModelOverlayMutation({ ...transaction, lock: false }), applyPublication: async () => { published += 1; } };
   const result = await checkGoAutoCatalog(options);
   assert.equal(result.state, "pending");
   assert.deepEqual(result.plan.missingDocs, ["legacy-alias"]);
@@ -216,7 +247,7 @@ test("publication failure rolls all three updater files back", async () => {
   const now = Date.now(); const activity = { ok: true, version: 1, instanceId: "router-1", observedAt: now - GO_AUTO_QUIET_MS - 1_000, active: [], recent: [] };
   status(p, { instanceId: "router-1", inFlightRequests: 0, activeCount: 0, observedAt: activity.observedAt, latestActivityAt: activity.observedAt });
   let publications = 0;
-  const options = { ...p, sourceRoot: process.cwd(), configuredCheck: () => ["opencode-go"], discoveryDisabledCheck: () => false, discover: async () => ({ discovered: ["rollback-me"], modelMetadata: {} }), fetchDocs: async () => html([["rollback-me", "https://opencode.ai/zen/go/v1/responses"]]), readHealth: async () => ({ ok: true, resources: { inFlightRequests: 0 } }), readActivity: async () => activity, now: () => now, transact: (transaction) => transactModelOverlayMutation({ ...transaction, lock: false }), applyPublication: async () => { publications += 1; if (publications === 1) {
+  const options = { ...p, sourceRoot: process.cwd(), configuredCheck: () => ["opencode-go"], discoveryDisabledCheck: () => false, fetchInventory: async () => inventory([["rollback-me", "https://opencode.ai/inference/go/openai/v1/responses"]]), readHealth: async () => ({ ok: true, resources: { inFlightRequests: 0 } }), readActivity: async () => activity, now: () => now, transact: (transaction) => transactModelOverlayMutation({ ...transaction, lock: false }), applyPublication: async () => { publications += 1; if (publications === 1) {
     const concurrent = await checkGoAutoCatalog(options);
     assert.equal(concurrent.reason, "already_running", "another updater must not observe uncommitted model state");
     throw new Error("simulated publication failure");
@@ -234,7 +265,7 @@ test("publication failure rolls all three updater files back", async () => {
   assert.ok(JSON.parse(readFileSync(p.seenPath, "utf8")).seen.some(identity => JSON.parse(identity)[1] === "rollback-me"));
 });
 
-test("disabled or unconfigured Go is skipped before discovery", async () => {
+test("disabled or unconfigured Go is skipped before the public fetch", async () => {
   assert.deepEqual(goProviderEligibility({ discoveryDisabledCheck: () => true, configuredCheck: () => ["opencode-go"] }), { enabled: false, reason: "discovery_disabled" });
   assert.deepEqual(goProviderEligibility({ discoveryDisabledCheck: () => false, configuredCheck: () => ["deepseek"] }), { enabled: false, reason: "provider_unconfigured" });
 });
@@ -267,12 +298,19 @@ test("disable does not claim success when launchd refuses bootout", async () => 
 });
 
 
-test("official table uses Model ID instead of the preceding display name", () => {
-  const rows = parseOfficialGoDocs('<table><tr><th>Model</th><th>Model ID</th><th>Endpoint</th><th>AI SDK Package</th></tr><tr><td>Example Display Name</td><td>example-id</td><td>https://opencode.ai/zen/go/v1/responses</td><td>sdk</td></tr></table>');
-  assert.equal(rows[0].modelId, "example-id");
-  for (const endpoint of ["https://user@opencode.ai/zen/go/v1/responses", "see https://opencode.ai/zen/go/v1/responses here", "https://opencode.ai/zen/go/v1/RESPONSES", "https://opencode.ai:443/zen/go/v1/responses"]) {
-    assert.throws(() => parseOfficialGoDocs(html([["example-id", endpoint]])), /endpoint/i);
+test("inventory rejects credentials, cross-origin and noncanonical endpoint URLs", () => {
+  for (const base_url of [
+    "https://user@opencode.ai/inference/go/openai/v1", "https://opencode.ai:443/inference/go/openai/v1",
+    "https://example.com/inference/go/openai/v1", "https://opencode.ai/inference/go/openai/v1?secret=x",
+    "https://opencode.ai/inference/go/openai/v1#x", "https://opencode.ai/inference/go/openai/v1/",
+    "https://opencode.ai/zen/go/v1", "https://opencode.ai/inference/go/openai/other", "http://opencode.ai/inference/go/openai/v1",
+  ]) {
+    const payload = publicInventory(); payload.data[0].api["chat-completions"].base_url = base_url;
+    assert.throws(() => parseOfficialGoInventory(JSON.stringify(payload)), /endpoint/i);
   }
+  const payload = publicInventory();
+  payload.data[0].api.responses = { base_url: "https://opencode.ai/inference/go/anthropic/v1", sdk: "test" };
+  assert.throws(() => parseOfficialGoInventory(JSON.stringify(payload)), /endpoint/i);
 });
 
 test("policy cannot redirect activation to a different state directory", async () => {
@@ -298,7 +336,7 @@ test("history-only updates use the overlay transaction without publishing or rew
   writeFileSync(p.userModelsPath, userText); writeFileSync(p.pickerPath, pickerText);
   let transactions = 0;
   const result = await checkGoAutoCatalog({ ...p, sourceRoot: process.cwd(), configuredCheck: () => ["opencode-go"], discoveryDisabledCheck: () => false,
-    discover: async () => ({ discovered: ["history"] }), fetchDocs: async () => html([["history", "https://opencode.ai/zen/go/v1/chat/completions"]]),
+    fetchInventory: async () => inventory([["history", "https://opencode.ai/inference/go/openai/v1/chat/completions"]]),
     readHealth: async () => ({ ok: false }), readActivity: async () => ({ ok: false }),
     transact: transaction => { transactions += 1; return transactModelOverlayMutation({ ...transaction, lock: false }); },
     applyPublication: async () => { assert.fail("history does not require publication"); },
@@ -333,7 +371,7 @@ test("existing user route takes priority over a documented preset on another Go 
     const pickerText = JSON.stringify({ version: 1, hidden: hidden ? [custom.slug] : [], visible: hidden ? [] : [custom.slug], seeded: [custom.slug] });
     writeFileSync(p.userModelsPath, userText); writeFileSync(p.pickerPath, pickerText);
     const result = await checkGoAutoCatalog({ ...p, configuredCheck: () => ["opencode-go"], discoveryDisabledCheck: () => false,
-      discover: async () => ({ discovered: [preset.upstreamModel] }), fetchDocs: async () => html([[preset.upstreamModel, "https://opencode.ai/zen/go/v1/responses"]]),
+      fetchInventory: async () => inventory([[preset.upstreamModel, "https://opencode.ai/inference/go/openai/v1/responses"]]),
       readHealth: async () => ({ ok: false }), readActivity: async () => ({ ok: false }),
       transact: transaction => transactModelOverlayMutation({ ...transaction, lock: false }),
       applyPublication: async () => { assert.fail("existing route does not need publication"); },
@@ -350,9 +388,393 @@ test("distinct live IDs that collapse to one gateway cannot be falsely adopted",
   const p = tempPaths(); p.policyPath = path.join(p.stateDir, "policy.json");
   mkdirSync(p.stateDir, { recursive: true, mode: 0o700 }); policy(p);
   const result = await checkGoAutoCatalog({ ...p, configuredCheck: () => ["opencode-go"], discoveryDisabledCheck: () => false,
-    discover: async () => ({ discovered: ["new.foo", "new-foo"] }), fetchDocs: async () => html(["new.foo", "new-foo"].map(id => [id, "https://opencode.ai/zen/go/v1/chat/completions"])),
+    fetchInventory: async () => inventory(["new.foo", "new-foo"].map(id => [id, "https://opencode.ai/inference/go/openai/v1/chat/completions"])),
     transact: async () => { assert.fail("colliding models cannot mutate state"); },
   });
   assert.equal(result.state, "pending"); assert.equal(result.reason, "model_identity_collision");
   for (const file of ["user-models.json", "model-picker.json", "opencode-go-auto-catalog-seen.json"]) assert.equal(existsSync(path.join(p.stateDir, file)), false);
+});
+
+function checkFixture() {
+  const p = tempPaths();
+  Object.assign(p, { policyPath: path.join(p.stateDir, "policy.json"), statusPath: path.join(p.stateDir, "status.json"), seenPath: path.join(p.stateDir, "seen.json"), pickerPath: path.join(p.stateDir, "picker.json"), userModelsPath: path.join(p.stateDir, "user-models.json") });
+  mkdirSync(p.stateDir, { recursive: true, mode: 0o700 }); policy(p);
+  const now = Date.now();
+  status(p, { instanceId: "router-1", inFlightRequests: 0, activeCount: 0, observedAt: now - GO_AUTO_QUIET_MS - 1000, latestActivityAt: 0 });
+  return { ...p, configuredCheck: () => ["opencode-go"], discoveryDisabledCheck: () => false, ...idleSeams(now), now: () => now,
+    transact: transaction => transactModelOverlayMutation({ ...transaction, lock: false }), applyPublication: async () => {},
+  };
+}
+
+test("canonical inventory maps only supported metadata and leaves Google pending", () => {
+  const payload = publicInventory();
+  const makeModel = (id, name, limit, protocol, base_url) => ({ ...structuredClone(payload.data[0]), id, name, limit, api: { [protocol]: { base_url, sdk: "@ai-sdk/fixture" } } });
+  payload.data.push(
+    makeModel("gpt-6-luna", "GPT 6 Luna", { context: 1050000, input: 922000, output: 128000 }, "responses", "https://opencode.ai/inference/go/openai/v1"),
+    makeModel("claude-haiku-5-5", "Claude Haiku 5.5", { context: 200000, output: 64000 }, "messages", "https://opencode.ai/inference/go/anthropic/v1"),
+    makeModel("gemini-4-argon", "Gemini 4 Argon", { context: 1000000, output: 64000 }, "generate-content", protocolRoutes["generate-content"]),
+  );
+  const snapshot = parseOfficialGoInventory(JSON.stringify(payload));
+  assert.deepEqual(snapshot.discovered, payload.data.map(model => model.id));
+  assert.deepEqual(snapshot.rows.map(row => row.providerId), ["opencode-go", "opencode-go-responses", "opencode-go-messages"]);
+  assert.deepEqual(snapshot.rows[0].metadata, { displayName: "DeepSeek V4.1 Flash", contextWindow: 1000000, inputModalities: ["text", "image"] });
+  assert.equal(snapshot.rows[1].metadata.contextWindow, 1050000);
+  assert.equal(Object.hasOwn(snapshot.rows[1].metadata, "output"), false);
+  payload.data[0].modalities = { input: ["text", "audio/wav"], output: ["audio/wav"] };
+  assert.deepEqual(parseOfficialGoInventory(JSON.stringify(payload)).rows[0].metadata.inputModalities, ["text"]);
+});
+
+test("consumed inventory metadata fails closed on malformed values", () => {
+  const mutations = [
+    value => { delete value.data; }, value => { value.data = {}; }, value => { value.data = [null]; },
+    value => { value.data[0].id = ""; }, value => { value.data[0].id = "x".repeat(513); },
+    value => { value.data[0].id = "https://evil.example/model"; }, value => { value.data[0].id = "injected\nmodel"; },
+    value => { value.data[0].name = "x".repeat(241); }, value => { value.data[0].name = {}; },
+    value => { value.data[0].limit.context = 0; }, value => { value.data[0].limit.context = 1.5; },
+    value => { value.data[0].limit.output = "128000"; }, value => { value.data[0].limit.output = -1; },
+    value => { value.data[0].limit.input = Number.MAX_SAFE_INTEGER + 1; }, value => { delete value.data[0].limit; },
+    value => { value.data[0].modalities.input = ["image"]; }, value => { value.data[0].modalities.input = [null]; },
+    value => { value.data[0].modalities.output = "text"; }, value => { value.data[0].modalities.output = []; },
+    value => { value.data[0].api = []; }, value => { value.data[0].api = {}; },
+    value => { value.data[0].api["chat-completions"].base_url = {}; }, value => { delete value.data[0].api["chat-completions"].base_url; },
+    value => { value.data[0].api = { unknown: { base_url: "https://opencode.ai/inference/go/openai/v1", sdk: "test" } }; },
+    value => { value.data[0].api = JSON.parse('{"__proto__":{"base_url":"https://evil.example","sdk":"test"}}'); },
+  ];
+  for (const mutate of mutations) {
+    const payload = publicInventory(); mutate(payload);
+    assert.throws(() => parseOfficialGoInventory(JSON.stringify(payload)), error => ["inventory_invalid", "inventory_unknown_endpoint"].includes(error.code));
+  }
+  for (const text of ["null", "[]", "{", "", JSON.stringify({ data: [] }) + "x"]) assert.throws(() => parseOfficialGoInventory(text), /malformed/i);
+});
+
+test("fetch rejects non-2xx, non-JSON, streamed oversize and invalid URL before adoption", async () => {
+  for (const status of [302, 400, 401, 500]) {
+    await assert.rejects(fetchOfficialGoInventory({ fetchImpl: async () => new Response("{}", { status, headers: { "content-type": "application/json" } }) }), { code: "inventory_fetch_failed" });
+  }
+  for (const type of ["text/html", "text/plain", "application/jsonp", ""]) {
+    await assert.rejects(fetchOfficialGoInventory({ fetchImpl: async () => new Response("{}", { headers: { "content-type": type } }) }), { code: "inventory_content_type" });
+  }
+  await assert.rejects(fetchOfficialGoInventory({ fetchImpl: async () => new Response("x".repeat(21), { headers: { "content-type": "application/json" } }), maxBytes: 20 }), { code: "inventory_too_large" });
+  await assert.rejects(fetchOfficialGoInventory({ url: "https://evil.example/models", fetchImpl: async () => assert.fail("invalid URL cannot fetch") }), { code: "inventory_url_not_allowed" });
+  let cancelled = false;
+  await assert.rejects(fetchOfficialGoInventory({ maxBytes: 4, fetchImpl: async () => ({ ok: true, status: 200, headers: new Headers({ "content-type": "application/json" }), body: { getReader: () => ({ read: async () => ({ done: false, value: new Uint8Array(5) }), cancel: async () => { cancelled = true; } }) } }) }), { code: "inventory_too_large" });
+  assert.equal(cancelled, true);
+});
+
+test("fetch timeout is bounded for the response and its body", async () => {
+  // A live fetch observes AbortSignal for both its request and body stream.
+  for (const duringBody of [false, true]) {
+    const fetchImpl = async (_url, { signal }) => {
+      const waitForAbort = () => new Promise((resolve, reject) => signal.addEventListener("abort", () => reject(new DOMException("timeout", "AbortError")), { once: true }));
+      if (!duringBody) return waitForAbort();
+      return { ok: true, status: 200, headers: new Headers({ "content-type": "application/json" }), body: { getReader: () => ({ read: waitForAbort }) } };
+    };
+    // Keep the test alive because the production deadline timer is unref'ed.
+    const keepAlive = setInterval(() => {}, 1000);
+    try { await assert.rejects(fetchOfficialGoInventory({ fetchImpl, timeoutMs: 5 }), { code: "inventory_timeout" }); }
+    finally { clearInterval(keepAlive); }
+  }
+});
+
+test("eligibility gates prevent every inventory request", async () => {
+  const cases = [
+    { policyEnabled: false, expected: "disabled" },
+    { discoveryDisabledCheck: () => true, expected: "discovery_disabled" },
+    { configuredCheck: () => [], expected: "provider_unconfigured" },
+    { selection: ["deepseek"], expected: "provider_disabled" },
+  ];
+  for (const gate of cases) {
+    const options = checkFixture();
+    if (gate.policyEnabled === false) policy(options, false);
+    if (gate.selection) writeFileSync(path.join(options.stateDir, "enabled-providers.json"), JSON.stringify({ version: 1, providers: gate.selection }));
+    const result = await checkGoAutoCatalog({ ...options, ...gate, fetchImpl: async () => assert.fail("gate must run before fetch"), fetchInventory: async () => assert.fail("gate must run before inventory") });
+    assert.equal(result.reason, gate.expected);
+  }
+});
+
+test("one public snapshot drives adoption and hostile unused metadata never enters the registry", async () => {
+  const options = checkFixture();
+  const payload = publicInventory();
+  const model = payload.data[0]; model.id = "snapshot-test-model";
+  const injection = "REMOTE_INSTRUCTION https://evil.example/payload";
+  Object.assign(model, { description: injection, provider: injection, requestProfile: injection, reasoningLevels: injection, supportedEndpoints: [injection] });
+  Object.assign(model.api["chat-completions"], { sdk: injection, compatibility: { system: injection }, capabilities: { instructions: injection, tools: injection } });
+  let fetches = 0;
+  let publications = 0;
+  const checkOptions = { ...options,
+    discover: async () => assert.fail("credential-backed discovery is retired for this updater"),
+    fetchDocs: async () => assert.fail("HTML docs must never be fetched"),
+    fetchImpl: async (url, request) => {
+      fetches += 1;
+      assert.equal(url, "https://opencode.ai/inference/go/v1/models");
+      assert.equal(Object.hasOwn(request.headers, "Authorization"), false);
+      return new Response(JSON.stringify(payload), { headers: { "content-type": "application/json" } });
+    },
+    applyPublication: async () => { publications += 1; },
+  };
+  const result = await checkGoAutoCatalog(checkOptions);
+  assert.equal(result.state, "active"); assert.equal(fetches, 1); assert.equal(publications, 1);
+  const saved = readFileSync(options.userModelsPath, "utf8");
+  assert.equal(saved.includes(injection), false);
+  const adopted = JSON.parse(saved).models[0];
+  assert.equal(adopted.contextWindow, 1000000); assert.equal(adopted.autoCompact, 850000);
+  assert.deepEqual(adopted.inputModalities, ["text", "image"]);
+  assert.equal(adopted.displayName, "DeepSeek V4.1 Flash");
+  assert.equal(adopted.provider, "opencode-go");
+  assert.equal(Object.hasOwn(adopted, "api"), false);
+  const again = await checkGoAutoCatalog(checkOptions);
+  assert.equal(again.reason, "no_change"); assert.equal(fetches, 2); assert.equal(publications, 1);
+  assert.equal(readFileSync(options.userModelsPath, "utf8"), saved);
+});
+
+test("unsupported-only inventory is pending without mutating files or marking history", async () => {
+  const options = checkFixture();
+  const result = await checkGoAutoCatalog({ ...options, fetchInventory: async () => inventory([["gemini-4-argon", protocolRoutes["generate-content"]]]), transact: async () => assert.fail("unsupported-only rows cannot mutate") });
+  assert.equal(result.state, "pending");
+  assert.deepEqual(result.plan.missingDocs, ["gemini-4-argon"]);
+  for (const file of [options.userModelsPath, options.pickerPath, options.seenPath]) assert.equal(existsSync(file), false);
+  assert.equal(GO_AUTO_INTERVAL_SECONDS, 300);
+});
+
+test("invalid inventory produces pending status without publishing or partial adoption", async () => {
+  const options = checkFixture();
+  const payload = publicInventory();
+  payload.data.push({ ...structuredClone(payload.data[0]), id: "bad-entry", limit: { context: -1, output: 1 } });
+  const result = await checkGoAutoCatalog({ ...options, fetchInventory: async () => JSON.stringify(payload), transact: async () => assert.fail("invalid inventory cannot mutate") });
+  assert.equal(result.state, "pending"); assert.equal(result.reason, "inventory_invalid");
+  for (const file of [options.userModelsPath, options.pickerPath, options.seenPath]) assert.equal(existsSync(file), false);
+});
+
+
+test("fresh overlay state wins over the earlier inventory plan under the transaction lock", async () => {
+  const options = checkFixture();
+  const model = { slug: "opencode-go/concurrent", gatewayModel: "opencode-go-concurrent", upstreamModel: "concurrent", provider: "opencode-go", contextWindow: 65536, displayName: "Concurrent operator edit" };
+  let publications = 0;
+  const result = await checkGoAutoCatalog({ ...options,
+    fetchInventory: async () => inventory([[model.upstreamModel, protocolRoutes["chat-completions"]]]),
+    transact: async transaction => {
+      // A different overlay writer finishes after planning but before this
+      // transaction obtains the overlay lock. The updater must replan.
+      writeFileSync(options.userModelsPath, JSON.stringify({ version: 1, models: [model] }));
+      writeFileSync(options.pickerPath, JSON.stringify({ version: 1, hidden: [model.slug], visible: [], seeded: [model.slug] }));
+      writeFileSync(options.seenPath, JSON.stringify({ version: 1, seen: [JSON.stringify([model.provider, model.upstreamModel])] }));
+      return transactModelOverlayMutation({ ...transaction, lock: false });
+    },
+    applyPublication: async () => { publications += 1; },
+  });
+  assert.equal(result.state, "active"); assert.equal(publications, 0);
+  assert.deepEqual(JSON.parse(readFileSync(options.userModelsPath, "utf8")).models, [model]);
+  assert.deepEqual(JSON.parse(readFileSync(options.pickerPath, "utf8")).hidden, [model.slug]);
+});
+
+
+const MANAGED_DUMMY = "managed-go-integration-fixture";
+
+test("scheduled entry creates one updater child with transient auth only in env", async () => {
+  const options = checkFixture();
+  let launches = 0;
+  const inherited = { LEGITIMATE: "preserved" };
+  const result = await runScheduledGoAutoCatalog({ ...options, environment: inherited,
+    loadEnvironment: input => { assert.equal(input.environment === inherited, true); return { ...inherited, OPENCODE_API_KEY: MANAGED_DUMMY }; },
+    spawnUpdater: async ({ environment }) => {
+      launches += 1;
+      assert.equal(environment.OPENCODE_API_KEY === MANAGED_DUMMY && environment.LEGITIMATE === "preserved", true, "child environment differs");
+      return { code: 0, signal: null };
+    },
+  });
+  assert.equal(result.state, "completed"); assert.equal(launches, 1);
+  assert.equal(Object.hasOwn(inherited, "OPENCODE_API_KEY"), false);
+  for (const file of [options.policyPath, options.statusPath, options.seenPath]) if (existsSync(file)) assert.equal(readFileSync(file, "utf8").includes(MANAGED_DUMMY), false);
+  assert.equal(renderLaunchdPlist().includes(MANAGED_DUMMY), false);
+});
+
+test("scheduled disabled and discovery gates precede extraction and run again before spawning", async () => {
+  for (const mode of ["disabled", "discovery", "selection", "changed-policy", "changed-discovery"]) {
+    const options = checkFixture();
+    if (mode === "disabled") policy(options, false);
+    if (mode === "selection") writeFileSync(path.join(options.stateDir, "enabled-providers.json"), JSON.stringify({ version: 1, providers: ["deepseek"] }));
+    let extraction = 0;
+    const result = await runScheduledGoAutoCatalog({ ...options,
+      discoveryDisabledCheck: () => mode === "discovery" || (mode === "changed-discovery" && extraction > 0),
+      loadEnvironment: () => { extraction += 1; if (mode === "changed-policy") policy(options, false); return {}; },
+      spawnUpdater: async () => assert.fail("gated scheduled child started"),
+    });
+    assert.equal(["disabled", "skipped"].includes(result.state), true);
+    assert.equal(extraction, mode.startsWith("changed-") ? 1 : 0);
+  }
+});
+
+test("scheduled trust failures and abnormal child exits expose only fixed pending codes", async () => {
+  for (const mode of ["loader", "spawn", "exit", "signal", "killed", "malformed-policy"]) {
+    const options = checkFixture();
+    if (mode === "malformed-policy") writeFileSync(options.policyPath, MANAGED_DUMMY);
+    let launches = 0;
+    const result = await runScheduledGoAutoCatalog({ ...options,
+      loadEnvironment: () => { if (mode === "loader") { const error = new Error(MANAGED_DUMMY); error.code = MANAGED_DUMMY; throw error; } return { OPENCODE_API_KEY: MANAGED_DUMMY }; },
+      spawnUpdater: async () => { launches += 1; if (mode === "spawn") throw new Error(MANAGED_DUMMY); return ["signal", "killed"].includes(mode) ? { code: null, signal: mode === "killed" ? "SIGKILL" : "SIGTERM" } : { code: 7, signal: null }; },
+    });
+    assert.equal(result.state, "pending");
+    assert.equal(launches, ["loader", "malformed-policy"].includes(mode) ? 0 : 1);
+    assert.equal(JSON.stringify(result).includes(MANAGED_DUMMY), false);
+    assert.equal(readFileSync(options.statusPath, "utf8").includes(MANAGED_DUMMY), false);
+    for (const file of [options.userModelsPath, options.pickerPath, options.seenPath]) assert.equal(existsSync(file), false);
+    if (mode === "exit") assert.equal(result.exitCode, 7);
+    if (mode === "signal") assert.equal(result.signal, "SIGTERM");
+    if (mode === "killed") assert.equal(result.signal, "SIGKILL");
+  }
+});
+
+test("updater spawn has fixed argv, no output channels or timeout, and forwards signals until close", async () => {
+  const { EventEmitter } = await import("node:events");
+  const signals = new EventEmitter();
+  const child = new EventEmitter();
+  const killed = [];
+  child.kill = signal => { killed.push(signal); return true; };
+  let spawnCount = 0;
+  const promise = spawnManagedGoUpdater({ environment: { OPENCODE_API_KEY: MANAGED_DUMMY }, signalSource: signals,
+    spawnImpl: (command, args, options) => {
+      spawnCount += 1;
+      assert.equal(command, process.execPath);
+      assert.equal(args.length === 2 && args[1] === GO_MANAGED_CHILD_COMMAND && args[0].endsWith("/src/opencode-go-auto-catalog.mjs"), true);
+      assert.equal(JSON.stringify(args).includes(MANAGED_DUMMY), false);
+      assert.equal(options.env.OPENCODE_API_KEY === MANAGED_DUMMY, true, "auth absent from child env");
+      assert.deepEqual(options.stdio, ["ignore", "ignore", "ignore"]);
+      assert.equal(options.timeout, undefined); assert.equal(options.shell, undefined);
+      return child;
+    },
+  });
+  signals.emit("SIGTERM"); assert.deepEqual(killed, ["SIGTERM"]);
+  let completed = false; promise.then(() => { completed = true; });
+  await Promise.resolve(); assert.equal(completed, false);
+  child.emit("close", null, "SIGTERM");
+  assert.deepEqual(await promise, { code: null, signal: "SIGTERM" });
+  assert.equal(spawnCount, 1); assert.equal(signals.listenerCount("SIGTERM"), 0);
+});
+
+test("child catalog failures cannot copy credential-bearing errors into status or results", async () => {
+  const options = checkFixture();
+  const error = new Error(MANAGED_DUMMY); error.code = MANAGED_DUMMY;
+  const result = await checkGoAutoCatalog({ ...options, fetchInventory: async () => inventory([["error-sanitization", protocolRoutes.responses]]), transact: async () => { throw error; } });
+  assert.equal(result.state, "error");
+  assert.equal(JSON.stringify(result).includes(MANAGED_DUMMY), false, "unsafe error escaped updater");
+  assert.equal(readFileSync(options.statusPath, "utf8").includes(MANAGED_DUMMY), false, "unsafe error persisted");
+  assert.equal(String(result.error?.stack).includes(MANAGED_DUMMY), false, "unsafe error stack escaped updater");
+});
+
+
+test("effective child env reaches initial and final configured gates and publication", async t => {
+  const root = mkdtempSync(path.join(process.cwd(), ".managed-child-test-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const stateDir = path.join(root, "state"); mkdirSync(stateDir, { mode: 0o700 });
+  const policyPath = path.join(stateDir, "opencode-go-auto-catalog-policy.json");
+  const statusPath = path.join(stateDir, "opencode-go-auto-catalog-status.json");
+  policy({ policyPath, stateDir });
+  const proofPath = path.join(root, "proof.json");
+  const script = `
+    import { checkGoAutoCatalog, GO_AUTO_QUIET_MS } from ${JSON.stringify(new URL("../src/opencode-go-auto-catalog.mjs", import.meta.url).href)};
+    import { writeFileSync, readFileSync, existsSync } from "node:fs";
+    const now = Date.now();
+    const observation = { ok: true, instanceId: "fixture-router", inFlightRequests: 0, activeCount: 0, observedAt: now - GO_AUTO_QUIET_MS - 1000, latestActivityAt: 0 };
+    writeFileSync(${JSON.stringify(statusPath)}, JSON.stringify({ version: 1, observations: [observation] }));
+    let configuredCalls = 0, published = false, held = false, released = false;
+    const hasAuth = () => typeof process.env.OPENCODE_API_KEY === "string" && process.env.OPENCODE_API_KEY.length > 0;
+    const result = await checkGoAutoCatalog({
+      configuredCheck: () => { configuredCalls++; return hasAuth() ? ["opencode-go"] : []; },
+      discoveryDisabledCheck: () => false,
+      fetchInventory: async () => ${JSON.stringify(inventory([["synthetic-child-model", protocolRoutes.responses]]))},
+      observeIdle: async () => ({ ...observation, observedAt: now }), now: () => now,
+      acquireLock: async () => { held = true; return () => { held = false; released = true; }; },
+      transact: async transaction => { await transaction.restart(); await transaction.mutate(); await transaction.applyPublication({}); return {}; },
+      applyPublication: async () => { published = hasAuth() && held; },
+    });
+    writeFileSync(${JSON.stringify(proofPath)}, JSON.stringify({ passed: result.state === "active", configuredCalls, published, released }));
+  `;
+  const inherited = { HOME: root, CODEX_HOME: root, MODEL_ROUTER_STATE_DIR: stateDir, CODEX_ROUTER_SOURCE_ROOT: process.cwd(), CODEX_ROUTER_NO_DISCOVERY: "0", LEGITIMATE: "preserved" };
+  let launches = 0;
+  const result = await runScheduledGoAutoCatalog({ stateDir, environment: inherited, discoveryDisabledCheck: () => false,
+    loadEnvironment: () => ({ ...inherited, OPENCODE_API_KEY: MANAGED_DUMMY }),
+    spawnUpdater: ({ environment }) => spawnManagedGoUpdater({ environment,
+      spawnImpl: (command, args, spawnOptions) => {
+        launches++;
+        assert.equal(args.length === 2 && args[1] === GO_MANAGED_CHILD_COMMAND && !JSON.stringify(args).includes(MANAGED_DUMMY), true, "updater child argv differs");
+        // Run the updater's existing seams inside a real child so process.env
+        // inheritance, both gates and publication share the same environment.
+        return realSpawn(command, ["--input-type=module", "-e", script], spawnOptions);
+      },
+    }),
+  });
+  assert.equal(result.state, "completed"); assert.equal(launches, 1);
+  const proof = JSON.parse(readFileSync(proofPath, "utf8"));
+  assert.equal(proof.passed && proof.published && proof.released && proof.configuredCalls >= 2, true, "child environment did not reach every activation stage");
+  assert.equal(Object.hasOwn(inherited, "OPENCODE_API_KEY"), false);
+  for (const name of ["opencode-go-auto-catalog-policy.json", "opencode-go-auto-catalog-status.json", "opencode-go-auto-catalog-seen.json", "user-models.json", "model-picker.json"]) {
+    const file = path.join(stateDir, name);
+    if (existsSync(file)) assert.equal(readFileSync(file, "utf8").includes(MANAGED_DUMMY), false, "credential persisted in updater state");
+  }
+});
+
+test("fixed internal child rechecks discovery without recursion or inventory side effects", async t => {
+  const root = mkdtempSync(path.join(process.cwd(), ".managed-fixed-child-test-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const stateDir = path.join(root, "state"); mkdirSync(stateDir, { mode: 0o700 });
+  const policyPath = path.join(stateDir, "opencode-go-auto-catalog-policy.json");
+  policy({ policyPath, stateDir });
+  const outcome = await spawnManagedGoUpdater({ environment: { HOME: root, CODEX_HOME: root, MODEL_ROUTER_STATE_DIR: stateDir, CODEX_ROUTER_SOURCE_ROOT: process.cwd(), CODEX_ROUTER_NO_DISCOVERY: "1", OPENCODE_API_KEY: MANAGED_DUMMY } });
+  assert.equal(outcome.code, 0);
+  const saved = JSON.parse(readFileSync(path.join(stateDir, "opencode-go-auto-catalog-status.json"), "utf8"));
+  assert.equal(saved.reason, "discovery_disabled");
+  for (const file of ["user-models.json", "model-picker.json", "opencode-go-auto-catalog-seen.json"]) assert.equal(existsSync(path.join(stateDir, file)), false);
+});
+
+test("spawn errors never relay diagnostics and remain attached until child close", async () => {
+  const { EventEmitter } = await import("node:events");
+  const child = new EventEmitter(); child.kill = () => true;
+  const signals = new EventEmitter();
+  const result = spawnManagedGoUpdater({ environment: { OPENCODE_API_KEY: MANAGED_DUMMY }, signalSource: signals, spawnImpl: () => child });
+  child.emit("error", new Error(MANAGED_DUMMY));
+  let completed = false; result.then(() => { completed = true; });
+  await Promise.resolve(); assert.equal(completed, false);
+  child.emit("close", -2, null);
+  const outcome = await result;
+  assert.equal(outcome.failed, true);
+  assert.equal(JSON.stringify(outcome).includes(MANAGED_DUMMY), false);
+  assert.equal(signals.listenerCount("SIGTERM"), 0);
+});
+
+test("public SDK objects across all protocol families stay unused while supported models activate", async () => {
+  const options = checkFixture();
+  const metadataMarker = "UNUSED_SDK_METADATA_FIXTURE";
+  const families = [
+    ["fixture-sdk-chat", "chat-completions", "@ai-sdk/openai-compatible", "@opencode/ai/providers/openai-compatible"],
+    ["fixture-sdk-responses", "responses", "@ai-sdk/openai", "@opencode/ai/providers/openai"],
+    ["fixture-sdk-messages", "messages", "@ai-sdk/anthropic", "@opencode/ai/providers/anthropic"],
+    ["fixture-sdk-google", "generate-content", "@ai-sdk/google", "@opencode/ai/providers/google"],
+  ];
+  const payload = JSON.parse(inventory(families.map(([id, protocol]) => [id, protocolRoutes[protocol]])));
+  payload.data.forEach((model, index) => {
+    const api = model.api[families[index][1]];
+    api.sdk = { aisdk: families[index][2], opencodeai: families[index][3] };
+    api.compatibility = { instructions: metadataMarker, nested: { supported: true } };
+    api.capabilities = { tools: { supported: true }, metadata: metadataMarker };
+    model.compatibility = { metadata: metadataMarker };
+    model.capabilities = { tools: true, reasoning: { metadata: metadataMarker } };
+  });
+  const text = JSON.stringify(payload);
+  const snapshot = parseOfficialGoInventory(text);
+  assert.deepEqual(snapshot.discovered, families.map(([id]) => id));
+  assert.deepEqual(snapshot.rows.map(row => row.providerId), ["opencode-go", "opencode-go-responses", "opencode-go-messages"]);
+  assert.equal(JSON.stringify(snapshot).includes("@ai-sdk/") || JSON.stringify(snapshot).includes("@opencode/ai/") || JSON.stringify(snapshot).includes(metadataMarker), false);
+  for (const sdk of [undefined, null, "@ai-sdk/legacy-fixture", { aisdk: { unused: metadataMarker } }]) {
+    const variant = structuredClone(payload);
+    for (const model of variant.data) model.api[Object.keys(model.api)[0]].sdk = sdk;
+    assert.deepEqual(parseOfficialGoInventory(JSON.stringify(variant)), snapshot);
+  }
+  const result = await checkGoAutoCatalog({ ...options, fetchInventory: async () => text });
+  assert.equal(result.reason, "catalog_updated_pending_documentation");
+  assert.deepEqual(result.plan.missingDocs, ["fixture-sdk-google"]);
+  assert.equal(JSON.parse(readFileSync(options.userModelsPath, "utf8")).models.length, 3);
+  for (const file of [options.userModelsPath, options.pickerPath, options.seenPath, options.statusPath]) {
+    const saved = readFileSync(file, "utf8");
+    assert.equal(saved.includes("@ai-sdk/") || saved.includes("@opencode/ai/") || saved.includes(metadataMarker), false, "unused API metadata reached updater state");
+  }
 });
